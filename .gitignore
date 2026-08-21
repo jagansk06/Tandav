@@ -1,0 +1,29 @@
+# --- Secrets ---
+backend/.env
+
+# --- Python / backend ---
+backend/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# --- Runtime data ---
+backend/uploads/
+
+# --- Build artifacts ---
+app-release.apk
+*.apk
+
+# --- Flutter / mobile (extra, on top of mobile/.gitignore) ---
+mobile/flutter_*.log
+*.log
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
