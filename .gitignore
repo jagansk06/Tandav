@@ -1,6 +1,14 @@
 # --- Secrets ---
 backend/.env
 
+# Release signing. The keystore itself lives OUTSIDE this repo
+# (D:\Projects\tandav-signing\) so that no git command can ever reach it, but
+# key.properties holds its password and must never be committed.
+# Also ignored by mobile/android/.gitignore; belt and braces.
+key.properties
+*.jks
+*.keystore
+
 # --- Python / backend ---
 backend/.venv/
 .venv/
@@ -15,6 +23,20 @@ backend/uploads/
 # --- Build artifacts ---
 app-release.apk
 *.apk
+
+# Gradle and Flutter build output. 21 Gradle cache files were committed by
+# accident (checksums, .lock, .bin, .ser) — machine-local state that changes on
+# every build and is meaningless to anyone else.
+build/
+.gradle/
+mobile/.dart_tool/
+mobile/android/.gradle/
+mobile/android/build/
+mobile/packages/*/android/.gradle/
+mobile/packages/*/android/build/
+
+# Device log captured by ship.ps1 — can contain account details.
+device-log.txt
 
 # --- Flutter / mobile (extra, on top of mobile/.gitignore) ---
 mobile/flutter_*.log
