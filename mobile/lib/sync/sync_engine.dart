@@ -9,6 +9,16 @@ class SyncDelta {
   /// table -> rows we have changed since the peer last saw our data.
   final Map<String, List<Map<String, Object?>>> tables = {};
 
+  /// Our own clock at the moment this delta was snapshotted.
+  ///
+  /// This is the ceiling for [SyncEngine.markDeltaSent]. Rows merged from a
+  /// peer carry the PEER's `updated_at`, which may sit in the future if its
+  /// clock is fast; letting such a value become our "delivered" mark would
+  /// strand every local edit until real time caught up. Clamping to the
+  /// snapshot instant also guarantees that anything written *during* the
+  /// upload stays above the mark and is still sent next time.
+  String snapshotAt = '';
+
   bool get isEmpty => tables.values.every((rows) => rows.isEmpty);
 
   int get rowCount => tables.values.fold(0, (sum, rows) => sum + rows.length);
@@ -26,9 +36,17 @@ class SyncApplyResult {
 /// The incremental, conflict-resolving merge engine.
 ///
 /// Strategy:
-/// - **Incremental** – every table keeps a per-table watermark of the newest
-///   `updated_at` value we have received from the peer. We only send records
-///   newer than that watermark, so a full database dump is never transferred.
+/// - **Incremental** – every table keeps TWO independent per-table marks, and
+///   conflating them was a data-loss bug, so keep them apart:
+///     * `sent.<table>` – the newest `updated_at` we have actually **delivered**
+///       to the peer. This, and only this, decides what [computeOutbound]
+///       sends. It is advanced by [markDeltaSent] after a *confirmed* send.
+///     * `watermark.<table>` – the newest `updated_at` we have **received** from
+///       the peer. Bookkeeping/diagnostics only.
+///   Filtering our own outbound rows by the *received* mark is wrong: the
+///   peer's timestamps say nothing about which of OUR rows the peer has seen.
+///   If the peer's clock ran even a minute ahead, every local edit we made in
+///   that minute sorted below the mark and became permanently unsendable.
 /// - **Conflict resolution** – last-write-wins by `updated_at` (UTC ISO-8601).
 ///   On equal timestamps the lexicographically higher `device_id` wins
 ///   (deterministic and stable across both devices).
@@ -56,17 +74,30 @@ class SyncEngine {
     'monthly_progress': {'student_id': 'students'},
   };
 
-  /// Rows we must send to the peer: everything newer than the watermark.
+  /// Key holding the newest `updated_at` we have successfully delivered to the
+  /// peer for [table]. Absent (== '') means "the peer has never had anything
+  /// from us", which correctly forces a full send.
+  static String sentKey(String table) => 'sent.$table';
+
+  /// Key holding the newest `updated_at` we have received from the peer for
+  /// [table]. Deliberately NOT used to filter outbound rows — see the class
+  /// doc for why that was a bug.
+  static String receivedKey(String table) => 'watermark.$table';
+
+  /// Rows we must send to the peer: everything we have not already delivered.
   ///
   /// Called with a read-only transaction so the snapshot is consistent with
-  /// the watermark it is based on.
+  /// the mark it is based on.
   Future<SyncDelta> computeOutbound(Transaction txn) async {
     final delta = SyncDelta();
+    // Read our clock BEFORE querying, so every row written after this point is
+    // strictly above the mark markDeltaSent will set.
+    delta.snapshotAt = DateTime.now().toUtc().toIso8601String();
     for (final table in SyncCodec.applyOrder) {
-      final wm = await state.readWithin(txn, 'watermark.$table') ?? '';
-      final rows = wm.isEmpty
+      final sent = await state.readWithin(txn, sentKey(table)) ?? '';
+      final rows = sent.isEmpty
           ? await _selectAll(txn, table)
-          : await txn.query(table, where: 'updated_at > ?', whereArgs: [wm]);
+          : await txn.query(table, where: 'updated_at > ?', whereArgs: [sent]);
       if (rows.isEmpty) continue;
       final out = <Map<String, Object?>>[];
       for (final r in rows) {
@@ -78,6 +109,41 @@ class SyncEngine {
       delta.tables[table] = out;
     }
     return delta;
+  }
+
+  /// Record that every row in [delta] has reached the peer, so the next
+  /// [computeOutbound] does not send it again.
+  ///
+  /// **Only call this once delivery is confirmed.** Over the Drive mailbox that
+  /// is a successful file write (the bundle now sits in the account and the
+  /// peer will read it whenever it next syncs). Over BLE it is the peer's
+  /// `syncDone`. Calling it merely because we *attempted* a send would drop
+  /// rows on a dropped connection; calling it late only costs a harmless
+  /// re-send, so when in doubt, call it late.
+  Future<void> markDeltaSent(Transaction txn, SyncDelta delta) async {
+    final ceiling = delta.snapshotAt;
+    for (final entry in delta.tables.entries) {
+      var max = '';
+      for (final row in entry.value) {
+        final at = (row['updated_at'] as String?) ?? '';
+        if (at.compareTo(max) > 0) max = at;
+      }
+      // Never let a peer's clock set our mark. A row we merged from a fast
+      // phone can be stamped in the future; if that became our mark, every
+      // local edit until then would sort below it and never be sent again.
+      // Such a row is simply re-offered each sync until our own clock passes
+      // it, and the peer discards it as an unchanged echo — wasted bytes, in
+      // exchange for never losing an edit.
+      if (ceiling.isNotEmpty && max.compareTo(ceiling) > 0) max = ceiling;
+      if (max.isEmpty) continue;
+      final key = sentKey(entry.key);
+      final current = await state.readWithin(txn, key) ?? '';
+      // Never move the mark backwards: a clock that jumped back would
+      // otherwise re-send, and worse, a later correct value would be lost.
+      if (max.compareTo(current) > 0) {
+        await state.writeWithin(txn, key, max);
+      }
+    }
   }
 
   /// Apply rows received from the peer inside one transaction.
@@ -164,18 +230,20 @@ class SyncEngine {
           } else if (updatedAt.compareTo(localUpdatedAt) < 0 ||
               (incomingDevice == localDeviceId &&
                   updatedAt.compareTo(localUpdatedAt) == 0)) {
-            // Incoming is strictly older (our newer version wins), or it is
-            // an exact echo of the local winner (same writer, same time).
-            // Either way the peer will settle on our row, so it is safe to
-            // advance the watermark past this record.
+            // Incoming is strictly older (our newer version wins), or it is an
+            // exact echo of a row we already sent. Either way there is nothing
+            // to change locally.
             tableUuids[uuid] = existing['id'] as int;
             result.conflictsSkipped[table] =
                 result.conflictsSkipped[table]! + 1;
             _maxOf(advanceable, updatedAt);
           } else {
-            // Perfect tie between two devices: the winner (higher device id)
-            // must be re-transmitted, so do not advance the watermark past
-            // this record yet.
+            // Perfect tie between two different devices and we hold the winner
+            // (our device id is higher). The peer must still learn our version.
+            // That is guaranteed by `sent.<table>`: our winning row was either
+            // never delivered — so it is still queued — or it was delivered and
+            // the peer will reach the same verdict, because the tie-break is
+            // pure comparison and runs identically on both sides.
             tableUuids[uuid] = existing['id'] as int;
             result.conflictsSkipped[table] =
                 result.conflictsSkipped[table]! + 1;
@@ -183,13 +251,14 @@ class SyncEngine {
         }
       }
 
-      // Advance the watermark only if nothing was orphaned — an orphaned row
-      // may need the parent to arrive in a future sync, so it must be retried.
+      // Advance the received mark only if nothing was orphaned — an orphaned
+      // row may need the parent to arrive in a future sync, so it must be
+      // retried. This mark is bookkeeping only; it never gates what we send.
       if (advanceable.isNotEmpty && !orphans) {
-        final current = await state.readWithin(txn, 'watermark.$table') ?? '';
+        final current = await state.readWithin(txn, receivedKey(table)) ?? '';
         final maxSeen = advanceable.reduce((a, b) => a.compareTo(b) > 0 ? a : b);
         if (maxSeen.compareTo(current) > 0) {
-          await state.writeWithin(txn, 'watermark.$table', maxSeen);
+          await state.writeWithin(txn, receivedKey(table), maxSeen);
         }
       }
     }

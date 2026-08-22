@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<!--
+  drive-visibility-test.html
+  ==========================
+  Throwaway diagnostic. Answers ONE question:
+
+      Under the `drive.file` scope, can a WEB OAuth client see the files an
+      ANDROID OAuth client created in the same Google account?
+
+  Google's docs say drive.file grants access to "files the app created" without
+  pinning down whether "the app" is the Cloud project or the individual client
+  ID. Tandav's entire iPhone story depends on the answer: the PWA must be able
+  to read the Android phone's sync file. Twenty minutes here beats discovering
+  it after the PWA is finished.
+
+  HOW TO RUN
+    1. Install and sync the release APK on Android first, so a Tandav Sync
+       folder with tandav-XXXX.json exists in the account.
+    2. cd D:\Projects\Tandav\tools  &&  python -m http.server 8080
+    3. Open http://localhost:8080/drive-visibility-test.html
+       (file:// will NOT work - Google Identity Services needs a real origin,
+       and http://localhost:8080 must be an Authorized JavaScript origin on the
+       Web client.)
+    4. Sign in with the SAME Google account the phone used.
+
+  Delete this file once the question is settled.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tandav — drive.file cross-client visibility test</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin:0; padding:32px; background:#faf9f7; color:#1a1a1a;
+         font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:860px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:-0.01em; }
+  .sub { color:#6b6b6b; margin:0 0 28px; }
+  fieldset { border:1px solid #e0ddd8; border-radius:10px; padding:18px 20px;
+             margin:0 0 20px; background:#fff; }
+  legend { padding:0 8px; font-weight:600; font-size:13px; color:#6b6b6b;
+           text-transform:uppercase; letter-spacing:0.06em; }
+  input[type=text] { width:100%; padding:10px 12px; font:13px ui-monospace,Consolas,monospace;
+                     border:1px solid #d5d2cc; border-radius:7px; background:#fff; }
+  button { padding:10px 16px; font-size:14px; font-weight:600; border-radius:7px;
+           border:1px solid #1a1a1a; background:#1a1a1a; color:#fff; cursor:pointer;
+           margin:12px 8px 0 0; }
+  button.sec { background:#fff; color:#1a1a1a; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .verdict { padding:16px 18px; border-radius:10px; margin:20px 0; font-weight:600;
+             display:none; }
+  .good { background:#e8f5ec; border:1px solid #a8d5b8; color:#14532d; }
+  .bad  { background:#fdecec; border:1px solid #f0b4b4; color:#7f1d1d; }
+  .warn { background:#fdf6e3; border:1px solid #e8d9a0; color:#713f12; }
+  .verdict small { display:block; font-weight:400; margin-top:8px; line-height:1.5; }
+  table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid #eeece8; }
+  th { color:#6b6b6b; font-weight:600; font-size:11px; text-transform:uppercase;
+       letter-spacing:0.05em; }
+  td.name { font-family:ui-monospace,Consolas,monospace; }
+  tr.hit td { background:#e8f5ec; }
+  pre { background:#f4f2ef; border:1px solid #e5e2dd; border-radius:8px;
+        padding:12px; overflow:auto; font-size:12px; margin:14px 0 0; }
+  .muted { color:#6b6b6b; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>drive.file cross-client visibility test</h1>
+  <p class="sub">Can a <strong>Web</strong> OAuth client read what the
+     <strong>Android</strong> client created?</p>
+
+  <fieldset>
+    <legend>Web OAuth client ID</legend>
+    <input type="text" id="cid" spellcheck="false"
+           placeholder="1234567890-abcdefg.apps.googleusercontent.com">
+    <div class="muted" style="margin-top:8px">
+      From Cloud Console → Credentials → <em>Tandav Web</em>. Requires
+      <code>http://localhost:8080</code> as an authorized JavaScript origin.
+    </div>
+    <button id="signin">Sign in with Google</button>
+  </fieldset>
+
+  <div id="verdict" class="verdict"></div>
+
+  <fieldset id="actions" style="display:none">
+    <legend>Tests</legend>
+    <button id="list">List what this client can see</button>
+    <button id="create" class="sec">Create a file from this client</button>
+    <div class="muted" style="margin-top:10px">
+      Run <strong>List</strong> first (does web see Android's file?). Then
+      <strong>Create</strong>, and sync on the phone to check the reverse
+      direction — the one the PWA actually depends on.
+    </div>
+    <div id="results"></div>
+  </fieldset>
+
+  <pre id="log">Waiting…</pre>
+</div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+const SCOPE = 'https://www.googleapis.com/auth/drive.file';
+let token = null;
+
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent =
+  new Date().toLocaleTimeString() + '  ' + m + '\n' + $('log').textContent; };
+
+function verdict(kind, html) {
+  const v = $('verdict');
+  v.className = 'verdict ' + kind;
+  v.innerHTML = html;
+  v.style.display = 'block';
+}
+
+// Remember the client id between reloads; retyping a 72-character string while
+// iterating on Cloud Console settings is its own source of error.
+try { $('cid').value = localStorage.getItem('tandav_web_client_id') || ''; } catch (e) {}
+
+$('signin').onclick = () => {
+  const cid = $('cid').value.trim();
+  if (!cid) { alert('Paste the Web client ID first.'); return; }
+  try { localStorage.setItem('tandav_web_client_id', cid); } catch (e) {}
+  if (!window.google || !google.accounts) {
+    log('ERROR: Google Identity Services did not load. Are you on http://localhost:8080 and online?');
+    return;
+  }
+  google.accounts.oauth2.initTokenClient({
+    client_id: cid,
+    scope: SCOPE,
+    callback: r => {
+      if (r.error) { log('Auth failed: ' + r.error); return; }
+      token = r.access_token;
+      log('Signed in. Access token acquired.');
+      $('actions').style.display = 'block';
+    }
+  }).requestAccessToken();
+};
+
+// `path` is either relative to the Drive v3 endpoint, or a full URL — uploads
+// live under /upload/drive/v3/, a different prefix entirely.
+async function drive(path, opts = {}) {
+  const url = path.startsWith('https://')
+    ? path
+    : 'https://www.googleapis.com/drive/v3/' + path;
+  const r = await fetch(url, {
+    ...opts,
+    headers: { Authorization: 'Bearer ' + token, ...(opts.headers || {}) }
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((body.error && body.error.message) || r.status);
+  return body;
+}
+
+$('list').onclick = async () => {
+  try {
+    log('Listing everything this client is allowed to see…');
+    const d = await drive('files?pageSize=200&fields=files(id,name,mimeType,modifiedTime,size)&q=trashed%3Dfalse');
+    const files = d.files || [];
+    log('Visible to this client: ' + files.length + ' item(s).');
+
+    // "Android's file" = one this web client did not create. Names are the only
+    // signal available: the phone writes tandav-<deviceId>.json into Tandav Sync.
+    const androidish = files.filter(f =>
+      (/^tandav-.*\.json$/.test(f.name) && !f.name.includes('WEBTEST')) ||
+      f.name === 'Tandav Sync');
+
+    let rows = files.map(f => {
+      const hit = androidish.includes(f) ? ' class="hit"' : '';
+      const kind = f.mimeType === 'application/vnd.google-apps.folder' ? 'folder' : 'file';
+      return `<tr${hit}><td class="name">${f.name}</td><td>${kind}</td>` +
+             `<td>${f.modifiedTime || ''}</td></tr>`;
+    }).join('');
+    if (!rows) rows = '<tr><td colspan="3" class="muted">nothing at all</td></tr>';
+    $('results').innerHTML =
+      '<table><tr><th>Name</th><th>Type</th><th>Modified</th></tr>' + rows + '</table>';
+
+    if (androidish.length) {
+      verdict('good',
+        'PER-PROJECT — the Web client CAN see the Android client\'s files.' +
+        '<small>Two OAuth clients in one project is fine. Build the PWA as planned. ' +
+        'Now press <strong>Create a file from this client</strong> and check the phone ' +
+        'sees it, to confirm the reverse direction too.</small>');
+    } else if (files.length === 0) {
+      verdict('bad',
+        'PER-CLIENT — this Web client sees NOTHING.' +
+        '<small>The Android file exists in this account but is invisible here, so ' +
+        'drive.file is scoped to the individual client ID. The PWA cannot sync using ' +
+        'a separate Web client. Fall back to one shared Web client on both platforms ' +
+        '(browser PKCE flow on Android instead of native google_sign_in).' +
+        '<br><br>Before concluding: confirm you signed in with the SAME Google account ' +
+        'the phone used, and that the phone really did sync — a Tandav Sync folder must ' +
+        'be visible in that account\'s Drive.</small>');
+    } else {
+      verdict('warn',
+        'INCONCLUSIVE — files are visible, but none look like the phone\'s.' +
+        '<small>Expected a folder named <code>Tandav Sync</code> or a file matching ' +
+        '<code>tandav-*.json</code>. Either the phone has not synced yet, or you are ' +
+        'in a different Google account. Check Drive in the browser, then retry.</small>');
+    }
+  } catch (e) {
+    log('List failed: ' + e.message);
+    verdict('warn', 'Request failed — see the log.' +
+      '<small>A 403 <code>accessNotConfigured</code> means the Drive API is not enabled ' +
+      'on the project (step 2 of OAUTH-SETUP.md).</small>');
+  }
+};
+
+$('create').onclick = async () => {
+  try {
+    const name = 'tandav-WEBTEST.json';
+    const meta = { name, mimeType: 'application/json' };
+    const body =
+      '--x\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify(meta) +
+      '\r\n--x\r\nContent-Type: application/json\r\n\r\n' +
+      JSON.stringify({ note: 'written by the web client to test reverse visibility' }) +
+      '\r\n--x--';
+    const r = await drive('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name', {
+      method: 'POST',
+      headers: { 'Content-Type': 'multipart/related; boundary=x' },
+      body
+    });
+    log('Created ' + r.name + ' (id ' + r.id + ') at the root of My Drive.');
+    verdict('warn',
+      'Created <code>tandav-WEBTEST.json</code> from the Web client.' +
+      '<small>Now check whether the ANDROID app can see it. It sits at the root of My ' +
+      'Drive, not in Tandav Sync, so the app will not sync it — the point is only ' +
+      'whether the phone\'s client is permitted to list it. Delete it afterwards.</small>');
+  } catch (e) {
+    log('Create failed: ' + e.message);
+  }
+};
+
+log('Ready. Paste the Web client ID and sign in.');
+</script>
+</body>
+</html>

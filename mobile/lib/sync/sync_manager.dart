@@ -85,6 +85,9 @@ class SyncManager {
   String? _serverNonce;
   String? _peerDoneFrom;
   bool _ownDoneSent = false;
+  /// The delta we transmitted this session, held until the peer's `syncDone`
+  /// proves it was applied. Only then is it marked as sent.
+  SyncDelta? _sentDelta;
   int _applied = 0;
   int _skipped = 0;
   Timer? _sessionTimer;
@@ -121,6 +124,7 @@ class SyncManager {
     _serverNonce = null;
     _peerDoneFrom = null;
     _ownDoneSent = false;
+    _sentDelta = null;
     _applied = 0;
     _skipped = 0;
 
@@ -587,6 +591,7 @@ class SyncManager {
       });
     }
     _ownDoneSent = true;
+    _sentDelta = delta;
     _emit(
       SyncPhase.exchanging,
       'Sent changes — $_applied applied, $_skipped skipped.',
@@ -628,6 +633,18 @@ class SyncManager {
 
   Future<void> _maybeComplete() async {
     if (!_ownDoneSent || _peerDoneFrom == null || !_sessionActive) return;
+
+    // The peer sent its own syncDone, which it only does after applying our
+    // rows — so now, and not a moment earlier, our delta is confirmed
+    // delivered. If the link dropped before this point the rows stay queued
+    // and go out again next time, which is exactly what we want.
+    final delivered = _sentDelta;
+    if (delivered != null && !delivered.isEmpty) {
+      final d = await db.open();
+      await d.transaction((txn) => engine.markDeltaSent(txn, delivered));
+      _sentDelta = null;
+    }
+
     await state.setLastSyncAt(DateTime.now().toUtc().toIso8601String());
     _emit(
       SyncPhase.complete,
@@ -647,6 +664,9 @@ class SyncManager {
     _sessionActive = false;
     _ownDoneSent = false;
     _peerDoneFrom = null;
+    // Dropped without the peer's syncDone: forget the delta so it is recomputed
+    // and re-sent next session rather than being silently assumed delivered.
+    _sentDelta = null;
     link.disconnectAll();
     link.stopAdvertising();
   }

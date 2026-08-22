@@ -16,8 +16,11 @@ import '../repositories/event_repository.dart';
 import '../repositories/fee_repository.dart';
 import '../repositories/progress_repository.dart';
 import '../repositories/student_repository.dart';
+import '../sync/cloud_sync.dart';
+import '../sync/drive_mailbox.dart';
 import '../sync/sync_engine.dart';
 import '../sync/sync_manager.dart';
+import '../sync/sync_mailbox.dart';
 import '../sync/sync_state.dart';
 
 /// Tandav local data service.
@@ -29,7 +32,11 @@ import '../sync/sync_state.dart';
 /// offline: no network, no server, no laptop required.
 class TandavApi {
   final TandavDatabase db;
-  TandavApi({TandavDatabase? database}) : db = database ?? TandavDatabase.instance;
+  TandavApi({TandavDatabase? database, SyncMailbox? mailbox})
+      : db = database ?? TandavDatabase.instance,
+        _mailbox = mailbox;
+
+  final SyncMailbox? _mailbox;
 
   late final AuthRepository auth = AuthRepository(db);
   late final BatchRepository batches = BatchRepository(db);
@@ -43,8 +50,24 @@ class TandavApi {
   // ---- Sync ----
   late final SyncState syncState = SyncState(db);
   late final SyncEngine syncEngine = SyncEngine(db, syncState);
+
+  /// Bluetooth sync — the fast path for when the two masters happen to be in
+  /// the same room.
   late final SyncManager sync =
       SyncManager(db: db, state: syncState, engine: syncEngine);
+
+  /// Where the two devices leave files for each other. Built lazily so tests
+  /// and Bluetooth-only use never construct a Google client.
+  late final SyncMailbox mailbox = _mailbox ?? DriveMailbox();
+
+  /// Google Drive sync — the everyday path, and the only one that works when
+  /// the two masters are in different places.
+  late final CloudSyncManager cloudSync = CloudSyncManager(
+    db: db,
+    state: syncState,
+    engine: syncEngine,
+    mailbox: mailbox,
+  );
 
   /// Generate missing monthly fee records for the current month (and any
   /// months missed while the app was closed). Idempotent; call at startup

@@ -24,6 +24,14 @@ dependencies:
     path: packages/ble_peripheral
   permission_handler: ^11.3.1
   uuid: ^4.5.1
+  # Google Drive sync mailbox. The two master devices sign into the SAME
+  # Google account; each writes one small JSON file and reads the other's.
+  # Only the narrow `drive.file` scope is requested — the app can see nothing
+  # in the user's Drive except the files it created itself.
+  google_sign_in: ^6.2.1
+  googleapis: ^13.2.0
+  googleapis_auth: ^1.6.0
+  extension_google_sign_in_as_googleapis_auth: ^2.0.12
 
 dev_dependencies:
   flutter_test:

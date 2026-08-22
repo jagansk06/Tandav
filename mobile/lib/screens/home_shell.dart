@@ -40,6 +40,9 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Pull anything the other device left in Drive while this app was closed.
+    // Silent by design — no spinner, no error if there is no internet.
+    context.read<TandavApi>().cloudSync.autoSync();
   }
 
   @override
@@ -53,7 +56,10 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       // A new month may have started while the app was backgrounded —
       // generate any missing monthly fee records locally.
-      context.read<TandavApi>().ensureMonthlyFees().catchError((_) => 0);
+      final api = context.read<TandavApi>();
+      api.ensureMonthlyFees().catchError((_) => 0);
+      // …and pick up whatever the other master changed in the meantime.
+      api.cloudSync.autoSync();
     }
   }
 

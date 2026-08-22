@@ -80,12 +80,10 @@ class SyncState {
     return id != null && id.isNotEmpty;
   }
 
-  /// Per-table watermark: the newest `updated_at` we have already merged from
-  /// the peer. Records on the peer newer than this are the incremental delta.
-  Future<String> watermark(String table) async {
-    return (await read('watermark.$table')) ?? '';
-  }
-
-  Future<void> setWatermark(String table, String maxUpdatedAt) =>
-      write('watermark.$table', maxUpdatedAt);
+  // NOTE: the per-table sync marks deliberately live in SyncEngine
+  // (SyncEngine.sentKey / SyncEngine.receivedKey) and are read and written
+  // inside the same transaction as the rows they describe. Convenience getters
+  // used to sit here and invited the assumption that one mark governs both
+  // directions, which cost us a data-loss bug; there are two marks and only
+  // `sent.<table>` may gate what we transmit.
 }

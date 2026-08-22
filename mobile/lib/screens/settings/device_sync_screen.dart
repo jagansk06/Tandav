@@ -7,12 +7,22 @@ import '../../core/format.dart';
 import '../../core/services.dart';
 import '../../core/theme.dart';
 import '../../sync/bluetooth.dart';
+import '../../sync/cloud_sync.dart';
 import '../../sync/sync_manager.dart';
 import '../../widgets/states.dart';
 
-/// Device & Sync: shows this device's TANDAV id, pairing status, discovered
-/// Tandav devices and the live pairing/sync session state, plus actions to
-/// pair, sync, unpair and cancel.
+/// Device & Sync.
+///
+/// Two ways to sync, shown in the order customers actually use them:
+///
+/// 1. **Automatic (Google Drive)** — the everyday path. Both devices sign into
+///    the same Google account and leave changes there for each other, so the
+///    two masters can be in different cities and never need to meet.
+/// 2. **Bluetooth** — the fast path for when the two devices happen to be in
+///    the same room, and the fallback when there is no internet at all.
+///
+/// Both routes feed the same merge engine, so it makes no difference to the
+/// data which one delivered a change.
 class DeviceSyncScreen extends StatefulWidget {
   const DeviceSyncScreen({super.key});
 
@@ -23,11 +33,20 @@ class DeviceSyncScreen extends StatefulWidget {
 class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
   StreamSubscription<TandavSyncStatus>? _sub;
   StreamSubscription<String>? _logSub;
+  StreamSubscription<CloudSyncStatus>? _cloudSub;
   TandavSyncStatus _last = TandavSyncStatus(SyncPhase.idle, 'Idle');
+  CloudSyncStatus _cloud = const CloudSyncStatus(CloudSyncPhase.idle, '');
   final List<String> _bleLog = [];
   String? _deviceId;
   String? _pairedWith;
   String? _lastSyncAt;
+
+  // Drive sync state.
+  bool _driveConnected = false;
+  String? _driveAccount;
+  String? _drivePeer;
+  String? _driveLastSync;
+  int _pending = 0;
 
   @override
   void initState() {
@@ -43,14 +62,102 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
         if (_bleLog.length > 6) _bleLog.removeAt(0);
       });
     });
+    _cloudSub = api.cloudSync.status.listen((s) {
+      if (mounted) setState(() => _cloud = s);
+    });
     _refresh();
+    _restoreDrive();
   }
 
   @override
   void dispose() {
     _sub?.cancel();
     _logSub?.cancel();
+    _cloudSub?.cancel();
     super.dispose();
+  }
+
+  /// Reconnect the Drive account without any prompt, so a returning user just
+  /// sees "Connected as …" instead of a sign-in screen.
+  Future<void> _restoreDrive() async {
+    final api = context.read<TandavApi>();
+    final ok = await api.cloudSync.connectSilently();
+    if (mounted) setState(() => _driveConnected = ok);
+    await _refreshDrive();
+  }
+
+  Future<void> _refreshDrive() async {
+    final api = context.read<TandavApi>();
+    final account = await api.cloudSync.cloudAccount;
+    final peer = await api.cloudSync.cloudPeerId;
+    final last = await api.cloudSync.lastCloudSyncAt;
+    final pending = await api.cloudSync.pendingRowCount();
+    if (!mounted) return;
+    setState(() {
+      _driveAccount = account;
+      _drivePeer = peer;
+      _driveLastSync = last;
+      _pending = pending;
+    });
+  }
+
+  Future<void> _connectDrive() async {
+    final api = context.read<TandavApi>();
+    final error = await api.cloudSync.connect();
+    if (!mounted) return;
+    if (error != null) {
+      Alert.show(context, error, isError: true);
+      setState(() => _driveConnected = false);
+      return;
+    }
+    setState(() => _driveConnected = true);
+    await _refreshDrive();
+    if (!mounted) return;
+    // Connecting is only useful once data starts moving, so do it right away.
+    await _driveSyncNow();
+  }
+
+  Future<void> _driveSyncNow() async {
+    final api = context.read<TandavApi>();
+    final result = await api.cloudSync.syncNow();
+    await _refreshDrive();
+    if (!mounted) return;
+    Alert.show(context, result.message, isError: !result.ok);
+  }
+
+  Future<void> _disconnectDrive() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: TandavColors.surface,
+        title: const Text('Disconnect automatic sync?'),
+        content: const Text(
+          'Changes will stop travelling between the two devices until you '
+          'connect the account again. Nothing on this device is deleted, and '
+          'the files already in Drive are left alone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(
+              'Disconnect',
+              style: TextStyle(color: TandavColors.danger),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await context.read<TandavApi>().cloudSync.disconnect();
+    if (!mounted) return;
+    setState(() {
+      _driveConnected = false;
+      _driveAccount = null;
+    });
   }
 
   Future<void> _refresh() async {
@@ -209,11 +316,13 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
             ),
           ),
           const SizedBox(height: 16),
+          _driveCard(),
+          const SizedBox(height: 16),
           _Card(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _label('SYNC SESSION'),
+                _label('BLUETOOTH — WHEN BOTH DEVICES ARE TOGETHER'),
                 const SizedBox(height: 8),
                 _phaseRow(_last.phase),
                 Text(
@@ -321,6 +430,164 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
         ],
       ),
     );
+  }
+
+  /// Automatic sync card — the everyday path, so it sits above Bluetooth.
+  Widget _driveCard() {
+    final busy = _cloud.isBusy;
+    final connected = _driveConnected;
+    return _Card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                connected
+                    ? Icons.cloud_done_rounded
+                    : Icons.cloud_off_rounded,
+                size: 18,
+                color: connected
+                    ? TandavColors.success
+                    : TandavColors.textMuted,
+              ),
+              const SizedBox(width: 8),
+              Expanded(child: _label('AUTOMATIC SYNC — WORKS FROM ANYWHERE')),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            connected
+                ? 'Connected as ${_driveAccount ?? 'your Google account'}'
+                : 'Not connected. Sign in with the SAME Google account on both '
+                    'devices — changes then travel between them on their own.',
+            style: TextStyle(
+              fontSize: 13.5,
+              fontWeight: connected ? FontWeight.w600 : FontWeight.w400,
+              color: connected
+                  ? TandavColors.textPrimary
+                  : TandavColors.textMuted,
+            ),
+          ),
+          if (connected) ...[
+            const SizedBox(height: 12),
+            _kv('Other device', _drivePeer ?? 'Waiting for its first sync'),
+            _kv('Last sync', _ago(_driveLastSync)),
+            _kv(
+              'Waiting to send',
+              _pending == 0
+                  ? 'Nothing — everything is sent'
+                  : '$_pending ${_pending == 1 ? 'change' : 'changes'}',
+            ),
+          ],
+          if (_cloud.message.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                if (busy)
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: TandavColors.gold,
+                    ),
+                  )
+                else
+                  Icon(
+                    _cloud.phase == CloudSyncPhase.failed
+                        ? Icons.error_rounded
+                        : Icons.check_circle_rounded,
+                    size: 16,
+                    color: _cloud.phase == CloudSyncPhase.failed
+                        ? TandavColors.danger
+                        : TandavColors.success,
+                  ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _cloud.message,
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      color: TandavColors.textPrimary,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+          const SizedBox(height: 14),
+          if (!connected)
+            GoldButton(
+              label: 'Connect Google account',
+              onPressed: busy ? null : _connectDrive,
+            )
+          else ...[
+            GoldButton(
+              label: busy ? 'Syncing…' : 'Sync now',
+              onPressed: busy ? null : _driveSyncNow,
+            ),
+            const SizedBox(height: 8),
+            Center(
+              child: TextButton(
+                onPressed: busy ? null : _disconnectDrive,
+                child: const Text(
+                  'Disconnect account',
+                  style: TextStyle(color: TandavColors.textMuted),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _kv(String key, String value) => Padding(
+    padding: const EdgeInsets.only(bottom: 6),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 118,
+          child: Text(
+            key,
+            style: const TextStyle(
+              fontSize: 12.5,
+              color: TandavColors.textMuted,
+            ),
+          ),
+        ),
+        Expanded(
+          child: Text(
+            value,
+            style: const TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+              color: TandavColors.textPrimary,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  /// "Never", "Just now", "12 minutes ago", "Yesterday", "14/08/2026".
+  String _ago(String? iso) {
+    if (iso == null || iso.isEmpty) return 'Never';
+    final when = DateTime.tryParse(iso);
+    if (when == null) return Fmt.date(iso);
+    final diff = DateTime.now().difference(when.toLocal());
+    if (diff.isNegative || diff.inMinutes < 1) return 'Just now';
+    if (diff.inMinutes < 60) {
+      return '${diff.inMinutes} ${diff.inMinutes == 1 ? 'minute' : 'minutes'} ago';
+    }
+    if (diff.inHours < 24) {
+      return '${diff.inHours} ${diff.inHours == 1 ? 'hour' : 'hours'} ago';
+    }
+    if (diff.inDays == 1) return 'Yesterday';
+    if (diff.inDays < 7) return '${diff.inDays} days ago';
+    return Fmt.date(iso);
   }
 
   Widget _peerTile(BlePeer peer, {required bool enabled}) {

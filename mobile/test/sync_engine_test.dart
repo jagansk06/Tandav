@@ -63,6 +63,12 @@ void main() {
           t, delta.tables,
           peerDeviceId: peerDeviceId)));
 
+  /// Stand-in for a transport confirming delivery. The real carriers call this
+  /// after a successful Drive write / the peer's `syncDone`, and suppression of
+  /// repeat sends depends entirely on it.
+  Future<void> markSent(SyncDelta delta) => open().then(
+      (d) => d.transaction((t) => currentEngine.markDeltaSent(t, delta)));
+
   Future<int> seedStudent(String name, {int? batchId}) async {
     final d = await open();
     return d.insert('students', {
@@ -135,7 +141,7 @@ void main() {
         0;
   }
 
-  test('records flow both ways, FKs remap, and watermarks suppress repeats',
+  test('records flow both ways, FKs remap, and confirmed sends suppress repeats',
     () async {
     await device('a');
     final aId = me();
@@ -145,6 +151,7 @@ void main() {
     final aDelta = await outbound();
     expect(aDelta.tables['batches']!.length, 1);
     expect(aDelta.tables['students']!.length, 1);
+    await markSent(aDelta);
 
     await device('b');
     final bId = me();
@@ -166,24 +173,33 @@ void main() {
     // B creates a second student, syncs back to A.
     await seedStudent('Meera');
     final bDelta = await outbound();
+    await markSent(bDelta);
     await device('a');
     final appliedA = await applyTo(bDelta, bId);
     expect(appliedA.totalApplied, greaterThan(0));
     expect(await findStudent('Meera'), isNotNull);
 
-    // A's next delta must NOT re-send Meera — the watermark advanced. The
-    // batch row MAY be re-sent: the watermark only covers data received from
-    // the peer, so our own rows in tables the peer never sent us are
-    // retransmitted (the peer skips them as unchanged echoes).
+    // A's batch row is not re-sent: A delivered it and marked it so.
+    //
+    // Meera IS offered back once. That is the deliberate price of filtering
+    // outbound by "what we have delivered" rather than "what we have received":
+    // A has never *sent* Meera, so A offers her. Sending one redundant row is
+    // harmless — B skips it as an unchanged echo — whereas the reverse mistake
+    // silently loses edits forever, which is the bug this design replaced.
     final aDelta2 = await outbound();
-    expect(aDelta2.rowCount, 1);
-    expect(aDelta2.tables['students'] ?? const [], isEmpty);
-    expect((aDelta2.tables['batches'] ?? const []).length, 1);
+    expect(aDelta2.tables['batches'] ?? const [], isEmpty);
+    expect((aDelta2.tables['students'] ?? const []).length, 1);
 
-    // B is not bothered by the repeated batch row.
     await device('b');
     final appliedB2 = await applyTo(aDelta2, aId);
-    expect(appliedB2.totalApplied, 0);
+    expect(appliedB2.totalApplied, 0, reason: 'B already has Meera');
+
+    // The echo terminates — this is the property that actually matters, because
+    // a re-send that never stopped would be an infinite loop between the two
+    // phones.
+    await device('a');
+    await markSent(aDelta2);
+    expect((await outbound()).rowCount, 0);
   });
 
   test('last-write-wins by updated_at', () async {

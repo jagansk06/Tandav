@@ -469,7 +469,7 @@ class TandavDatabase {
   Future<bool> restoreFromBackup(File backup) async {
     final db = await open();
     final livePath = db.path;
-    final backupPath = await backup.absolute.path;
+    final backupPath = backup.absolute.path;
     if (backupPath == livePath) return false;
 
     // Copy backup to a staging path first so a failed copy never truncates

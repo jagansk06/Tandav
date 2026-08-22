@@ -15,6 +15,12 @@
         android:maxSdkVersion="30" />
     <uses-feature android:name="android.hardware.bluetooth_le"
         android:required="true" />
+    <!-- Google Drive sync mailbox: the two masters are usually in different
+         places, so changes travel through one small file in a shared Google
+         account instead of over Bluetooth. The app talks to Google only —
+         there is no Tandav server. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <application
         android:label="Tandav"
         android:name="${applicationName}"
