@@ -112,10 +112,10 @@ if (-not $LogOnly) {
 }
 
 Write-Host ''
-Write-Host '  On the phone now: log in, then Settings -> Device & Sync ->' -ForegroundColor White
-Write-Host '  Connect Google Drive, and let it fail.' -ForegroundColor White
+Write-Host '  Reproduce whatever you are testing on the phone now, then come' -ForegroundColor White
+Write-Host '  back here. (Sync test: Settings -> Device & Sync -> Sync now.)' -ForegroundColor White
 Write-Host ''
-Read-Host '  Press Enter here once you have reproduced it'
+Read-Host '  Press Enter here once you are done on the phone'
 
 & $Adb logcat -d -v time > $LogFile
 $size = (Get-Item $LogFile).Length

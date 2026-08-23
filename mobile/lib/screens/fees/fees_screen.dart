@@ -168,7 +168,7 @@ class _FeesScreenState extends State<FeesScreen> {
             children: [
               Expanded(
                 child: DropdownButtonFormField<int?>(
-                  value: _batchId,
+                  initialValue: _batchId,
                   isExpanded: true,
                   decoration: const InputDecoration(
                     labelText: 'Batch',

@@ -114,7 +114,7 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                   builder: (context, snapshot) {
                     final batches = snapshot.data ?? [];
                     return DropdownButtonFormField<int?>(
-                      value: _selectedBatchId,
+                      initialValue: _selectedBatchId,
                       isExpanded: true,
                       decoration: const InputDecoration(
                         labelText: 'Batch',

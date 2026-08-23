@@ -641,4 +641,91 @@ void main() {
     expect(again.items.single.firstName, 'Neha');
     expect((await api.getFees(studentId: studentId)).total, 1);
   });
+
+  test("restoring your own backup keeps this device's sync identity", () async {
+    final api = await freshApi();
+    final db = TandavDatabase.instance;
+    final idBefore = db.deviceId;
+
+    // A delivered mark, to prove the ordinary restore does not throw away sync
+    // bookkeeping that was expensively earned.
+    final live = await db.open();
+    await live.insert('sync_state',
+        {'key': 'sent.students', 'value': '2026-01-01T00:00:00.000Z'});
+
+    final studentId = await createStudent(api, name: 'Ravi');
+    final backup = await api.createBackup();
+    await api.students.deleteStudent(studentId);
+
+    expect(await api.restoreFromBackup(backup), isTrue);
+    expect((await api.getStudents()).total, 1);
+
+    expect(db.deviceId, idBefore,
+        reason: 'a phone restoring its own backup is still the same device');
+    final marks = await (await db.open())
+        .query('sync_state', where: 'key = ?', whereArgs: ['sent.students']);
+    expect(marks, hasLength(1),
+        reason: 'clearing the sent marks here would re-send the whole database');
+  });
+
+  test("restoring another phone's backup mints a fresh sync identity",
+      () async {
+    final api = await freshApi();
+    final db = TandavDatabase.instance;
+    final idBefore = db.deviceId;
+
+    await createStudent(api, name: 'Meera');
+    final backup = await api.createBackup();
+
+    // Make the backup look like it came off the partner phone: its own device
+    // id, the pairing it had, and marks claiming rows were already delivered.
+    const otherId = 'TANDAV-OTHR';
+    final donor = await databaseFactoryFfi.openDatabase(backup.path);
+    await donor.update('sync_state', {'value': otherId},
+        where: 'key = ?', whereArgs: ['device_id']);
+    const planted = {
+      'cloud_peer_device_id': 'TANDAV-ZZZZ',
+      'paired_device_id': 'TANDAV-ZZZZ',
+      'pairing_secret': 'shared-secret',
+      'cloud_last_sync_at': '2026-01-01T00:00:00.000Z',
+      'last_sync_at': '2026-01-01T00:00:00.000Z',
+      'sent.students': '2026-01-01T00:00:00.000Z',
+      'watermark.batches': '2026-01-01T00:00:00.000Z',
+    };
+    for (final e in planted.entries) {
+      await donor.insert('sync_state', {'key': e.key, 'value': e.value});
+    }
+    await donor.close();
+
+    expect(await api.restoreFromBackup(backup), isTrue);
+
+    // The data still arrives — this is a restore, not a refusal.
+    expect((await api.getStudents()).total, 1);
+    expect((await api.getStudents()).items.single.firstName, 'Meera');
+
+    // The identity does not. Inheriting it would aim both phones at the same
+    // `tandav-<id>.json`, where each overwrites the other, and — because a
+    // device skips its own file when looking for a peer — neither would ever
+    // see a partner again.
+    expect(db.deviceId, isNot(otherId));
+    expect(db.deviceId, isNot(idBefore));
+    expect(db.deviceId, matches(r'^TANDAV-[2-9A-HJ-NP-Z]{4}$'));
+
+    final keys = (await (await db.open()).query('sync_state'))
+        .map((r) => r['key'] as String)
+        .toSet();
+    for (final gone in [
+      'cloud_peer_device_id',
+      'paired_device_id',
+      'pairing_secret',
+      'cloud_last_sync_at',
+      'last_sync_at',
+    ]) {
+      expect(keys, isNot(contains(gone)), reason: '$gone described the donor');
+    }
+    // The sent marks are the dangerous ones. Left in place, rows this phone has
+    // never uploaded would already count as delivered and become unsendable.
+    expect(keys.where((k) => k.startsWith('sent.')), isEmpty);
+    expect(keys.where((k) => k.startsWith('watermark.')), isEmpty);
+  });
 }

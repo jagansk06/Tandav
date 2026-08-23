@@ -35,6 +35,26 @@
 ///    APK; the Drive grant is per app, so a differently-signed build cannot
 ///    see the other phone's file.
 ///
+/// ### Extra steps for the iPhone build (the PWA)
+///
+/// 4. Create a **Web OAuth client** and list every origin the PWA is served
+///    from under *Authorized JavaScript origins* — the GitHub Pages URL, plus
+///    `http://localhost:<port>` for local testing. GIS refuses to run from an
+///    origin that is not listed, so `flutter run -d chrome` must be given a
+///    fixed `--web-port` rather than the random one it picks by default.
+/// 5. Put that client id in `web/index.html` as
+///    `<meta name="google-signin-client_id" content="…">`. The plugin picks it
+///    up from there; `clientId` stays null in Dart so Android keeps using its
+///    own client. The id is not a secret and is meant to be public.
+/// 6. Enable the **People API** in the same project, and add the
+///    `userinfo.email` and `userinfo.profile` scopes to the consent screen.
+///    This looks gratuitous and is not: on the web, `signIn()` returns an
+///    access token but **no identity**, so the plugin fetches the signed-in
+///    email from `people/me` to fill in the account. Without it, sign-in
+///    succeeds and then fails on "which account was that?". Both scopes are
+///    non-sensitive, so neither triggers Google verification. Verified against
+///    google_sign_in_web 0.12.4+4, `gis_client.signIn` and `people.dart`.
+///
 /// Nothing here expires and nothing needs renewing.
 library;
 
@@ -42,6 +62,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sign_in_as_googleapis_auth.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:googleapis_auth/googleapis_auth.dart' show AuthClient;
@@ -101,6 +122,21 @@ class DriveMailbox extends SyncMailbox {
 
   @override
   Future<bool> connectSilently() async {
+    // On the web there is nothing silent to attempt, so don't try.
+    //
+    // `google_sign_in_web` implements `signInSilently()` as `id.prompt()` —
+    // Google's **One Tap card**, a visible overlay. Calling it on every launch
+    // would flash a Google panel over the app, and on iPhone it fails anyway:
+    // One Tap needs third-party cookies, which Safari blocks by default.
+    // Verified against google_sign_in_web 0.12.4+4, `gis_client.signInSilently`.
+    //
+    // Nothing is lost by skipping it. The browser holds the Drive access token
+    // in memory only, so a reload has no token to restore whatever we do here
+    // — a fresh one needs a popup, and a popup needs a tap. The Device Sync
+    // screen still shows the remembered account name (that lives in the
+    // database), so the customer sees "Connected as …" and one Connect tap
+    // resumes syncing. Everything else in the app works offline meanwhile.
+    if (kIsWeb) return false;
     try {
       final account = await _signIn.signInSilently();
       if (account == null) return false;
@@ -154,6 +190,14 @@ class DriveMailbox extends SyncMailbox {
   /// treated as "granted" and the first real Drive call becomes the test — its
   /// 401/403 is already turned into a "reconnect the account" message by
   /// [_friendly], which is a far better failure than crashing on connect.
+  ///
+  /// On the web it is real, and it answers **false far more often than it
+  /// looks like it should**: it compares against the last token response held
+  /// in the plugin's memory, so any page reload makes it false even though the
+  /// customer granted permission months ago. Verified against
+  /// google_sign_in_web 0.12.4+4, `gis_client.canAccessScopes`. That is why
+  /// [connectSilently] does not bother on web — a false here with
+  /// `interactive: false` can only end in giving up.
   Future<bool> _scopesGranted() async {
     try {
       return await _signIn.canAccessScopes(_scopes);
@@ -363,6 +407,37 @@ class DriveMailbox extends SyncMailbox {
         text.contains('Failed host lookup') ||
         text.contains('ClientException')) {
       return 'No internet connection. Sync will run next time you are online.';
+    }
+    // Browser-only failures. `google_sign_in_web` wraps whatever Google
+    // Identity Services reports into a PlatformException whose `code` is the
+    // raw GIS reason string, so match on the text rather than on a type.
+    if (text.contains('popup_failed_to_open') ||
+        text.contains('popup_closed')) {
+      return 'The Google sign-in window did not open. Allow pop-ups for this '
+          'page, then tap Connect again.';
+    }
+    if (text.contains('access_denied')) {
+      return 'Permission was declined. Tandav can only sync if it may store '
+          'its own file in your Drive.';
+    }
+    if (text.contains('invalid_client') ||
+        text.contains('unauthorized_client') ||
+        text.contains('idpiframe_initialization_failed')) {
+      // The two ways the PWA is normally mis-deployed: the placeholder client
+      // id was never replaced in `web/index.html`, or the address it is being
+      // served from is missing from the Web client's Authorized JavaScript
+      // origins. Both are developer errors, so name them rather than blaming
+      // the customer's account.
+      return 'Google would not accept this copy of the app. Check the web '
+          'client id in web/index.html, and that this exact address is listed '
+          'as an authorised origin.';
+    }
+    if (text.contains('content-people.googleapis.com') ||
+        text.contains('People API')) {
+      // Only the *web* sign-in reaches the People API, and only to learn which
+      // email signed in. See the setup note at the top of this file.
+      return 'Google let you sign in but would not say which account it was. '
+          'The People API may not be switched on for this app yet.';
     }
     return 'Could not reach Google Drive: $text';
   }

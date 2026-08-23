@@ -15,14 +15,37 @@ dependencies:
   intl: ^0.20.0
   image_picker: ^1.1.2
   sqflite: ^2.4.1
+  # `sqflite` has no web implementation, so the iPhone PWA opens the same schema
+  # through WASM SQLite persisted in IndexedDB instead. Selected in
+  # `lib/platform/app_files.dart`; only the web half of that conditional import
+  # ever compiles this package, so the Android build is untouched. The
+  # `package:sqflite` types stay usable on both — it is only the platform
+  # channel behind them that is Android-only.
+  sqflite_common_ffi_web: ^0.4.0
+  # PINNED, AND THE EXACT VERSION MATTERS. This is normally a transitive
+  # dependency; it is listed here only to hold it at one version.
+  #
+  # `sqlite3` is the Dart half of WASM SQLite: it supplies the JavaScript
+  # functions that `sqlite3.wasm` imports. The binary and this package are built
+  # together and their import names change between major versions, but
+  # `sqflite_common_ffi_web` declares `sqlite3: '>=2.4.6 <4.0.0'` while its setup
+  # script downloads the binary from a HARD-CODED release —
+  # `sqlite3-2.4.6/sqlite3.wasm`, see
+  # `lib/src/setup/sqlite3_wasm_version.dart` in that package. Left alone, pub
+  # resolves 3.x, the 2.4.6 binary asks for `dart.function_xFunc` and
+  # `env.memory`, 3.x offers `dart.dispatch_xFunc` and no imported memory, and
+  # `WebAssembly.instantiateStreaming` fails with a LinkError. The app then hangs
+  # on the splash screen.
+  #
+  # If `sqflite_common_ffi_web` is ever upgraded, read its
+  # `sqlite3_wasm_version.dart` and set this to the version in that path, then
+  # re-run `dart run sqflite_common_ffi_web:setup`. Android does not use any of
+  # this — it has real native SQLite through `sqflite`.
+  sqlite3: 2.4.6
   path_provider: ^2.1.5
   path: ^1.9.0
   crypto: ^3.0.6
   url_launcher: ^6.3.0
-  flutter_blue_plus: ^2.3.12
-  ble_peripheral:
-    path: packages/ble_peripheral
-  permission_handler: ^11.3.1
   uuid: ^4.5.1
   # Google Drive sync mailbox. The two master devices sign into the SAME
   # Google account; each writes one small JSON file and reads the other's.

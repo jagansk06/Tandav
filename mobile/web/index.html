@@ -1,46 +1,132 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <!--
-    If you are serving your web app in a path other than the root, change the
-    href value below to reflect the base path you are serving from.
-
-    The path provided below has to start and end with a slash "/" in order for
-    it to work correctly.
-
-    For more details:
-    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
-
-    This is a placeholder for base href that will be replaced by the value of
-    the `--base-href` argument provided to `flutter build`.
+    Rewritten by `flutter build web --base-href`. GitHub Pages serves this app
+    from a subpath (…github.io/<repo>/), so the deploy command MUST pass
+    `--base-href /<repo>/` or every asset request 404s and the page stays blank.
   -->
   <base href="$FLUTTER_BASE_HREF">
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
+  <meta name="description" content="Tandav — dance studio management. Works offline.">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
 
-  <!-- iOS meta tags & icons -->
+  <!--
+    Google sign-in client id for the WEB build only.
+
+    ==> REPLACE the content below with your Web OAuth client id. <==
+    It is the same id you paste into tools/fake-peer.html. This value is
+    public by design — it is not a secret and is safe to commit.
+
+    The Android build ignores this entirely and uses its own OAuth client,
+    keyed to the release keystore's SHA-1.
+  -->
+  <meta name="google-signin-client_id"
+        content="209094615335-ii905pbco2bvtvdrl83g6fo4mc679dm5.apps.googleusercontent.com">
+
+  <!--
+    iOS home-screen behaviour. `apple-mobile-web-app-capable` is the legacy
+    spelling and `mobile-web-app-capable` the standard one; both are present
+    because older iOS honours only the first and newer Safari only warns about
+    it. Without one of them, tapping the home-screen icon opens a Safari tab
+    with an address bar instead of a standalone app.
+
+    `black-translucent` lets the app paint under the status bar, which suits the
+    dark theme; the viewport `viewport-fit=cover` above is what makes the safe
+    area available so text does not slide under the notch.
+  -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="tandav_mobile">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Tandav">
+  <meta name="theme-color" content="#0B0B0E">
+
+  <!--
+    iOS ignores the icons declared in manifest.json and uses this link instead,
+    so it has to be here as well as there or the home-screen icon becomes a
+    grey screenshot of the page.
+  -->
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
-  <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>tandav_mobile</title>
+  <title>Tandav</title>
   <link rel="manifest" href="manifest.json">
+
+  <style>
+    /*
+      Shown while the Flutter engine downloads. Matched to the app's own
+      background so launching the PWA does not flash white — which, on a phone
+      in a dark studio, reads as a crash. Removed by the script below once the
+      first frame is up.
+    */
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background-color: #0B0B0E;
+      color: #D4AF37;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #tandav-boot {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      letter-spacing: 0.35em;
+      font-size: 15px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+  </style>
 </head>
 <body>
-  <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
+  <div id="tandav-boot">Tandav</div>
 
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
-  -->
+  <script>
+    // The engine fires this once the app has rendered. Guarded with a timeout
+    // so a failed load does not leave the word "TANDAV" sitting over a broken
+    // page forever with no way to see the real error underneath.
+    window.addEventListener('flutter-first-frame', function () {
+      var boot = document.getElementById('tandav-boot');
+      if (boot) boot.remove();
+    });
+    setTimeout(function () {
+      var boot = document.getElementById('tandav-boot');
+      if (boot) boot.remove();
+    }, 20000);
+  </script>
+
+  <script>
+    // Register Tandav's own service worker — the reason the iPhone version can
+    // open with no internet. Flutter no longer provides one; see tandav_sw.js
+    // for the whole story. The app must therefore be built with
+    // `--pwa-strategy=none`, or Flutter would also register a worker of its own
+    // for this same scope and the two would fight over it.
+    //
+    // Skipped on localhost, because `flutter run -d chrome` serves a debug
+    // build whose JavaScript changes on every hot restart, and a cache-first
+    // worker would keep handing back the previous version — which looks exactly
+    // like hot reload being broken. To test offline behaviour locally, serve
+    // `build/web` and open it once with `?sw=1`; the worker then stays
+    // registered for that browser afterwards.
+    (function () {
+      if (!('serviceWorker' in navigator)) return;
+      var host = window.location.hostname;
+      var local = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+      if (local && window.location.search.indexOf('sw=1') === -1) return;
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('tandav_sw.js').catch(function (e) {
+          // Not fatal: the app still runs, it just needs the network each time.
+          console.warn('Tandav: offline cache unavailable —', e);
+        });
+      });
+    })();
+  </script>
+
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

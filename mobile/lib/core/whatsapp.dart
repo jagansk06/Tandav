@@ -1,3 +1,8 @@
+// `kIsWeb` has to be imported explicitly. `material.dart` re-exports
+// `widgets.dart`, which re-exports `foundation.dart` with only
+// `show Brightness, UniqueKey` — so importing material does NOT bring it in.
+// Same pattern as sync/drive_mailbox.dart.
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -8,12 +13,12 @@ enum WhatsAppOpenResult { launched, notInstalled, invalidNumber }
 
 /// WhatsApp messaging helper for fee receipts and reminders.
 ///
-/// Uses the standard WhatsApp deep-link mechanism —
-/// `whatsapp://send?phone=<country_code_and_number>&text=<url_encoded_message>`
-/// (the same intent behind the canonical `https://wa.me/<number>?text=...`
-/// links) — so no WhatsApp Business API, Meta Cloud API or third-party
-/// provider is involved. The admin still presses Send inside WhatsApp; this
-/// feature never sends anything automatically.
+/// Uses the standard WhatsApp deep-link mechanism — `whatsapp://send?...` on
+/// Android, and the canonical `https://wa.me/<number>?text=...` form of the
+/// same link in the browser, which is how the iPhone build ships. No WhatsApp
+/// Business API, Meta Cloud API or third-party provider is involved. The admin
+/// still presses Send inside WhatsApp; this feature never sends anything
+/// automatically.
 ///
 /// Opening a chat never touches the fee/student records in the database.
 class WhatsAppService {
@@ -80,6 +85,9 @@ class WhatsAppService {
   /// attempted unconditionally and only reported as failed when the system
   /// genuinely cannot handle the intent (i.e. WhatsApp is not installed). A
   /// malformed number returns [WhatsAppOpenResult.invalidNumber].
+  ///
+  /// On the web [WhatsAppOpenResult.notInstalled] is effectively never
+  /// returned; see the note on the return value below.
   static Future<WhatsAppOpenResult> openChat({
     required String number,
     required String message,
@@ -87,15 +95,28 @@ class WhatsAppService {
     final normalized = normalizeIndianNumber(number);
     if (normalized == null) return WhatsAppOpenResult.invalidNumber;
 
-    // Standard WhatsApp deep link. `phone` is the international number without
-    // the leading '+', and `text` is URL-encoded for us by [Uri], so spaces,
-    // line breaks, ₹, emojis and any other special characters survive the
-    // query string intact.
-    final uri = Uri(
-      scheme: 'whatsapp',
-      host: 'send',
-      queryParameters: {'phone': normalized, 'text': message},
-    );
+    // Two spellings of the same link, because a browser cannot use the first.
+    //
+    // Android keeps `whatsapp://send?phone=…&text=…`. `phone` is the
+    // international number without the leading '+', and `text` is URL-encoded
+    // for us by [Uri], so spaces, line breaks, ₹, emojis and any other special
+    // characters survive the query string intact. `AndroidManifest.xml` already
+    // declares this scheme under `<queries>`.
+    //
+    // The iPhone build gets `https://wa.me/<number>?text=…`. Safari will not
+    // hand an unknown URL scheme from a web page off to another app, so
+    // `whatsapp://` there does nothing whatsoever — no chat and no error, which
+    // is the worst kind of broken. `wa.me` is an ordinary https link that iOS
+    // recognises as belonging to WhatsApp and opens the app directly; with
+    // WhatsApp absent it lands on WhatsApp's own page, which at least explains
+    // itself.
+    final uri = kIsWeb
+        ? Uri.https('wa.me', '/$normalized', {'text': message})
+        : Uri(
+            scheme: 'whatsapp',
+            host: 'send',
+            queryParameters: {'phone': normalized, 'text': message},
+          );
 
     // We deliberately do NOT gate the launch behind canLaunchUrl(): on some
     // devices (package-visibility / OEM restrictions, aggressive battery
@@ -104,7 +125,24 @@ class WhatsAppService {
     // installed" message. Instead we attempt the real launch and treat a
     // failure as the only reliable signal that WhatsApp is unavailable.
     try {
-      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      final ok = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+        // Web only, and it is what makes this work at all. With no window name
+        // the plugin calls `window.open(url, '')` — a pop-up — and browsers
+        // block pop-ups that are not the direct result of a tap. This one is
+        // not: the caller loads the student from the database first, and that
+        // await ends the user gesture. `_self` navigates the current page
+        // instead, which is never blocked; iOS then hands the wa.me link to
+        // WhatsApp, with Tandav still sitting behind it.
+        webOnlyWindowName: kIsWeb ? '_self' : null,
+      );
+      // On the web `ok` is not evidence of anything: the plugin opens the
+      // window with `noopener`, cannot observe the result, and returns true
+      // unconditionally — verified in url_launcher_web 2.4.3, `openNewWindow`.
+      // So "WhatsApp is not installed" is a message only Android can honestly
+      // produce, and the browser simply navigates and lets the user see what
+      // happened.
       return ok ? WhatsAppOpenResult.launched : WhatsAppOpenResult.notInstalled;
     } on Exception {
       return WhatsAppOpenResult.notInstalled;

@@ -1,18 +1,29 @@
 /// The file format two Tandav devices exchange through a [SyncMailbox].
 ///
 /// A bundle is a single JSON document holding one device's outbound delta for
-/// *all* synced tables at once. The BLE path sends one message per table
-/// because a Bluetooth link is a live conversation; a mailbox is not, so
-/// everything travels together and is applied in one transaction. That is what
-/// makes foreign-key remapping work: parents and children always arrive
-/// together and can never be split across two separate deliveries.
+/// *all* synced tables at once. Everything travels together and is applied in
+/// one transaction, which is what makes foreign-key remapping work: parents and
+/// children always arrive together and can never be split across two separate
+/// deliveries. (The removed Bluetooth path sent one message per table, because
+/// a live link is a conversation and a mailbox is not.)
 library;
 
 import 'dart:convert';
 
-import 'protocol.dart';
 import 'sync_codec.dart';
 import 'sync_engine.dart';
+
+/// Version of the bundle format, carried in every file as `protocol`.
+///
+/// **Do not change this to tidy up.** Bundles already sitting in customers'
+/// Drive folders carry `1`, and [SyncBundle.decode] rejects anything else, so
+/// bumping it makes both devices refuse the file the other one last wrote.
+/// Bump it only for a real, incompatible format change — and then only
+/// alongside code that can still read `1`.
+///
+/// It previously lived in `protocol.dart` with the Bluetooth wire framing, and
+/// moved here when that file was deleted. The value did not change.
+const int syncProtocolVersion = 1;
 
 /// Thrown when a file in the mailbox is not a bundle we can apply.
 class SyncBundleException implements Exception {

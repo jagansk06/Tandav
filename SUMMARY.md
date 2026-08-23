@@ -1,126 +1,356 @@
 # Tandav — Dance Studio Management System
 
-Flutter mobile app + FastAPI backend + PostgreSQL. Dark black/gold "Tandav" theme.
-No external services (no WhatsApp, no payment gateway, no Firebase).
+A **dance studio management app** sold to studios as a one-time purchase.
+Batches, students, attendance, fees, events and costumes, monthly progress,
+reports. Dark black/gold theme.
 
-## Folder structure
+**Local-first.** Everything lives in an on-device SQLite database and the whole
+app works with no internet at all. There is **no Tandav server** and nothing to
+renew. Two devices run the same data as **two equal masters** and keep each
+other in sync through a shared Google Drive account.
+
+> **This file was rewritten on 2026-08-23.** Every earlier version described a
+> FastAPI + PostgreSQL + JWT client-server app and referenced
+> `lib/core/api_client.dart`, which no longer exists. If you find another doc
+> claiming Tandav talks to an HTTP API, that doc is stale.
+
+## `backend/` is dead code — deliberately kept
+
+The repo still contains `backend/` (46 Python files: FastAPI, SQLAlchemy,
+Alembic, Postgres) and `scripts/e2e_smoke.py`, which drives that API. **None of
+it is used, built, tested or shipped.** The Flutter app has no `http`
+dependency at all — verify with `mobile/pubspec.yaml` if you doubt it.
+
+It is retained on purpose as history, not as a component. **Do not** try to run
+it, migrate it, or "reconnect" the app to it. Reintroducing a server would break
+the product promise: the studios own the app outright and nothing about it may
+depend on infrastructure someone has to pay for and keep alive.
+
+## Layout
 
 ```
 Tandav/
-├── backend/                  # FastAPI application
-│   ├── app/
-│   │   ├── main.py           # FastAPI app, CORS, /uploads static, /health
-│   │   ├── core/             # config (env), security (JWT+bcrypt), formatting
-│   │   ├── db/               # session, Base
-│   │   ├── models/           # User, Batch, Student, Attendance, MonthlyAttendance,
-│   │   │                     # Fee, Event, EventParticipation, MonthlyProgress
-│   │   ├── schemas/          # auth, batch, student, attendance, fee, event, progress, dashboard
-│   │   ├── api/v1/           # auth, batches, students, attendance, fees, events, progress, dashboard, reports
-│   │   ├── api/deps.py       # JWT dependency, current user
-│   │   └── seed.py           # demo data (explicit: python -m app.seed)
-│   ├── alembic/              # migrations (initial_schema: 10 tables)
-│   ├── tests/                # conftest + test_api — 40 tests, all passing
-│   ├── requirements.txt
-│   └── .env.example          # documented env vars (no real secrets)
-├── mobile/                   # Flutter app (android + web)
+├── SYNC.md                  # the sync design in depth — read this first
+├── OAUTH-SETUP.md           # one-time Google Cloud Console setup
+├── PWA.md                   # the iPhone build: flags, deploy, offline, limits
+├── IPHONE-INVITE.md         # the link + paste-ready message for an iPhone user
+├── ship.ps1                 # build + verify signature + install + capture logs
+├── tools/
+│   ├── verify-apk.ps1       # signature gate for a hand-copied APK (no cable)
+│   ├── deploy-pwa.ps1       # build + prune + stamp + publish the public site
+│   ├── make-web-icons.py    # PWA icons from the studio logo
+│   ├── fake-peer.html       # impersonate a 2nd device from a browser
+│   └── drive-visibility-test.html
+├── mobile/                  # THE APP
 │   ├── lib/
-│   │   ├── main.dart         # RootGate → Login / HomeShell (AuthState)
-│   │   ├── core/             # api_client (10.0.2.2 for emulator), auth_state,
-│   │   │                     # theme (TandavColors/TandavTheme), services (TandavApi), format (Fmt/Alert)
-│   │   ├── models/           # user, batch, student, attendance, fee, event, progress, dashboard
-│   │   ├── widgets/states.dart  # LoadingView, ErrorView, EmptyView, StatusBadge, GoldButton
-│   │   └── screens/          # login, home_shell (6 tabs + overflow), dashboard, students,
-│   │                         # batches, attendance (daily + monthly), fees, events,
-│   │                         # progress, reports
-│   └── test/widget_test.dart # 7 unit/widget tests, all passing
-└── scripts/e2e_smoke.py      # end-to-end API smoke test (login → CRUD → reports → cleanup)
+│   │   ├── main.dart        # RootGate → Signup / Login / HomeShell
+│   │   ├── core/            # services (TandavApi facade), auth_state, theme,
+│   │   │                    # format, whatsapp (deep links)
+│   │   ├── platform/        # the Android/web split — see below
+│   │   ├── database/        # tandav_database.dart (schema, migrations, backups)
+│   │   ├── models/          # plain data classes
+│   │   ├── repositories/    # 8 repositories, all sqflite
+│   │   ├── sync/            # 8 files — see SYNC.md
+│   │   ├── screens/         # 24 screens
+│   │   └── widgets/states.dart
+│   ├── web/                 # PWA shell: index.html, manifest, tandav_sw.js,
+│   │   │                    # icons/, sqlite3.wasm (no sqflite_sw.js — see PWA.md)
+│   └── test/                # 7 files, 64 tests
+├── backend/                 # DEAD (see above)
+└── scripts/e2e_smoke.py     # DEAD (drives the dead API)
 ```
 
-APK artifact: `mobile/build/app/outputs/flutter-apk/app-debug.apk`
+### `lib/platform/` — the one place that knows which platform this is
 
-## Tech stack & dependencies
-
-| Layer      | Stack                                                            |
-|------------|------------------------------------------------------------------|
-| Backend    | Python 3.12, FastAPI, Uvicorn, SQLAlchemy 2, Alembic, psycopg2, PyJWT, bcrypt, pydantic-settings, pytest+httpx |
-| Mobile     | Flutter 3.44 / Dart 3.12; http, provider, shared_preferences, intl, image_picker, flutter_lints |
-| Database   | PostgreSQL (project-local cluster, port 5433, user `tandav`)     |
-
-## Database schema (10 tables)
-
-`users` · `batches` · `students` · `attendance` · `monthly_attendance` · `fees` ·
-`events` · `event_participations` · `monthly_progress`
-
-Key semantics:
-- `students.batch_id` → `batches.id` **SET NULL** (deleting a batch leaves students as "Unassigned" rather than losing them); all student children (attendance, monthly_attendance, fees, participations, progress) **CASCADE** on student delete.
-- `fees.amount_paid` is additive — each recorded payment increments it; `status` derived from due vs paid (due / partial / paid).
-- `event_participations.costume_fee_paid` additive; `costume_status` derived.
-- `MonthlyAttendance` aggregates recomputed after every daily attendance save.
-- `monthly_progress.attendance_percentage` auto-synced from the month's attendance.
-
-## API endpoints (all under `/api/v1`, JWT bearer)
-
-| Group | Endpoints |
-|-------|-----------|
-| auth  | POST `/auth/login` · GET `/auth/me` · POST `/auth/change-password` |
-| batches | GET/POST `/batches` · GET/PUT/DELETE `/batches/{id}` |
-| students | GET/POST `/students` (search/filter) · GET/PUT/DELETE `/students/{id}` · POST `/students/{id}/photo` |
-| attendance | GET/PUT `/attendance/day` · POST `/attendance/day/{id}/status` · DELETE `/attendance/day/{id}` · GET `/attendance/monthly` · GET `/attendance/students/{id}/monthly` |
-| fees | GET `/fees` (filters/status) · GET `/fees/summary` · POST `/fees/students/{sid}/{month}` · GET/PUT/DELETE `/fees/{id}` · PUT `/fees/{id}/payment` |
-| events | GET/POST `/events` · GET/PUT/DELETE `/events/{id}` · GET/POST `/events/{id}/participants` · POST `/events/{id}/participants/batch/{bid}` · GET `/events/{id}/costume-summary` · PUT/DELETE `/events/participants/{pid}` · GET `/events/students/{sid}/history` |
-| progress | POST/GET `/progress/students/{sid}` · GET/PUT/DELETE `/progress/students/{sid}/{month}` · GET `/progress` |
-| dashboard | GET `/dashboard` (stats + fees + attendance trend + upcoming events + recent students) |
-| reports | GET `/reports/monthly` (per-batch attendance + fees, incl. Unassigned) |
-
-## Authentication flow
-- Login → JWT (access token) via bcrypt-verified credentials → token stored in `shared_preferences`; every API call sends `Authorization: Bearer <token>`; 401 anywhere → auto-logout to login screen.
-- Admin bootstrap only via seed: `admin` / `admin123` (change after first login).
-- All secrets (JWT key, DB URL, admin seed password) come from env vars documented in `backend/.env.example` — none hardcoded.
-
-## Flutter screens
-Login · Dashboard (stats/fees/attendance trend/upcoming events) · Students (search, filters, list, form, detail with photo upload, fees, progress, attendance) · Batches (list/form/detail) · Attendance (daily batch editor with present/absent/late, monthly summary) · Fees (monthly list, record payment sheet, summary) · Events (list/form/detail with participant management + costume fee payments) · Progress (month ratings 0–100 + remarks) · Reports (monthly per-batch) · Home shell: 6 tabs + overflow menu (Reports, Sign out).
-
-## Run instructions
-
-Backend:
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-# PostgreSQL already running on port 5433 (cluster /home/jagan/tandav_pgdata, user tandav)
-alembic upgrade head            # migrate
-python -m app.seed              # demo data (optional; server never auto-seeds)
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+app_files_api.dart    the interface + UnsupportedOnThisPlatform
+app_files_io.dart     Android: real paths, real files
+app_files_web.dart    browser: photos and backups off, IndexedDB database
+app_files.dart        picks one, and exposes platformDatabaseFactory
 ```
 
-Mobile (Android):
-```bash
-cd mobile
-cmd.exe /c "C:\Users\jagan\develop\flutter\bin\flutter.bat run"  # emulator; base URL auto = 10.0.2.2:8000
-cmd.exe /c "C:\Users\jagan\develop\flutter\bin\flutter.bat build apk --debug"
+The pick is a conditional import whose **default is the web file**:
+
+```dart
+import 'app_files_web.dart' if (dart.library.io) 'app_files_io.dart' as impl;
 ```
 
-Tests:
-```bash
-cd backend && .venv/bin/python -m pytest tests/     # 40 passed
-cd mobile  && cmd.exe /c "...\flutter.bat test"     # 7 passed
-cd ../.. && backend/.venv/bin/python scripts/e2e_smoke.py   # live E2E vs running API (requires server on :8000)
+That way a platform offering neither `dart:io` nor a browser fails loudly rather
+than silently getting a file system it does not have. Shared code must read
+`platformDatabaseFactory` from here and never import `databaseFactory` from
+`package:sqflite` — that global is the Android one, and touching it from shared
+code is what makes a file impossible to compile for the web.
+
+## Tech stack
+
+| Layer        | Stack |
+|--------------|-------|
+| App          | Flutter 3.47.1 / Dart 3.13.1 |
+| Storage      | `sqflite` (on-device SQLite), `dbVersion = 2`, 12 tables |
+| Storage (web)| `sqflite_common_ffi_web` — WASM SQLite persisted in IndexedDB, `sqlite3` pinned to **2.4.6** to match the binary |
+| State        | `provider` — `TandavApi` facade in `core/services.dart` |
+| Sync         | `google_sign_in`, `googleapis` (Drive v3), `uuid`, `crypto` |
+| Other        | `intl`, `image_picker`, `path_provider`, `url_launcher`, `shared_preferences` |
+| Tests        | `flutter_test` + `sqflite_common_ffi` (real SQLite on the desktop) |
+
+`core/services.dart` deliberately kept the old remote-API method signatures when
+storage moved local, so the screens never had to change. That is why it reads
+like an API client and isn't one.
+
+## Database (12 tables)
+
+`users` · `app_settings` · `batches` · `students` · `attendance` ·
+`monthly_attendance` · `fees` · `fee_payments` · `events` ·
+`event_participations` · `monthly_progress` · `sync_state`
+
+- The nine business tables carry `sync_uuid`, `device_id`, `updated_at` and
+  `deleted_at`, added programmatically by `_addSyncColumns()` looping over
+  `syncTables` — which is why they don't appear in the `CREATE TABLE` text.
+- **`users`, `app_settings` and `sync_state` never sync.** This is a security
+  boundary, not tidiness: the sync bundle is plain unencrypted JSON, `users`
+  holds the password hash and `app_settings` holds the account recovery code.
+- `students.batch_id` → `batches.id` is **SET NULL**, so deleting a batch leaves
+  its students as "Unassigned" rather than destroying them. Student children
+  (attendance, fees, participations, progress) **CASCADE**.
+- `fees.amount_paid` is additive per recorded payment; `status` is derived
+  (due / partial / paid). Same shape for `event_participations.costume_fee_paid`.
+- Monthly attendance aggregates are recomputed after every daily save, and
+  `monthly_progress.attendance_percentage` tracks the month's attendance.
+
+## Accounts
+
+Two different things called "account", and confusing them is the most common
+mistake here:
+
+- **App login — one per phone, different on each, never syncs.** The `users`
+  table is still seeded with `admin` / `admin123` on first open, because
+  `_seedAdminIfNeeded` recreates that row whenever the table is empty. What
+  changed is that the app **refuses to let anyone in on it**:
+  `isFactoryDefault()` asks whether the factory password still verifies, and
+  while it does, an un-dismissable **signup** screen replaces the login screen.
+  Signup updates that same row in place and issues a **recovery code**, shown
+  once, which is the only way back in if the password is forgotten. The check is
+  deliberately "does the factory password still work" rather than "is the table
+  empty" (it never is) or a separate flag (which can drift out of step with the
+  row) — so an APK already handed out gets prompted on its next launch instead
+  of staying on `admin123` forever. `users` is not a synced table.
+- **Google account — one, shared by both phones, mandatory.** It *is* the sync
+  mailbox. Two different Google accounts means two private Drives and sync can
+  never work. Advise each studio to create a **fresh Google account used only
+  for Tandav**, not either person's personal Gmail.
+
+## Sync, in one paragraph
+
+Both devices sign into the same Google account. The app makes a **Tandav Sync**
+folder and each device owns exactly one file in it, `tandav-<deviceId>.json`. A
+device writes its own file and reads the other's, so **neither waits for the
+other to be online** — one can sync at 9am and the other at 6pm and both end up
+correct. Merging is last-write-wins on `updated_at` with the higher device id
+breaking exact ties, soft-delete tombstones, and foreign keys remapped by UUID,
+all applied in a single transaction. Sync runs on app open, on resume, every 5
+minutes while the app is in the foreground, and on demand from Settings →
+Device & Sync. **A Bluetooth transport existed and was deleted on 2026-08-23**;
+Drive is the only carrier. Because each file is a **delta and not a backup**, a
+device that lost its data is rebuilt with **Send everything again** on the
+surviving one. Full detail, including why, is in `SYNC.md`.
+
+## WhatsApp — deep links, not the Cloud API
+
+`core/whatsapp.dart` opens a prewritten fee **receipt** or **reminder** through
+`url_launcher`; the admin presses Send inside WhatsApp themselves. Indian number
+normalization (+91, 6–9 prefix). **Zero cost, no Meta template approval, no BSP.**
+Notes anywhere about Cloud API pricing or utility templates do not apply to this
+codebase.
+
+Two spellings of the same link, because a browser cannot use the first:
+`whatsapp://send?phone=&text=` on Android, and `https://wa.me/<number>?text=` on
+web. Safari will not hand an unknown URL scheme from a web page to another app, so
+`whatsapp://` there does nothing at all — no chat and no error. On web the link is
+also navigated with `webOnlyWindowName: '_self'`, because the default is
+`window.open`, and a pop-up opened after an `await` has lost its user gesture and
+gets blocked.
+
+## Distribution
+
+- **Android:** a direct, release-signed `.apk` handed to each studio. No Play
+  Store. Run **`.\tools\verify-apk.ps1`** before copying one to a phone.
+- **iPhone:** the same Flutter app compiled for the web and served at
+  **`https://jagansk06.github.io/tandav-app/`**, installed from Safari with **Add
+  to Home Screen**. Not a native app, and nothing to renew. The site lives in a
+  **second, public** repo holding only build output, so the private source is
+  never published — `PWA.md` covers that split, the mandatory build flags, the
+  deploy script, the offline cache and the two honest limitations.
+  **`IPHONE-INVITE.md`** is what to actually send a customer.
+- **No store means no auto-update channel** on Android — a new release is
+  redistributed by hand — and Play Protect will warn on install. The iPhone side
+  is the opposite: it updates itself the next time it is opened online, because
+  it is a website.
+
+Two things the iPhone build does differently, both browser limits rather than
+choices: **photos and Backup/Restore are hidden** (a browser has no file paths,
+and half-working was worse than honest), and **sync needs one "Resume syncing"
+tap per launch** (Safari keeps the Google permission in memory only). All the
+local data — students, attendance, fees — needs no tap and no signal.
+
+**The release keystore in `D:\Projects\tandav-signing\` must survive forever.**
+Two reasons, both severe: a differently-signed APK cannot update an installed
+one, and the only fix is uninstalling, which **destroys the studio's only copy
+of its data**; and the Google **OAuth client is bound to that keystore's SHA-1**,
+so a build signed with anything else cannot sign in to Drive at all. Never
+commit it, never regenerate it, and keep it in two backup locations.
+`mobile/android/key.properties` holds its password and must never be committed.
+
+Backups (`TandavBackups` under app documents) are a copy of the whole `.db`, so
+they contain the password hash and the recovery code. **Treat a backup file as a
+secret.** Backup/restore is a hard requirement, not a nicety, precisely because
+the database is the only copy.
+
+## Build, install, test
+
+```powershell
+cd D:\Projects\Tandav\mobile
+flutter pub get
+flutter analyze
+flutter test              # 64 tests
+
+cd D:\Projects\Tandav
+.\ship.ps1                # build + verify signature + install + capture logs
 ```
 
-## Verification performed
-- Alembic migration applied; 10 tables created. Seed: 4 batches, 38 students, 3 events, admin user.
-- Backend unit/API suite: **40 passed** (auth, CRUD, photo upload, attendance math, fee payment + history, overpay rejection, events incl. batch/individual participation + costume, progress sync, dashboard, monthly reports, search/filters).
-- `flutter analyze` — 0 errors, 0 warnings (35 info-level lints).
-- `flutter test` — 7 passed.
-- `flutter build apk --debug` — built (Gradle 9.1.0 distribution had to be pulled via WSL and injected into the Windows Gradle cache; subsequent builds ~9s).
-- Live E2E smoke (scripts/e2e_smoke.py) — 14 steps all passed: login → dashboard → create batch/student → daily attendance (100%) → monthly summary → fee record + 2 payments (partial → paid) → event + participant + costume fee partial → progress record (overall = mean of ratings, attendance% synced) → related-data queries → monthly report → wrong-password rejected → cascade cleanup verified.
-  - The E2E caught and fixed a real app bug: `month` params (fees/dashboard/reports/progress) were sent as `YYYY-MM` while the API types them as full dates — now normalized to `YYYY-MM-01` in `services.dart` (`_monthIso`). Rebuilt APK after the fix.
+`ship.ps1` does `flutter build apk --release --split-per-abi`, then refuses to
+continue unless the APK's SHA-1 matches the release key (catching the silent
+debug-signing fallback, which produces an APK that installs fine but can never
+reach Drive), then **`adb install -r`** and pulls a filtered logcat into
+`device-log.txt`.
 
-## Known limitations / notes
-- Batch deletion keeps students (FK SET NULL) — they become "Unassigned"; delete students individually to remove them. This is intentional and covered by the monthly report's Unassigned row.
-- Admin password `admin123` is seed-only; change it via the change-password endpoint (no dedicated UI).
-- Android emulator targets `10.0.2.2:8000`; a physical device needs the LAN IP (edit `api_client.dart`).
-- No photo size limits server-side beyond request limits; uploads stored under `UPLOAD_DIR` and served at `/uploads`.
-- Seed data is date-relative to the current month (July 2026 fees/attendance seeded; August intentionally empty so a fresh month starts clean).
-- `flutter analyze` info lints remain (deprecated `value:` on dropdowns kept intentionally for controlled behavior, null-aware suggestions, etc.).
-- E2E leftover data: deleting the smoke batch leaves orphaned "Smoke Student" records (SET NULL behavior); delete them via the students API if they appear.
+**Install over the top. Never uninstall first.** `adb install -r` keeps the
+database; uninstalling erases it. `device-log.txt` is gitignored because it can
+contain account details.
+
+Useful flags: `.\ship.ps1 -SkipBuild` (install the existing APK, fast loop) and
+`.\ship.ps1 -LogOnly` (capture only).
+
+The iPhone build is a separate one-command path:
+
+```powershell
+cd D:\Projects\Tandav
+.\tools\deploy-pwa.ps1    # build web + prune + stamp cache version + publish the public site
+```
+
+Read `PWA.md` before touching its flags. `flutter build web` on its own produces
+an app that cannot open without a network.
+
+Testing sync with only one phone: open `tools/fake-peer.html`, which plants a
+valid bundle in the Drive folder as `TANDAV-WEB1` and reads back the phone's own
+bundle. Clean up in this order — remove the planted file **first**, then tap
+**Forget the other device** on the phone, or it stays pinned to the fake peer
+and will refuse the real second device.
+
+## Status
+
+**Working and validated on hardware:** the full Drive round trip (OAuth, folder
+creation, encode, upload, list, download, decode, protocol validation, merge,
+peer adoption), first-run signup and recovery code, restore-from-backup without
+cloning the sync identity, recoverable peer id, Drive call timeouts, foreground
+periodic sync, and — confirmed 2026-08-23 — **two-way sync between the Android
+app and the web build**, each picking up the other's edits, with no duplicates and
+no echo.
+
+**Not done yet:**
+
+1. **Two real Android phones side by side.** Every stage has been proven, but
+   one half was proven with a browser standing in for the second device.
+2. **The PWA runs, but has never been on an iPhone.** As of 2026-08-23 the web
+   build opens in Chrome on Windows, keeps its database in IndexedDB, signs in to
+   Drive and **syncs both ways with the Android phone** — that half is done, and
+   the Web client id is in `mobile/web/index.html`. What is left: **deploy**
+   (`.\tools\deploy-pwa.ps1`, which needs the public `tandav-app` repo created
+   first), the offline test against the served build, and a borrowed iPhone.
+   Three prerequisites are still on the Google Cloud Console side and all three
+   block sign-in from the deployed site: add `https://jagansk06.github.io` to the
+   Web client's Authorized JavaScript origins, enable the **People API**, and add
+   `userinfo.email` and `userinfo.profile` to the consent screen.
+3. **Conflict resolution under a wrong clock.** LWW compares wall-clock
+   `updated_at` with no hybrid logical clock, so a phone with a badly wrong
+   clock still wins or loses every *conflict*. The *data-loss* half of this is
+   already fixed (see the two-marks invariant in `SYNC.md`); the proper fix is a
+   monotonic per-row `local_seq` at schema v3, deferred because `SyncStamp` is
+   synchronous and used by every repository write.
+4. **`students.photo_url` is a local absolute path in a synced table.** So a photo
+   has never travelled between devices: the path arrives, points at nothing, and
+   `imageAt` falls back to the initial-letter avatar because it checks
+   `existsSync()`. It degrades quietly rather than breaking, which is why it went
+   unnoticed. Fixing it properly means moving photo *bytes* into the bundle.
+5. Cosmetic `flutter analyze` info lints. No errors, no warnings.
+
+## Traps worth knowing before you change anything
+
+- **`flutter test` compiles only test files and what they import.** No test
+  imports the screens, so a screen can be broken and the suite still passes.
+  `flutter analyze` is the only gate for UI files.
+- **Unit tests use `FakeMailbox`**, so no test can catch a plugin method that is
+  missing on one platform. That is exactly how `canAccessScopes()` — web-only —
+  got to a real device before failing.
+- **Seeing a file at drive.google.com proves nothing** about `drive.file` scope.
+  The Drive website is Google's own client with full access; only a request
+  bearing *our* client's token is restricted the way the app is. Use
+  `tools/drive-visibility-test.html`.
+- **Any `sync_state` key that is written once and auto-adopted needs a
+  user-reachable reset.** On a local-first app "reinstall to fix it" is data
+  destruction, not a workaround. This bug has been found three separate times.
+- **`sent.<table>` means "the peer already holds this", not "we uploaded this".**
+  So anything that clears `cloud_peer_device_id` must clear the sent marks in the
+  same transaction — the next device adopted is a *different* device and holds
+  nothing. When `forgetCloudPeer()` did only half of that, the replacement device
+  was adopted, both sides reported a clean sync, and the studio's whole history
+  was never offered to it, with nothing on screen to say so. It looks like two
+  faults ("the phone isn't sending", "the iPhone isn't sending") and is one.
+  Consequence: **"Forget the other device" now implies "Send everything again"**.
+- **The Drive files are deltas, not backups.** A healthy pair's mailbox files
+  are nearly empty, which is correct and also means the account is not a copy of
+  the studio. Recovery goes through **Send everything again** on the surviving
+  device; the real backup path is `TandavBackups`.
+- **Anything that swaps the whole database file must be audited for the identity
+  it drags along.** That is what made restore-from-backup clone `device_id`.
+- **Never sideload an APK you have not signature-checked.** Android cannot
+  update an installed app with an APK signed by a different key; the only way
+  through is uninstall, which **erases the database and the backups with it**.
+  The wrong signature is *silent* — a missing `key.properties` or keystore makes
+  Gradle fall back to debug signing and the build still succeeds. Symptom on the
+  phone: a brand-new `TANDAV-XXXX`, an empty studio, and `admin123` working
+  again, all three at once, "every time I log in". Run
+  **`.\tools\verify-apk.ps1`** (no cable needed) before copying any APK to a
+  phone, or use `.\ship.ps1`, which gates on the same check.
+- **`flutter run -d chrome` throws away IndexedDB between runs.** It launches
+  Chrome with a throwaway `--user-data-dir`, so the web database is new on every
+  run — new device id, empty studio, and a fresh orphan bundle in the Drive
+  folder each time. Storage does persist *within* a run, so a reload looks fine.
+  Test web persistence and sync against the deployed Pages URL in your own
+  browser instead.
+- **Flutter no longer ships a caching service worker.** On 3.47 the generated
+  `flutter_service_worker.js` is 815 bytes whose whole body unregisters itself.
+  So "it's a PWA, Flutter handles offline" is false, and the offline support is
+  ours: `mobile/web/tandav_sw.js`, built with `--pwa-strategy=none` so Flutter
+  does not register a second worker for the same scope. See `PWA.md`.
+- **`flutter test` never compiles the web code.** The suite runs on the Dart VM,
+  so the conditional import always resolves to `app_files_io.dart` and every
+  `kIsWeb` branch takes the false path. `app_files_web.dart` and the web halves
+  of `whatsapp.dart` and `drive_mailbox.dart` are reached only by
+  `flutter build web`, which is therefore a required gate and not an optional one.
+- **`kIsWeb` has to be imported explicitly.** `material.dart` re-exports
+  `widgets.dart`, which re-exports `foundation.dart` with only
+  `show Brightness, UniqueKey`. Importing material looks like it should be enough
+  and is not; the failure is a plain "undefined name" at build time.
+- **WASM SQLite is two artefacts that must be the same version**, and neither
+  `flutter analyze` nor `flutter build web` can tell you they are not: the binary
+  `sqlite3.wasm` and the `sqlite3` Dart package that supplies its imports.
+  `sqflite_common_ffi_web` allows `sqlite3` up to 4.0.0 but downloads a
+  hard-coded 2.4.6 binary, so pub happily resolves a version that cannot link.
+  Hence the exact `sqlite3: 2.4.6` pin in `mobile/pubspec.yaml`. Symptom is a
+  hang on the splash screen and `unsupported result null (null)`. Full story in
+  `PWA.md`.
+- **The web build does not use `sqflite_sw.js`.** The package's shared-worker
+  handler answers *every* internal failure with `port.postMessage(null)`, so real
+  errors never reach the page console — and iOS Safari has no `SharedWorker`
+  anyway. `app_files_web.dart` uses `databaseFactoryFfiWebNoWebWorker`
+  deliberately; do not "optimise" it back onto the worker.

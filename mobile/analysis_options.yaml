@@ -16,11 +16,6 @@ analyzer:
     - windows/**
     - macos/**
     - linux/**
-    # Pigeon schema files are INPUT to code generation, not Dart we compile.
-    # They reference package:pigeon, which is a build-time-only tool we do not
-    # ship, so the analyzer reports 14 phantom errors here. The generated
-    # output (ble_peripheral.g.dart) IS analysed normally.
-    - packages/*/pigeons/**
 include: package:flutter_lints/flutter.yaml
 
 linter:

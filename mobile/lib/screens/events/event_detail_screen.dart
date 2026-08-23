@@ -572,7 +572,7 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
             const SizedBox(height: 12),
             if (isBatchMode)
               DropdownButtonFormField<int?>(
-                value: _batchId,
+                initialValue: _batchId,
                 isExpanded: true,
                 decoration: const InputDecoration(
                   labelText: 'Batch *',

@@ -5,11 +5,19 @@ import 'core/auth_state.dart';
 import 'core/services.dart';
 import 'core/theme.dart';
 import 'database/tandav_database.dart';
+import 'platform/app_files.dart';
 import 'screens/home_shell.dart';
 import 'screens/login_screen.dart';
+import 'screens/signup_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Ask the browser to keep this app's storage. A no-op on Android; on the
+  // iPhone build the studio's whole database lives in IndexedDB, which a
+  // browser may otherwise clear when the phone runs low on space. Done before
+  // the database is opened, and it can neither throw nor hang.
+  await appFiles.keepDatabaseResident();
 
   // Open the local SQLite database (creates schema on first run, seeds the
   // default admin account) and generate any missing monthly fee records
@@ -70,6 +78,9 @@ class RootGate extends StatelessWidget {
         ),
       );
     }
+    // Setup comes before the login screen: while the device is still on the
+    // credentials baked into every APK there is nothing worth logging in to.
+    if (auth.needsSetup) return const SignupScreen();
     return auth.isLoggedIn
         ? HomeShell(key: ValueKey('shell-${auth.reloadToken}'))
         : const LoginScreen();

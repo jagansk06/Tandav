@@ -264,7 +264,7 @@ class _StudentFormScreenState extends State<StudentFormScreen> {
               builder: (context, snapshot) {
                 final batches = snapshot.data ?? [];
                 return DropdownButtonFormField<int?>(
-                  value: _batchId,
+                  initialValue: _batchId,
                   isExpanded: true,
                   decoration: const InputDecoration(
                     labelText: 'Batch',

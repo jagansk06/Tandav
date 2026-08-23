@@ -1,6 +1,4 @@
 import 'dart:io';
-import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -8,7 +6,6 @@ import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:tandav_mobile/database/tandav_database.dart';
-import 'package:tandav_mobile/sync/protocol.dart';
 import 'package:tandav_mobile/sync/sync_codec.dart';
 import 'package:tandav_mobile/sync/sync_engine.dart';
 import 'package:tandav_mobile/sync/sync_meta.dart';
@@ -309,38 +306,12 @@ void main() {
     expect(await countWhere('batches', 'deleted_at IS NULL'), 1);
   });
 
-  test('FrameCodec reassembles large payloads; protocol helpers behave',
-      () async {
-    final rng = Random(7);
-    final payload = List<int>.generate(5000, (_) => rng.nextInt(255) + 1);
-    final packets = FrameCodec.encode(payload);
-
-    final acc = FrameAccumulator();
-    Uint8List? reassembled;
-    for (final packet in packets) {
-      final (frame, done) = FrameCodec.feed(acc, packet);
-      if (done) {
-        reassembled = frame;
-        break;
-      }
-    }
-    expect(reassembled, isNotNull);
-    expect(reassembled!.length, payload.length);
-    expect(reassembled, equals(payload));
-
-    final msg = envelope(SyncMsgType.hello, {'deviceId': 'TANDAV-X1'});
-    expect(typeOf(msg), SyncMsgType.hello);
-
-    final codeA = pairingCode('TANDAV-A7F3', 'TANDAV-B291');
-    final codeB = pairingCode('TANDAV-B291', 'TANDAV-A7F3');
-    expect(codeA, codeB);
-    expect(RegExp(r'^\d{6}$').hasMatch(codeA), true);
-
-    final token = authToken('TANDAV-A7F3', 'secret-x', 'nonce-1');
-    expect(token, authToken('TANDAV-A7F3', 'secret-x', 'nonce-1'));
-    expect(token, isNot(authToken('TANDAV-A7F3', 'secret-x', 'nonce-2')));
-    expect(token, isNot(authToken('TANDAV-A7F3', 'secret-y', 'nonce-1')));
-  });
+  // A test covering FrameCodec / FrameAccumulator / envelope / pairingCode /
+  // authToken was removed here along with `lib/sync/protocol.dart`. Those were
+  // Bluetooth wire framing and the BLE pairing handshake; nothing in the app
+  // uses them now that Drive is the only transport. The one piece of that file
+  // still needed — `syncProtocolVersion` — moved to `sync_bundle.dart` and is
+  // covered by the bundle decode tests in `cloud_sync_test.dart`.
 
   test('SyncCodec round trips payloads with FKs', () {
     final row = <String, Object?>{

@@ -33,8 +33,15 @@
 *.bin  binary
 *.ser  binary
 
-# Generated / vendored code: keep it out of diff noise and language stats.
-mobile/packages/ble_peripheral/** linguist-vendored
+# The SQLite engine. `text=auto` would almost certainly classify it as binary on
+# its own, but "almost certainly" is not good enough here: a single mangled byte
+# in sqlite3.wasm does not fail the build, it hangs the web app on the splash
+# screen with a WebAssembly LinkError, which is a whole day to diagnose.
+*.wasm binary
+
+# Generated code: keep it out of diff noise and language stats.
+# (A `mobile/packages/ble_peripheral/**` vendored rule sat here until the
+# Bluetooth sync path was deleted on 2026-08-23.)
 *.g.dart   linguist-generated
 *.g.kt     linguist-generated
 *.g.swift  linguist-generated

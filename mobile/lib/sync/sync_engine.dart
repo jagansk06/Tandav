@@ -115,11 +115,10 @@ class SyncEngine {
   /// [computeOutbound] does not send it again.
   ///
   /// **Only call this once delivery is confirmed.** Over the Drive mailbox that
-  /// is a successful file write (the bundle now sits in the account and the
-  /// peer will read it whenever it next syncs). Over BLE it is the peer's
-  /// `syncDone`. Calling it merely because we *attempted* a send would drop
-  /// rows on a dropped connection; calling it late only costs a harmless
-  /// re-send, so when in doubt, call it late.
+  /// is a successful file write — the bundle now sits in the account and the
+  /// peer will read it whenever it next syncs. Calling it merely because we
+  /// *attempted* a send would drop rows whenever the upload failed; calling it
+  /// late only costs a harmless re-send, so when in doubt, call it late.
   Future<void> markDeltaSent(Transaction txn, SyncDelta delta) async {
     final ceiling = delta.snapshotAt;
     for (final entry in delta.tables.entries) {
@@ -144,6 +143,48 @@ class SyncEngine {
         await state.writeWithin(txn, key, max);
       }
     }
+  }
+
+  /// Forget which of our rows the peer has already received, so the next sync
+  /// offers the **whole** local dataset again. Returns how many marks existed.
+  ///
+  /// This is the recovery path for a peer whose database is gone — a phone that
+  /// was wiped or replaced, or an iPhone whose PWA storage Safari evicted (which
+  /// can happen without the customer doing anything). It is needed because a
+  /// mailbox file is a **delta, not a snapshot**: once we have delivered
+  /// everything, our file shrinks to nearly nothing, so a peer starting from an
+  /// empty database would find nothing in the account to restore from. Clearing
+  /// our marks is what turns our next bundle back into a full copy. On a
+  /// local-first app with no server this is the only route back.
+  ///
+  /// The keys are **deleted**, not set to `''`. [computeOutbound] branches on
+  /// `sent.isEmpty` and falls back to selecting every row, so an empty string
+  /// happens to work today — but the two branches do not agree on edge cases.
+  /// `attendance`, `fee_payments` and `event_participations` gained
+  /// `updated_at` by `ALTER TABLE … NOT NULL DEFAULT ''`, so an empty
+  /// `updated_at` is representable there; `updated_at > ''` skips such a row
+  /// while select-all includes it. Deleting the key keeps "everything" meaning
+  /// one thing.
+  ///
+  /// **Safe to run when nothing is wrong.** The peer matches each row by
+  /// `sync_uuid`, finds a copy it already has, and skips it as an unchanged
+  /// echo; a row the peer has since edited is *newer* than ours and wins there
+  /// too, so re-offering cannot overwrite it. The only cost is one larger
+  /// upload. That matters: a customer who cannot tell whether they need this
+  /// button must be able to press it without risk.
+  ///
+  /// Deliberately does **not** touch `watermark.<table>`. Those record what we
+  /// have *received*, and lowering them would make us re-apply the peer's rows
+  /// against our own — pointless work with real conflict-resolution risk.
+  Future<int> clearSentMarks(SyncExecutor ex) async {
+    var cleared = 0;
+    for (final table in SyncCodec.applyOrder) {
+      final key = sentKey(table);
+      if (await state.readWithin(ex, key) == null) continue;
+      await state.writeWithin(ex, key, null); // null deletes the row
+      cleared++;
+    }
+    return cleared;
   }
 
   /// Apply rows received from the peer inside one transaction.

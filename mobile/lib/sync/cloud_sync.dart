@@ -1,18 +1,23 @@
-/// Two-master sync over a store-and-forward [SyncMailbox] (e.g. a shared
-/// Google Drive account) instead of Bluetooth.
+/// Two-master sync over a store-and-forward [SyncMailbox] — in practice a
+/// shared Google Drive account. This is the app's **only** sync transport.
 ///
-/// Why this exists: the BLE path in `sync_manager.dart` is a live conversation
-/// and needs both phones in the same room. The two masters here are in
-/// different places and are rarely online at the same second, so this path is
+/// Why it is the only one: a Bluetooth LE path used to live in
+/// `sync_manager.dart` as a "same room" fast path. It was a live conversation
+/// and needed both phones within a few metres of each other, which is not the
+/// situation the app is actually sold into — the two masters are in different
+/// places and are rarely online at the same second. So this path is
 /// *asynchronous*: each device leaves a small file behind and picks up the
 /// other's whenever it next has internet. Neither device waits for the other,
-/// and there is still no server to run and nothing to renew.
+/// and there is still no server to run and nothing to renew. The BLE code was
+/// deleted rather than kept as a shortcut, because a second route into the
+/// merge engine is a second route that has to be trusted with a paying
+/// studio's records — and Safari has no Web Bluetooth, so the iPhone could
+/// never have used it anyway.
 ///
-/// The merge itself is untouched — [SyncEngine.computeOutbound] and
-/// [SyncEngine.applyIncoming] are reused exactly as the Bluetooth path uses
-/// them, so conflict resolution, tombstones, foreign-key remapping and the
-/// per-table watermarks behave identically no matter which carrier delivered
-/// the rows.
+/// The merge itself was never carrier-specific — [SyncEngine.computeOutbound]
+/// and [SyncEngine.applyIncoming] are the same code the Bluetooth path called,
+/// so conflict resolution, tombstones, foreign-key remapping and the per-table
+/// watermarks are unchanged by the removal.
 ///
 /// ## Order of operations (this order is deliberate)
 ///
@@ -109,6 +114,7 @@ class CloudSyncManager {
     required this.state,
     required this.engine,
     required this.mailbox,
+    this.syncTimeout = const Duration(seconds: 90),
   });
 
   final TandavDatabase db;
@@ -116,10 +122,32 @@ class CloudSyncManager {
   final SyncEngine engine;
   final SyncMailbox mailbox;
 
-  /// `sync_state` key holding the peer id learned through the mailbox. Kept
-  /// separate from the Bluetooth `paired_device_id` on purpose: BLE pairing
-  /// also stores an HMAC secret, and writing that key without a secret would
-  /// leave the Bluetooth handshake unable to authenticate.
+  /// Longest a single exchange may take before it is abandoned.
+  ///
+  /// This exists because of a UI failure mode, not a network one. The sync
+  /// screen disables its button while the last emitted phase is a busy one, so
+  /// a Drive call that never returns used to leave the button dead with no
+  /// message at all — the only way out being to force-close the app. Every
+  /// other exit from [_run] emits a terminal phase, so capping the wait is
+  /// enough to guarantee the UI always recovers.
+  ///
+  /// Note that [Future.timeout] does not cancel the underlying HTTP request; it
+  /// only stops us waiting on it. An abandoned run may still finish quietly,
+  /// which is safe: the upload overwrites one file in place, and the per-table
+  /// `sent` marks only advance after a confirmed write, so the next attempt
+  /// recomputes exactly the same delta.
+  ///
+  /// Injectable so tests can use a few milliseconds instead of a minute and a
+  /// half.
+  final Duration syncTimeout;
+
+  /// `sync_state` key holding the peer id learned through the mailbox.
+  ///
+  /// **Do not "simplify" this to `paired_device_id`.** That key belonged to the
+  /// deleted Bluetooth transport and may still hold a value in any database
+  /// written by an older build. Reusing it would make a fresh Drive pairing
+  /// read back a stale BLE peer id — or the reverse — on exactly the devices
+  /// that have been in the field longest.
   static const kCloudPeerId = 'cloud_peer_device_id';
 
   /// Last time a mailbox sync completed (ISO-8601 UTC).
@@ -142,9 +170,62 @@ class CloudSyncManager {
 
   Future<String?> get cloudAccount => state.read(kCloudAccount);
 
-  /// Forget the mailbox peer. Local data and remote files are left alone, so
-  /// re-connecting later resumes without re-sending everything.
-  Future<void> forgetCloudPeer() => state.write(kCloudPeerId, null);
+  /// Forget the mailbox peer **and** everything we believed it already had.
+  ///
+  /// Called from the sync screen's "Forget the other device". It must stay
+  /// reachable from the UI: [kCloudPeerId] is adopted silently and then matched
+  /// by exact id, so without a way to clear it a replaced phone locks sync out
+  /// permanently. See [disconnect].
+  ///
+  /// ## Why it clears the sent marks as well
+  ///
+  /// `sent.<table>` does not mean "uploaded". It means **"the peer already holds
+  /// everything up to this timestamp"** — that is the whole reason
+  /// [SyncEngine.markDeltaSent] may only run after a confirmed delivery. The
+  /// moment the peer is forgotten that sentence stops being true: the next
+  /// device to be adopted is a *different* device, and it holds nothing.
+  ///
+  /// Leaving the marks behind was a silent data hole rather than an error. The
+  /// replacement device would be adopted normally, both devices would report a
+  /// successful sync, and the new one would receive only rows edited from that
+  /// moment onwards — the studio's entire history stayed invisible, on both
+  /// sides, with nothing on screen to suggest anything was wrong. It cost a full
+  /// debugging session on real hardware, because the two symptoms it produces
+  /// ("the phone is not sending" and "the iPhone is not sending") look like two
+  /// separate faults and are one.
+  ///
+  /// So forgetting a peer implies a full re-offer, and the customer no longer
+  /// has to know to press "Send everything again" afterwards. The cost is one
+  /// larger upload; [SyncEngine.clearSentMarks] documents why that is always
+  /// safe (the peer skips rows it already has and keeps anything it edited more
+  /// recently).
+  ///
+  /// Both writes go in **one transaction**, so there is no instant where the
+  /// peer is forgotten but the marks still claim delivery. And `_running` is
+  /// held while it happens, for the same reason [resendEverything] holds it: a
+  /// resume or the five-minute timer could otherwise slip a sync into the gap
+  /// and its `markDeltaSent` — computed from a delta snapshotted before the
+  /// clear — would put the marks straight back.
+  ///
+  /// Returns null on success, or a message to show the user when nothing was
+  /// done.
+  Future<String?> forgetCloudPeer() async {
+    if (_running) {
+      return 'A sync is running right now. Wait for it to finish, then try '
+          'again.';
+    }
+    _running = true;
+    try {
+      final d = await db.open();
+      await d.transaction((txn) async {
+        await state.writeWithin(txn, kCloudPeerId, null);
+        await engine.clearSentMarks(txn);
+      });
+      return null;
+    } finally {
+      _running = false;
+    }
+  }
 
   void dispose() {
     if (!_status.isClosed) _status.close();
@@ -180,9 +261,31 @@ class CloudSyncManager {
     }
   }
 
+  /// Forget the mailbox account on this device.
+  ///
+  /// This also clears [kCloudPeerId], which matters more than it looks. The
+  /// peer id is adopted automatically on the first bundle we read and is then
+  /// matched by *exact* id. If the other phone is replaced, factory-reset or
+  /// has the app reinstalled it comes back as a different `TANDAV-XXXX`, stops
+  /// matching, and every later sync fails. Clearing it here (and via
+  /// [forgetCloudPeer]) is the only escape hatch; without one the alternative
+  /// for the customer is reinstalling, which destroys the local database — and
+  /// on a local-first app that is their only copy of the data.
+  ///
+  /// And because it clears the peer id, it must clear the per-table sent marks
+  /// too — they are a claim about *that* peer. See [forgetCloudPeer] for the
+  /// full argument. Reconnecting therefore re-offers the whole database once,
+  /// which is the right trade: the account may well be reconnected against a
+  /// second device that is not the one this device was talking to before, and
+  /// that case has to be correct without the customer diagnosing it.
   Future<void> disconnect() async {
     await mailbox.disconnect();
     await state.write(kCloudAccount, null);
+    final d = await db.open();
+    await d.transaction((txn) async {
+      await state.writeWithin(txn, kCloudPeerId, null);
+      await engine.clearSentMarks(txn);
+    });
     _emit(CloudSyncPhase.idle, 'Disconnected.');
   }
 
@@ -198,13 +301,23 @@ class CloudSyncManager {
   /// Run one full exchange. Safe to call on app open, on resume and from a
   /// manual button — overlapping calls are ignored rather than queued, so a
   /// user mashing Sync cannot start two merges at once.
+  ///
+  /// Always settles within [syncTimeout] and always emits a terminal phase,
+  /// even if the carrier hangs. The sync screen derives its button's enabled
+  /// state from the last emitted phase, so that guarantee is load-bearing.
   Future<CloudSyncResult> syncNow() async {
     if (_running) {
       return CloudSyncResult(ok: false, message: 'A sync is already running.');
     }
     _running = true;
     try {
-      return await _run();
+      return await _run().timeout(syncTimeout);
+    } on TimeoutException {
+      const msg = 'Sync timed out. Check your internet connection and try '
+          'again — nothing has been lost, and the next sync will send exactly '
+          'the same changes.';
+      _emit(CloudSyncPhase.failed, msg);
+      return CloudSyncResult(ok: false, message: msg);
     } on MailboxException catch (e) {
       _emit(CloudSyncPhase.failed, e.message);
       return CloudSyncResult(ok: false, message: e.message);
@@ -277,11 +390,7 @@ class CloudSyncManager {
     final known = await cloudPeerId;
     final chosen = _choosePeer(peers, known);
     if (chosen == null) {
-      final ids = peers.map((p) => p.deviceId).join(', ');
-      throw MailboxException(
-        'This account already has two Tandav devices. '
-        'Ignoring $ids — only two masters are supported.',
-      );
+      throw MailboxException(_peerProblem(peers, known));
     }
     final peerId = chosen.deviceId!;
 
@@ -364,6 +473,9 @@ class CloudSyncManager {
   /// Pick the bundle to apply: the device we already pair with, or — when we
   /// have no pair yet — the only candidate. Two unknown devices is ambiguous
   /// and is refused rather than guessed at.
+  ///
+  /// Returning null covers two completely different situations, which
+  /// [_peerProblem] separates before anything reaches the user.
   MailboxEntry? _choosePeer(List<MailboxEntry> peers, String? known) {
     if (known != null && known.isNotEmpty) {
       for (final p in peers) {
@@ -372,6 +484,50 @@ class CloudSyncManager {
       return null;
     }
     return peers.length == 1 ? peers.first : null;
+  }
+
+  /// Explain a null from [_choosePeer] in terms the studio owner can act on.
+  ///
+  /// The two causes need opposite remedies, and conflating them was itself the
+  /// bug: a *missing* partner used to be reported as "this account already has
+  /// two devices", which is both untrue and unactionable. Each message now
+  /// names the ids involved and states the one thing to do next.
+  String _peerProblem(List<MailboxEntry> peers, String? known) {
+    if (known != null && known.isNotEmpty) {
+      final found = peers.map((p) => p.deviceId).join(', ');
+      return 'This device syncs with $known, which has not left anything in '
+          'this account. Found $found instead. If the other device was '
+          'replaced or reset, tap "Forget the other device" below and sync '
+          'again — no data is lost.';
+    }
+    // Name the files rather than the device ids, and say when each was last
+    // written. The remedy is "delete one of these in Drive", and a bare
+    // TANDAV-XXXX is not something the customer can point at — the file name is.
+    // The near-universal cause is a leftover bundle from tools/fake-peer.html,
+    // which is always the oldest of the three, so the dates do the choosing.
+    final listed = peers
+        .map((p) => '• ${p.name}${_writtenAt(p.modifiedAt)}')
+        .join('\n');
+    return 'This account holds bundles from more than one other device, and '
+        'Tandav syncs two devices in total. Open the "Tandav Sync" folder in '
+        'Google Drive and delete the file belonging to the device you no '
+        'longer use — usually the oldest one, or one left behind by a test:'
+        '\n\n$listed\n\n'
+        'Then sync again. Deleting a file there loses nothing: the folder '
+        'carries changes in transit, not your data.';
+  }
+
+  /// ", last written 3 days ago" — or nothing at all when the mailbox did not
+  /// report a time, because an invented date is worse than none on the one
+  /// screen someone reads while trying to decide which file to delete.
+  String _writtenAt(DateTime? when) {
+    if (when == null) return '';
+    final age = DateTime.now().toUtc().difference(when);
+    if (age.isNegative || age.inMinutes < 60) return ', written just now';
+    if (age.inHours < 24) {
+      return ', written ${age.inHours} ${age.inHours == 1 ? 'hour' : 'hours'} ago';
+    }
+    return ', written ${age.inDays} ${age.inDays == 1 ? 'day' : 'days'} ago';
   }
 
   int _sum(Map<String, int> counts) =>
@@ -403,6 +559,60 @@ class CloudSyncManager {
   static const autoSyncCooldown = Duration(minutes: 2);
 
   DateTime? _lastAutoAttempt;
+
+  /// Offer this device's **entire** database to the peer, then sync.
+  ///
+  /// The recovery path for a peer that lost its data: a phone that was wiped,
+  /// replaced or reinstalled, or an iPhone whose PWA storage Safari evicted.
+  /// Without it such a device can never be restored, because the files in Drive
+  /// are *deltas* — once everything has been delivered our file holds almost
+  /// nothing, so there is no full copy anywhere for a blank device to read. The
+  /// app has no server, so if this button does not exist, nothing does.
+  ///
+  /// Safe to press at any time. See [SyncEngine.clearSentMarks]: the peer skips
+  /// rows it already has and keeps any row it has edited more recently, so the
+  /// only cost is a bigger upload.
+  ///
+  /// Two ordering details matter:
+  ///
+  /// - The marks are cleared **before** [syncNow], not merged into it, and the
+  ///   `_running` flag is held while clearing. Otherwise a resume or the
+  ///   five-minute timer could start a sync in the gap, and its `markDeltaSent`
+  ///   — which writes marks computed from the delta it snapshotted *before* the
+  ///   clear — would put them straight back, leaving a button that reports
+  ///   success and did nothing.
+  /// - Clearing persists even if the sync then fails (no internet, timeout).
+  ///   That is intentional: the customer's request is recorded in the database,
+  ///   so whichever sync succeeds next carries the full copy. They do not have
+  ///   to remember to come back and press it again.
+  Future<CloudSyncResult> resendEverything() async {
+    if (_running) {
+      return CloudSyncResult(
+        ok: false,
+        message: 'A sync is already running. Wait for it to finish, then try '
+            'again.',
+      );
+    }
+    _running = true;
+    try {
+      final d = await db.open();
+      await d.transaction((txn) => engine.clearSentMarks(txn));
+    } finally {
+      _running = false;
+    }
+    final result = await syncNow();
+    if (result.ok) return result;
+    return CloudSyncResult(
+      ok: false,
+      message: '${result.message}\n\nThe request is remembered — the next sync '
+          'that goes through will still send everything.',
+      sent: result.sent,
+      applied: result.applied,
+      skipped: result.skipped,
+      peerDeviceId: result.peerDeviceId,
+      peerBundleAt: result.peerBundleAt,
+    );
+  }
 
   /// Rows still waiting to be sent, for the "N changes pending" hint on the
   /// sync screen. Read-only; never advances a watermark.

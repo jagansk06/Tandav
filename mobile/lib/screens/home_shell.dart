@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -7,12 +7,14 @@ import '../core/auth_state.dart';
 import '../core/format.dart';
 import '../core/services.dart';
 import '../core/theme.dart';
+import '../platform/app_files.dart';
 import 'attendance/attendance_screen.dart';
 import 'batches/batches_screen.dart';
 import 'dashboard/dashboard_screen.dart';
 import 'events/events_screen.dart';
 import 'fees/fees_screen.dart';
 import 'reports/reports_screen.dart';
+import 'settings/account_screen.dart';
 import 'settings/device_sync_screen.dart';
 import 'students/students_screen.dart';
 
@@ -36,6 +38,33 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     'Events',
   ];
 
+  /// How often the app syncs while it is simply sitting open.
+  ///
+  /// This closes the one case that had no trigger at all. Sync otherwise runs on
+  /// app-open and on resume, so a studio that leaves Tandav in the foreground
+  /// all day would never upload what it typed and never see what the other
+  /// phone typed — which is precisely the two-locations scenario the whole sync
+  /// design exists for.
+  ///
+  /// Five minutes trades promptness against waking the radio for nothing. The
+  /// manager's `autoSync` is silent and throttled, so a tick with no internet,
+  /// no connected account, or a sync already in flight costs nothing.
+  static const _foregroundSyncInterval = Duration(minutes: 5);
+  Timer? _syncTimer;
+
+  void _startPeriodicSync() {
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(_foregroundSyncInterval, (_) {
+      if (!mounted) return;
+      context.read<TandavApi>().cloudSync.autoSync();
+    });
+  }
+
+  void _stopPeriodicSync() {
+    _syncTimer?.cancel();
+    _syncTimer = null;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -43,10 +72,12 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     // Pull anything the other device left in Drive while this app was closed.
     // Silent by design — no spinner, no error if there is no internet.
     context.read<TandavApi>().cloudSync.autoSync();
+    _startPeriodicSync();
   }
 
   @override
   void dispose() {
+    _stopPeriodicSync();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -60,16 +91,25 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       api.ensureMonthlyFees().catchError((_) => 0);
       // …and pick up whatever the other master changed in the meantime.
       api.cloudSync.autoSync();
+      _startPeriodicSync();
+    } else {
+      // Nothing useful happens off-screen, and a timer that survives into the
+      // background only drains the battery.
+      _stopPeriodicSync();
     }
   }
 
   Future<void> _backup() async {
     if (!mounted) return;
     final api = context.read<TandavApi>();
+    if (!appFiles.supportsBackups) {
+      Alert.show(context, appFiles.unavailableMessage, isError: true);
+      return;
+    }
     try {
-      final file = await api.createBackup();
+      final entry = await api.createBackup();
       if (!mounted) return;
-      Alert.show(context, 'Backup saved: ${file.uri.pathSegments.last}');
+      Alert.show(context, 'Backup saved: ${entry.name}');
     } on Exception catch (e) {
       if (mounted) {
         Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
@@ -81,7 +121,11 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   Future<void> _restore() async {
     if (!mounted) return;
     final api = context.read<TandavApi>();
-    final List<File> backups;
+    if (!appFiles.supportsBackups) {
+      Alert.show(context, appFiles.unavailableMessage, isError: true);
+      return;
+    }
+    final List<BackupEntry> backups;
     try {
       backups = await api.listBackups();
     } on Exception {
@@ -93,7 +137,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       Alert.show(context, 'No backups found yet', isError: true);
       return;
     }
-    final selected = await showModalBottomSheet<File>(
+    final selected = await showModalBottomSheet<BackupEntry>(
       context: context,
       backgroundColor: TandavColors.surface,
       builder: (ctx) => SafeArea(
@@ -111,18 +155,18 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                 ),
               ),
             ),
-            ...backups.map((f) => ListTile(
+            ...backups.map((b) => ListTile(
                   leading: const Icon(Icons.restore_rounded,
                       color: TandavColors.gold),
                   title: Text(
-                    f.uri.pathSegments.last,
+                    b.name,
                     style: const TextStyle(fontSize: 13),
                   ),
                   subtitle: Text(
-                    '${(f.lengthSync() / 1024).toStringAsFixed(1)} KB',
+                    b.sizeLabel,
                     style: const TextStyle(fontSize: 11.5),
                   ),
-                  onTap: () => Navigator.pop(ctx, f),
+                  onTap: () => Navigator.pop(ctx, b),
                 )),
           ],
         ),
@@ -136,7 +180,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         title: const Text('Restore data?'),
         content: Text(
             'This replaces all current data with the backup\n'
-            '${selected.uri.pathSegments.last}. This cannot be undone.'),
+            '${selected.name}. This cannot be undone.'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -155,7 +199,9 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       if (!ok) throw const FormatException('Restore failed');
       if (!mounted) return;
       Alert.show(context, 'Data restored');
-      context.read<AuthState>().notifyDatabaseRestored();
+      // Awaited because the restore may have reintroduced the factory password,
+      // in which case this re-raises the setup gate and drops the session.
+      await context.read<AuthState>().notifyDatabaseRestored();
     } on Exception catch (e) {
       if (mounted) {
         Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
@@ -257,22 +303,42 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                   );
                 },
               ),
+              // Hidden rather than disabled in the iPhone build: a greyed-out
+              // "Backup data" invites the customer to believe their data is
+              // being backed up somewhere. Drive sync is not a backup, so the
+              // honest thing is to not offer the menu item at all.
+              if (appFiles.supportsBackups) ...[
+                ListTile(
+                  leading: const Icon(Icons.backup_outlined,
+                      color: TandavColors.gold),
+                  title: const Text('Backup data'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _backup();
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.restore_outlined,
+                      color: TandavColors.gold),
+                  title: const Text('Restore data'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _restore();
+                  },
+                ),
+              ],
               ListTile(
-                leading: const Icon(Icons.backup_outlined,
+                leading: const Icon(Icons.shield_outlined,
                     color: TandavColors.gold),
-                title: const Text('Backup data'),
+                title: const Text('Account'),
+                subtitle: const Text('Password and recovery code',
+                    style: TextStyle(fontSize: 11.5)),
                 onTap: () {
                   Navigator.pop(ctx);
-                  _backup();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.restore_outlined,
-                    color: TandavColors.gold),
-                title: const Text('Restore data'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _restore();
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const AccountScreen()),
+                  );
                 },
               ),
               ListTile(

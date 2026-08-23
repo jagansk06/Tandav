@@ -48,6 +48,16 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  Future<void> _forgotPassword() async {
+    final done = await showDialog<bool>(
+      context: context,
+      builder: (_) => const _RecoveryDialog(),
+    );
+    if (done == true && mounted) {
+      Alert.show(context, 'Password changed. You are signed in.');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -153,6 +163,17 @@ class _LoginScreenState extends State<LoginScreen> {
                             expanded: true,
                             onPressed: _submit,
                           ),
+                    const SizedBox(height: 6),
+                    TextButton(
+                      onPressed: _busy ? null : _forgotPassword,
+                      child: const Text(
+                        'Forgot password?',
+                        style: TextStyle(
+                          color: TandavColors.textSecondary,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -160,6 +181,132 @@ class _LoginScreenState extends State<LoginScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Password reset by recovery code.
+///
+/// There is no server, so this is the entire reset story: no email, no SMS, no
+/// support queue. The code was shown once at signup and stays visible under
+/// Settings → Account, and it is matched loosely — case, spaces and dashes are
+/// all ignored — because being pedantic about punctuation would only ever
+/// punish someone who is already locked out.
+class _RecoveryDialog extends StatefulWidget {
+  const _RecoveryDialog();
+
+  @override
+  State<_RecoveryDialog> createState() => _RecoveryDialogState();
+}
+
+class _RecoveryDialogState extends State<_RecoveryDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _code = TextEditingController();
+  final _password = TextEditingController();
+  final _confirm = TextEditingController();
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _code.dispose();
+    _password.dispose();
+    _confirm.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() => _busy = true);
+    // Captured before the await so nothing reaches for a BuildContext that may
+    // already have been torn down.
+    final auth = context.read<AuthState>();
+    final navigator = Navigator.of(context);
+    try {
+      await auth.resetWithRecoveryCode(_code.text, _password.text);
+      navigator.pop(true);
+    } on Exception catch (e) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
+          isError: true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: TandavColors.surface,
+      title: const Text('Reset with recovery code'),
+      content: SingleChildScrollView(
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Enter the recovery code you saved when you set up this phone.',
+                style: TextStyle(
+                  color: TandavColors.textSecondary,
+                  fontSize: 13,
+                  height: 1.45,
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextFormField(
+                controller: _code,
+                autocorrect: false,
+                textCapitalization: TextCapitalization.characters,
+                decoration: const InputDecoration(
+                  labelText: 'Recovery code',
+                  hintText: 'TNDV-XXXX-XXXX',
+                  prefixIcon: Icon(Icons.vpn_key_outlined),
+                ),
+                validator: (v) => (v == null || v.trim().isEmpty)
+                    ? 'Recovery code is required'
+                    : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _password,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'New password',
+                  prefixIcon: Icon(Icons.lock_outline_rounded),
+                ),
+                validator: (v) => (v == null || v.length < 4)
+                    ? 'Use at least 4 characters'
+                    : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _confirm,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Confirm new password',
+                  prefixIcon: Icon(Icons.lock_outline_rounded),
+                ),
+                validator: (v) => v == _password.text
+                    ? null
+                    : 'The two passwords do not match',
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.pop(context, false),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: _busy ? null : _submit,
+          child: Text(
+            _busy ? 'Working…' : 'Reset',
+            style: const TextStyle(color: TandavColors.gold),
+          ),
+        ),
+      ],
     );
   }
 }

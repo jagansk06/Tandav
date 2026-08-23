@@ -111,6 +111,63 @@ Copy the **Client ID** (`…apps.googleusercontent.com`). For the PWA it goes in
 <meta name="google-signin-client_id" content="YOUR_WEB_CLIENT_ID.apps.googleusercontent.com">
 ```
 
+That file currently ships a `REPLACE_WITH_WEB_CLIENT_ID…` placeholder. Replace it
+before deploying, or the PWA loads normally and then refuses to connect. The
+client id is **not a secret** — it is meant to be public and is safe to commit.
+
+### 6a. Two more things the PWA needs that Android does not
+
+Both are one-time, free, and never need renewing.
+
+**Enable the People API** (same project → *APIs & Services* → *Library* →
+"Google People API" → Enable).
+
+This looks unnecessary and is not. On the web, Google's sign-in returns an access
+token but **no identity** — the plugin then asks `people/me` which email signed
+in, because the Drive client cannot be built without a signed-in user. Skip this
+and sign-in succeeds, then fails on "which account was that?". Verified by
+reading google_sign_in_web 0.12.4+4 (`gis_client.signIn`, `people.dart`), not
+inferred from the docs.
+
+**Add two scopes to the consent screen**: `userinfo.email` and
+`userinfo.profile`, alongside `drive.file`. These are what the People API call
+needs. Both are classed *non-sensitive*, so neither drags in Google verification
+or any recurring review.
+
+**Authorized JavaScript origins must list every address the PWA is served from.**
+GIS refuses to initialise from an unlisted origin. That includes local testing,
+and `flutter run -d chrome` picks a **random port** each run — so always pin it:
+
+```
+flutter run -d chrome --web-port=5555
+```
+
+By the end there should be three, and they are cheap to add all at once:
+
+```
+http://localhost:8080          the visibility test page in step 7
+http://localhost:5555          flutter run -d chrome
+https://jagansk06.github.io    the deployed PWA
+```
+
+An origin is scheme + host (+ port), with **no path** — so it is
+`https://jagansk06.github.io`, not `https://jagansk06.github.io/tandav-app/`, even
+though the app is served from the subpath. One happy consequence: renaming the
+site repo changes the URL customers use but **not** this entry.
+
+### 6b. What the customer will notice on iPhone
+
+The iPhone version asks for **one "Resume syncing" tap each time the app is
+opened**, and there is no way around it. A browser gets a short-lived access
+token and no refresh token, and Safari keeps it in memory only — so a reload has
+nothing to restore, and minting a new token needs a pop-up, which needs a tap.
+
+This is a browser limitation, not a subscription and not a setting. Everything
+else in the app works with no tap at all, because the data is local; only the
+Drive hand-off waits. One tap covers roughly an hour of use. The Device Sync
+screen says "Signed in as …" rather than "Not connected" in this state, so a
+customer whose sync is healthy is never told it is broken.
+
 ---
 
 ## 7. Settle the visibility question BEFORE building the PWA

@@ -32,8 +32,10 @@ build/
 mobile/.dart_tool/
 mobile/android/.gradle/
 mobile/android/build/
-mobile/packages/*/android/.gradle/
-mobile/packages/*/android/build/
+# `mobile/packages/*/android/{.gradle,build}/` was listed here for the vendored
+# ble_peripheral plugin. That whole directory went with the Bluetooth sync path
+# on 2026-08-23; the generic `build/` and `.gradle/` rules above cover any
+# future path dependency anyway.
 
 # Device log captured by ship.ps1 — can contain account details.
 device-log.txt

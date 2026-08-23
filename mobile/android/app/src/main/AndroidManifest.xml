@@ -1,24 +1,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Bluetooth LE: two-master sync between Tandav devices. On Android 12+
-         the scan/connect permissions are runtime-granted (permission_handler);
-         on older Android versions the legacy pair works because the app also
-         requests location during scanning. FOREVER SERVICE keeps the sync
-         session alive even if the app is backgrounded during an exchange. -->
-    <uses-permission android:name="android.permission.BLUETOOTH"
-        android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
-        android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
-    <uses-feature android:name="android.hardware.bluetooth_le"
-        android:required="true" />
     <!-- Google Drive sync mailbox: the two masters are usually in different
          places, so changes travel through one small file in a shared Google
-         account instead of over Bluetooth. The app talks to Google only —
-         there is no Tandav server. -->
+         account. The app talks to Google only — there is no Tandav server.
+
+         A Bluetooth LE transport used to live here and needed five permissions
+         plus <uses-feature android:name="android.hardware.bluetooth_le"
+         android:required="true" />. That feature tag also silently restricted
+         which devices could install the app at all, so removing the Bluetooth
+         path widened hardware support as a side effect. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <application

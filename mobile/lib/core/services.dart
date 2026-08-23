@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import '../database/tandav_database.dart';
 import '../models/attendance.dart';
 import '../models/batch.dart';
@@ -8,6 +6,7 @@ import '../models/event.dart';
 import '../models/fee.dart';
 import '../models/progress.dart';
 import '../models/student.dart';
+import '../platform/app_files.dart' show BackupEntry;
 import '../repositories/attendance_repository.dart';
 import '../repositories/auth_repository.dart';
 import '../repositories/batch_repository.dart';
@@ -19,7 +18,6 @@ import '../repositories/student_repository.dart';
 import '../sync/cloud_sync.dart';
 import '../sync/drive_mailbox.dart';
 import '../sync/sync_engine.dart';
-import '../sync/sync_manager.dart';
 import '../sync/sync_mailbox.dart';
 import '../sync/sync_state.dart';
 
@@ -51,17 +49,14 @@ class TandavApi {
   late final SyncState syncState = SyncState(db);
   late final SyncEngine syncEngine = SyncEngine(db, syncState);
 
-  /// Bluetooth sync — the fast path for when the two masters happen to be in
-  /// the same room.
-  late final SyncManager sync =
-      SyncManager(db: db, state: syncState, engine: syncEngine);
-
   /// Where the two devices leave files for each other. Built lazily so tests
-  /// and Bluetooth-only use never construct a Google client.
+  /// can inject a fake and never construct a Google client.
   late final SyncMailbox mailbox = _mailbox ?? DriveMailbox();
 
-  /// Google Drive sync — the everyday path, and the only one that works when
-  /// the two masters are in different places.
+  /// The one and only sync path: a shared Google Drive account acting as a
+  /// store-and-forward mailbox. A Bluetooth transport used to sit alongside
+  /// this; it was removed because the two masters are in different places, so
+  /// it could never carry the everyday case.
   late final CloudSyncManager cloudSync = CloudSyncManager(
     db: db,
     state: syncState,
@@ -112,8 +107,12 @@ class TandavApi {
   Future<void> deleteStudent(int id) => students.deleteStudent(id);
 
   /// Save a picked photo into app documents and return its local path.
-  Future<String> uploadPhoto(int studentId, File file, String filename) =>
-      students.savePhoto(studentId, file, filename);
+  ///
+  /// `sourcePath` rather than a `File` so this signature survives the web
+  /// build, where `dart:io` does not exist. Android only — guard on
+  /// `appFiles.supportsPhotos`.
+  Future<String> uploadPhoto(int studentId, String sourcePath, String filename) =>
+      students.savePhoto(studentId, sourcePath, filename);
 
   // ---- Attendance ----
   Future<AttendanceDay> getAttendanceDay(String date, {int? batchId}) =>
@@ -225,9 +224,12 @@ class TandavApi {
       dashboard.getMonthlyReport(month);
 
   // ---- Backup / restore ----
-  Future<File> createBackup() => db.createBackup();
+  // Android only. `appFiles.supportsBackups` is false in the iPhone PWA and
+  // these throw there; the menu hides them rather than calling.
+  Future<BackupEntry> createBackup() => db.createBackup();
 
-  Future<List<File>> listBackups() => db.listBackups();
+  Future<List<BackupEntry>> listBackups() => db.listBackups();
 
-  Future<bool> restoreFromBackup(File backup) => db.restoreFromBackup(backup);
+  Future<bool> restoreFromBackup(BackupEntry backup) =>
+      db.restoreFromBackup(backup);
 }

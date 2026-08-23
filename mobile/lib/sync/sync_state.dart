@@ -6,19 +6,21 @@ import '../database/tandav_database.dart';
 /// sqflite Transaction).
 typedef SyncExecutor = DatabaseExecutor;
 
-/// Persistent two-device sync state, stored in the `sync_state` key/value
-/// table (created at schema v2, alongside the device id itself).
+/// Persistent sync state, stored in the `sync_state` key/value table (created
+/// at schema v2, alongside the device id itself).
 ///
 /// Keys exposed here:
 /// - `device_id`          -> this installation's TANDAV-XXXX id (also on
 ///                           [TandavDatabase.deviceId])
-/// - `paired_device_id`   -> the other master device's TANDAV-XXXX id
-/// - `pairing_secret`     -> shared secret established during pairing used by
-///                           the AUTH handshake on every sync
-/// - `last_sync_at`       -> last successful sync timestamp (ISO-8601)
-/// - `watermark.<table>`  -> per-table high-water mark of what we have already
-///                           applied from the peer, so the next sync only
-///                           transfers records that changed since then
+///
+/// Keys owned by [CloudSyncManager] and read through it, not here:
+/// `cloud_account`, `cloud_peer_device_id`, `cloud_last_sync_at`.
+///
+/// Keys that may still exist in databases written by older builds and are now
+/// dead: `paired_device_id`, `pairing_secret`, `last_sync_at`. They belonged to
+/// the Bluetooth transport. Nothing reads them; they are left in place rather
+/// than migrated away because deleting rows buys nothing and a migration that
+/// touches `sync_state` risks the identity the whole sync design rests on.
 class SyncState {
   final TandavDatabase db;
   SyncState(this.db);
@@ -60,25 +62,6 @@ class SyncState {
   }
 
   String get deviceId => db.deviceId;
-
-  Future<String?> get pairedDeviceId => read('paired_device_id');
-
-  Future<void> setPairedDeviceId(String? id) => write('paired_device_id', id);
-
-  Future<String?> get pairingSecret => read('pairing_secret');
-
-  Future<void> setPairingSecret(String? secret) => write('pairing_secret', secret);
-
-  Future<String?> get lastSyncAt => read('last_sync_at');
-
-  Future<void> setLastSyncAt(String iso) => write('last_sync_at', iso);
-
-  /// True once this device has completed a verified pairing with another
-  /// device (i.e. `paired_device_id` is set).
-  Future<bool> get isPaired async {
-    final id = await pairedDeviceId;
-    return id != null && id.isNotEmpty;
-  }
 
   // NOTE: the per-table sync marks deliberately live in SyncEngine
   // (SyncEngine.sentKey / SyncEngine.receivedKey) and are read and written

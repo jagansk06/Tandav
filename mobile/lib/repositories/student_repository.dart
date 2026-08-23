@@ -1,11 +1,10 @@
-import 'dart:io';
-
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
 import '../database/db_helpers.dart';
 import '../database/tandav_database.dart';
 import '../models/student.dart';
+import '../platform/app_files.dart';
 import '../sync/sync_meta.dart';
 
 class StudentRepository {
@@ -101,12 +100,20 @@ class StudentRepository {
   }
 
   /// Copy a picked image into app documents and store the local path.
-  Future<String> savePhoto(int studentId, File source, String filename) async {
+  ///
+  /// Takes a path, not a `File`, so this file stays free of `dart:io` and
+  /// compiles for the web. Android only — the caller checks
+  /// `appFiles.supportsPhotos` first.
+  Future<String> savePhoto(
+    int studentId,
+    String sourcePath,
+    String filename,
+  ) async {
     final d = await _d;
     final dir = await db.photosDir;
     final ext = p.extension(filename).isEmpty ? '.jpg' : p.extension(filename);
-    final dest = p.join(dir.path, 'student_${studentId}_${DateTime.now().millisecondsSinceEpoch}$ext');
-    await source.copy(dest);
+    final dest = p.join(dir, 'student_${studentId}_${DateTime.now().millisecondsSinceEpoch}$ext');
+    await appFiles.copyFile(sourcePath, dest);
     await d.update('students', {
       'photo_url': dest,
       ...SyncStamp.now(db).touchColumns(),

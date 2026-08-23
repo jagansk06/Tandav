@@ -1,12 +1,12 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
+
+import '../platform/app_files.dart';
 
 /// Single source of truth for the local Tandav SQLite database.
 ///
@@ -65,31 +65,31 @@ class TandavDatabase {
     _overridePath = overridePath;
   }
 
-  DatabaseFactory get _databaseFactory => _factory ?? databaseFactory;
+  DatabaseFactory get _databaseFactory => _factory ?? platformDatabaseFactory;
 
   Future<String> _resolvePath() async {
     if (_overridePath != null) return _overridePath!;
-    final dir = await getDatabasesPath();
-    return p.join(dir, dbName);
+    // Asked of the platform layer rather than sqflite's global
+    // `getDatabasesPath()`, which is the Android platform channel and has no
+    // web implementation. In the browser this returns a bare IndexedDB key.
+    return appFiles.databasePath(dbName);
   }
 
-  Future<Directory> get photosDir async {
-    final dir = Directory(p.join(await _docsRoot, 'photos'));
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir;
-  }
+  /// Directory holding student photos. Android only — check
+  /// `appFiles.supportsPhotos` before calling.
+  Future<String> get photosDir async =>
+      appFiles.ensureDirectory(p.join(await _docsRoot, 'photos'));
 
-  Future<Directory> get backupsDir async {
-    final dir = Directory(p.join(await _docsRoot, 'TandavBackups'));
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir;
-  }
+  /// Directory holding database backups. Android only — check
+  /// `appFiles.supportsBackups` before calling.
+  Future<String> get backupsDir async =>
+      appFiles.ensureDirectory(p.join(await _docsRoot, 'TandavBackups'));
 
   /// App documents root; falls back to the test database directory when a
   /// test override path is configured (path_provider is unavailable there).
   Future<String> get _docsRoot async => _overridePath != null
       ? p.dirname(_overridePath!)
-      : p.dirname((await getApplicationDocumentsDirectory()).path);
+      : await appFiles.documentsRoot();
 
   Future<Database> open() async {
     if (_db != null && _db!.isOpen) return _db!;
@@ -342,15 +342,42 @@ class TandavDatabase {
     return deviceId;
   }
 
-  /// Generate a persistent device id of the form `TANDAV-XXXX`. The suffix is
-  /// four random characters drawn from an unambiguous uppercase alphabet (no
-  /// 0/O/1/I), giving ~1M combinations — plenty for a two-device pairing, and
-  /// never derived from a phone number.
-  static String generateDeviceId() {
-    const chars = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+  /// Unambiguous uppercase alphabet — no 0/O, no 1/I/L. Every code drawn from
+  /// it is read off a screen and typed back in by hand, sometimes from a note
+  /// written months earlier, so lookalike characters are removed rather than
+  /// explained.
+  static const _codeAlphabet = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+
+  static String _randomCode(int length) {
     final rng = Random.secure();
-    final suffix = List.generate(4, (_) => chars[rng.nextInt(chars.length)]);
-    return 'TANDAV-${suffix.join()}';
+    return List.generate(
+      length,
+      (_) => _codeAlphabet[rng.nextInt(_codeAlphabet.length)],
+    ).join();
+  }
+
+  /// Generate a persistent device id of the form `TANDAV-XXXX`. Four random
+  /// characters give ~1M combinations — plenty for a two-device pairing, and
+  /// never derived from a phone number.
+  static String generateDeviceId() => 'TANDAV-${_randomCode(4)}';
+
+  /// The one thing standing between a forgotten password and a database nobody
+  /// can open. Formatted `TNDV-XXXX-XXXX`: 31^8 is about 850 billion
+  /// combinations, grouped in fours because that is how people copy characters
+  /// off paper without losing their place.
+  static String generateRecoveryCode() =>
+      'TNDV-${_randomCode(4)}-${_randomCode(4)}';
+
+  /// Reduce a recovery code to the eight characters that carry the meaning,
+  /// discarding whatever formatting was added or lost on the way back in —
+  /// spaces, dashes, lower case, and the `TNDV` prefix itself.
+  ///
+  /// Both the stored code and the typed one go through this, so `tndv 4f7k9qx2`
+  /// unlocks a device holding `TNDV-4F7K-9QX2`. Being strict about punctuation
+  /// here would only ever punish someone who is already locked out.
+  static String normalizeRecoveryCode(String input) {
+    final bare = input.toUpperCase().replaceAll(RegExp('[^A-Z0-9]'), '');
+    return bare.startsWith('TNDV') ? bare.substring(4) : bare;
   }
 
   /// Forward migrations. Add a new branch for every future schema change;
@@ -380,6 +407,19 @@ class TandavDatabase {
       }
       await db.execute('''
         CREATE TABLE IF NOT EXISTS sync_state (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
+      ''');
+      // Defensive, and cheap. `app_settings` is created by `_onCreate`, so every
+      // database this repository has ever produced already has it — but if a
+      // build older than that is still installed anywhere, the first thing the
+      // new APK would do is show the signup screen, and `completeSetup` writes
+      // the recovery code into this table. A missing table there surfaces as a
+      // raw SQLite error on the one screen that cannot be dismissed or skipped,
+      // leaving the studio unable to reach its own data.
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS app_settings (
           key TEXT PRIMARY KEY,
           value TEXT
         )
@@ -439,7 +479,11 @@ class TandavDatabase {
   }
 
   /// Copy the live database file as a backup inside app documents.
-  Future<File> createBackup() async {
+  ///
+  /// Android only. The web build has no directory to write into, so
+  /// `appFiles.supportsBackups` is false there and this throws
+  /// [UnsupportedOnThisPlatform] — check the flag first.
+  Future<BackupEntry> createBackup() async {
     final db = await open();
     final path = db.path;
     final stamp = DateTime.now()
@@ -448,38 +492,98 @@ class TandavDatabase {
         .split('.')
         .first;
     final dir = await backupsDir;
-    final dest = File(p.join(dir.path, 'tandav-backup-$stamp.db'));
-    await File(path).copy(dest.path);
-    return dest;
+    final dest = p.join(dir, 'tandav-backup-$stamp.db');
+    await appFiles.copyFile(path, dest);
+    final saved = await appFiles.listDatabaseBackups(dir);
+    // Read the entry back so its size and timestamp come from the file system
+    // rather than from a guess. Falling back to a zero-size entry keeps a
+    // successful backup from being reported as a failure.
+    return saved.firstWhere(
+      (e) => e.path == dest,
+      orElse: () => BackupEntry(
+        path: dest,
+        name: p.basename(dest),
+        sizeBytes: 0,
+        modifiedAt: DateTime.now(),
+      ),
+    );
   }
 
-  /// List locally stored backups (newest first).
-  Future<List<File>> listBackups() async {
-    final dir = await backupsDir;
-    final files = dir
-        .listSync()
-        .whereType<File>()
-        .where((f) => p.extension(f.path) == '.db')
-        .toList()
-      ..sort((a, b) => b.path.compareTo(a.path));
-    return files;
+  /// List locally stored backups (newest first). Empty on the web build.
+  Future<List<BackupEntry>> listBackups() async {
+    if (!appFiles.supportsBackups) return const [];
+    return appFiles.listDatabaseBackups(await backupsDir);
   }
 
   /// Replace the live database with a backup file. Returns true on success.
-  Future<bool> restoreFromBackup(File backup) async {
+  ///
+  /// A backup is the whole file, `sync_state` included, so restoring one that
+  /// was taken on the *other* phone would hand this installation that phone's
+  /// `device_id`. Both would then write the same `tandav-<id>.json` and
+  /// overwrite each other's mailbox, and — because each device skips its own
+  /// file when hunting for a peer — neither would ever see a partner again.
+  /// The inherited `sent.<table>` marks are worse: rows this device has never
+  /// uploaded would already count as delivered and become unsendable for good.
+  ///
+  /// So the device id is compared across the swap. Unchanged means this is the
+  /// phone's own backup and everything is kept, which is the ordinary
+  /// disaster-recovery case. Changed means the file came from somewhere else,
+  /// and the sync identity is reset before it can do any damage.
+  Future<bool> restoreFromBackup(BackupEntry backup) async {
     final db = await open();
     final livePath = db.path;
-    final backupPath = backup.absolute.path;
+    final backupPath = appFiles.absolutePath(backup.path);
     if (backupPath == livePath) return false;
+
+    final idBefore = _deviceId;
 
     // Copy backup to a staging path first so a failed copy never truncates
     // the live database.
     final staging = '$livePath.restore.tmp';
-    await File(backupPath).copy(staging);
+    await appFiles.copyFile(backupPath, staging);
 
     await close();
-    await File(staging).rename(livePath);
-    await open();
+    await appFiles.moveFile(staging, livePath);
+    final restored = await open();
+
+    if (idBefore != null && _deviceId != idBefore) {
+      await _resetSyncIdentity(restored);
+    }
     return true;
+  }
+
+  /// Give this installation a brand-new sync identity, discarding every trace
+  /// of the one the restored file described.
+  ///
+  /// Everything cleared here is a statement about a *different* installation's
+  /// history: who it paired with, what it had already delivered, when it last
+  /// synced. Keeping any of it would make this device lie to its peer.
+  ///
+  /// The cached account label (`cloud_account`) is left alone on purpose — the
+  /// Google session lives in the sign-in plugin, not in this file, so clearing
+  /// the label would show "not connected" on a device that is still signed in.
+  Future<void> _resetSyncIdentity(Database db) async {
+    final fresh = generateDeviceId();
+    await db.insert(
+      'sync_state',
+      {'key': 'device_id', 'value': fresh},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    // The 'sent.' and 'watermark.' prefixes mirror SyncEngine.sentKey and
+    // SyncEngine.receivedKey. They are spelled out as literals here because
+    // SyncEngine imports this file, so importing it back would be circular.
+    await db.delete(
+      'sync_state',
+      where: "key IN (?, ?, ?, ?, ?) "
+          "OR key LIKE 'sent.%' OR key LIKE 'watermark.%'",
+      whereArgs: [
+        'paired_device_id',
+        'pairing_secret',
+        'last_sync_at',
+        'cloud_peer_device_id',
+        'cloud_last_sync_at',
+      ],
+    );
+    _deviceId = fresh;
   }
 }

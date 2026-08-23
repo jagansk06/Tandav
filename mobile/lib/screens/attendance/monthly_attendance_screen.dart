@@ -77,7 +77,7 @@ class _MonthlyAttendanceScreenState extends State<MonthlyAttendanceScreen> {
                     builder: (context, snapshot) {
                       final batches = snapshot.data ?? _batches;
                       return DropdownButtonFormField<int?>(
-                        value: _batchId,
+                        initialValue: _batchId,
                         isExpanded: true,
                         decoration: const InputDecoration(
                           labelText: 'Batch',
