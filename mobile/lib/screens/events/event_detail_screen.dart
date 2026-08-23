@@ -73,6 +73,7 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
       ),
     );
     if (confirmed != true) return;
+    if (!mounted) return;
     try {
       final api = context.read<TandavApi>();
       await api.deleteEvent(widget.eventId);
@@ -491,6 +492,7 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
     try {
       final api = context.read<TandavApi>();
       await api.removeParticipant(p.id);
+      if (!mounted) return;
       Alert.show(context, 'Participant removed');
       _reloadAll();
     } on Exception catch (e) {
@@ -572,7 +574,7 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
             const SizedBox(height: 12),
             if (isBatchMode)
               DropdownButtonFormField<int?>(
-                value: _batchId,
+                initialValue: _batchId,
                 isExpanded: true,
                 decoration: const InputDecoration(
                   labelText: 'Batch *',

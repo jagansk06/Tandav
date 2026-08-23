@@ -56,17 +56,37 @@ class SyncEngine {
     'monthly_progress': {'student_id': 'students'},
   };
 
-  /// Rows we must send to the peer: everything newer than the watermark.
+  /// Rows we must publish for the peer.
   ///
-  /// Called with a read-only transaction so the snapshot is consistent with
-  /// the watermark it is based on.
-  Future<SyncDelta> computeOutbound(Transaction txn) async {
+  /// Two modes:
+  ///
+  /// - **Watermark delta** (default) — everything newer than the per-table
+  ///   watermark. Used by a live, connected session where the peer
+  ///   acknowledges each exchange.
+  ///
+  /// - **Owned snapshot** ([ownedBy] set) — every row this device currently
+  ///   owns, i.e. `device_id == ownedBy`, regardless of watermark. Used by
+  ///   Google Drive sync, where our published file is the *only* record of
+  ///   our contribution and is overwritten on every upload: a watermark delta
+  ///   would silently drop changes a device that stayed offline for several
+  ///   syncs had not yet read. Because `device_id` is the *last writer*, each
+  ///   row lives in exactly one device's snapshot, the union of all snapshots
+  ///   is the complete dataset, and a row migrates out of our snapshot as
+  ///   soon as the other device edits it. Tombstones are deliberately
+  ///   included so deletions propagate.
+  Future<SyncDelta> computeOutbound(Transaction txn, {String? ownedBy}) async {
     final delta = SyncDelta();
     for (final table in SyncCodec.applyOrder) {
-      final wm = await state.readWithin(txn, 'watermark.$table') ?? '';
-      final rows = wm.isEmpty
-          ? await _selectAll(txn, table)
-          : await txn.query(table, where: 'updated_at > ?', whereArgs: [wm]);
+      final List<Map<String, Object?>> rows;
+      if (ownedBy != null) {
+        rows = await txn
+            .query(table, where: 'device_id = ?', whereArgs: [ownedBy]);
+      } else {
+        final wm = await state.readWithin(txn, 'watermark.$table') ?? '';
+        rows = wm.isEmpty
+            ? await _selectAll(txn, table)
+            : await txn.query(table, where: 'updated_at > ?', whereArgs: [wm]);
+      }
       if (rows.isEmpty) continue;
       final out = <Map<String, Object?>>[];
       for (final r in rows) {
@@ -156,6 +176,16 @@ class SyncEngine {
           remapped['device_id'] = (row['device_id'] as String?) ?? peerDeviceId;
           final incomingDevice = (row['device_id'] as String?) ?? peerDeviceId;
           if (_newerThan(updatedAt, incomingDevice, localUpdatedAt, localDeviceId)) {
+            if (!await _freeNaturalKey(
+                txn, table, remapped, existing['id'] as int)) {
+              // Another local row owns the unique key this update wants. Skip
+              // the row instead of letting SQLite abort the whole merge, and
+              // leave the watermark where it is so it is retried next sync.
+              tableUuids[uuid] = existing['id'] as int;
+              result.conflictsSkipped[table] =
+                  result.conflictsSkipped[table]! + 1;
+              continue;
+            }
             await txn.update(table, remapped,
                 where: 'id = ?', whereArgs: [existing['id']]);
             tableUuids[uuid] = existing['id'] as int;
@@ -197,6 +227,52 @@ class SyncEngine {
     return result;
   }
 
+  /// Make sure no *other* local row already owns the unique key [remapped] is
+  /// about to take, and report whether the write can go ahead.
+  ///
+  /// This matters for `batches.name`, the one natural key a user can edit:
+  /// renaming a batch on one device to a name a *deleted* batch still holds on
+  /// the other device would hit `UNIQUE constraint failed` while applying, and
+  /// because the whole merge runs in one transaction that single row would roll
+  /// back every other change and fail again on every future sync. A tombstone's
+  /// name is dead metadata, so it is parked out of the way; a live row's name is
+  /// not, so the incoming row is skipped and retried instead.
+  Future<bool> _freeNaturalKey(
+    Transaction txn,
+    String table,
+    Map<String, Object?> remapped,
+    int targetId,
+  ) async {
+    final natural = SyncCodec.naturalKeysFor(table);
+    if (natural.isEmpty) return true;
+    final conditions = <String>[];
+    final args = <Object?>[];
+    for (final key in natural) {
+      final value = remapped[key];
+      if (value == null) return true;
+      conditions.add('$key = ?');
+      args.add(value);
+    }
+    conditions.add('id <> ?');
+    args.add(targetId);
+    final blocking = await txn.query(table,
+        columns: ['id', 'deleted_at', 'sync_uuid'],
+        where: conditions.join(' AND '),
+        whereArgs: args,
+        limit: 1);
+    if (blocking.isEmpty) return true;
+    final blocker = blocking.first;
+    if (blocker['deleted_at'] == null) return false;
+    if (table != 'batches') return false;
+    final freed = blocker['id'] as int;
+    await txn.update(
+        'batches',
+        {'name': SyncCodec.parkedBatchName(freed, blocker['sync_uuid'])},
+        where: 'id = ?',
+        whereArgs: [freed]);
+    return true;
+  }
+
   void _maxOf(List<String> list, String value) {
     if (value.compareTo(list.isEmpty ? '' : list.last) > 0) list.add(value);
   }
@@ -220,6 +296,18 @@ class SyncEngine {
   /// Match a row by uuid first, then by the table's natural unique key (so
   /// the same logical record created independently on both devices merges
   /// into one row instead of duplicating).
+  ///
+  /// The natural-key lookup deliberately does **not** filter `deleted_at`.
+  /// Every natural key here is backed by a real UNIQUE constraint
+  /// (`batches.name`, `fees(student_id, month)`, `attendance(student_id,
+  /// attendance_date)`, …), so at most one row can ever match — and if that one
+  /// row happens to be a tombstone, it is still the only place the incoming
+  /// values can go. Skipping it and inserting instead would raise
+  /// `UNIQUE constraint failed`, which aborts the whole merge transaction and
+  /// would keep failing on every future sync. Reviving the tombstone (when the
+  /// incoming row is the newer one) also merges the two identities, which is
+  /// what "do not create duplicate students, batches, attendance or fee
+  /// records" asks for.
   Future<Map<String, Object?>?> _findByUuid(
     Transaction txn,
     String table,
@@ -241,10 +329,14 @@ class SyncEngine {
       final conditions = <String>[];
       final args = <Object?>[];
       for (final key in natural) {
+        final value = remapped[key];
+        // A NULL never satisfies `= ?` in SQL, so a natural key that arrived
+        // empty must not be turned into a query that silently matches nothing
+        // and inserts a duplicate.
+        if (value == null) return null;
         conditions.add('$key = ?');
-        args.add(remapped[key]);
+        args.add(value);
       }
-      conditions.add('deleted_at IS NULL');
       final nat = await txn.query(table,
           where: conditions.join(' AND '), whereArgs: args, limit: 1);
       if (nat.isNotEmpty) return Map<String, Object?>.from(nat.first);

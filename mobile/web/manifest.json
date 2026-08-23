@@ -1,11 +1,11 @@
 {
-    "name": "tandav_mobile",
-    "short_name": "tandav_mobile",
+    "name": "Tandav Studio",
+    "short_name": "Tandav",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#0B0B0E",
+    "theme_color": "#0B0B0E",
+    "description": "Tandav Dance Studio — students, batches, attendance and fees. Works offline; syncs through Google Drive.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

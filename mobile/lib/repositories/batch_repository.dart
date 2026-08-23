@@ -3,6 +3,7 @@ import 'package:sqflite/sqflite.dart' hide Batch;
 import '../database/db_helpers.dart';
 import '../database/tandav_database.dart';
 import '../models/batch.dart';
+import '../sync/sync_codec.dart';
 import '../sync/sync_meta.dart';
 
 class BatchRepository {
@@ -45,54 +46,153 @@ class BatchRepository {
       FROM batches b
       WHERE b.id = ? AND b.deleted_at IS NULL
     ''', [id]);
-    if (rows.isEmpty) throw RepoException('Batch not found');
+    if (rows.isEmpty) throw const RepoException('Batch not found');
     return _batchFromRow(rows.first);
   }
 
+  /// Create a batch, or revive one that was deleted under the same name.
+  ///
+  /// `batches.name` is UNIQUE and a deleted batch keeps its row as a tombstone
+  /// (so the deletion can reach the other device), which means a plain insert
+  /// fails with a constraint error the moment the studio re-creates a batch it
+  /// had removed — and the batch would never appear in the list or in the
+  /// Attendance picker. Reviving the tombstone keeps the name usable and keeps
+  /// the record's sync identity, so the other device updates its copy instead
+  /// of ending up with a duplicate.
   Future<Batch> createBatch(Map<String, dynamic> payload) async {
     final d = await _d;
-    final id = await d.insert('batches', {
-      'name': (payload['name'] as String).trim(),
-      'dance_style': payload['dance_style'] ?? '',
-      'level': payload['level'] ?? '',
-      'schedule': payload['schedule'] ?? '',
-      'monthly_fee': _fee(payload['monthly_fee']),
-      'is_active': payload['is_active'] == false ? 0 : 1,
-      'notes': payload['notes'],
-      ...SyncStamp.now(db).columns(),
+    final values = _payloadToRow(payload);
+    final id = await d.transaction<int>((txn) async {
+      final existing = await txn.query('batches',
+          columns: ['id', 'deleted_at'],
+          where: 'name = ?',
+          whereArgs: [values['name']],
+          limit: 1);
+      if (existing.isEmpty) {
+        return txn.insert('batches', {
+          ...values,
+          ...SyncStamp.now(db).columns(),
+        });
+      }
+      if (existing.first['deleted_at'] == null) {
+        throw const RepoException('A batch with that name already exists');
+      }
+      final revivedId = existing.first['id'] as int;
+      await txn.update('batches', {
+        ...values,
+        'deleted_at': null,
+        ...SyncStamp.now(db).touchColumns(),
+      }, where: 'id = ?', whereArgs: [revivedId]);
+      return revivedId;
     });
     return getBatch(id);
   }
 
+  /// Apply an edit, writing only the fields present in [payload].
   Future<Batch> updateBatch(int id, Map<String, dynamic> payload) async {
     final d = await _d;
-    final updated = await d.update('batches', {
-      'name': (payload['name'] as String).trim(),
-      'dance_style': payload['dance_style'] ?? '',
-      'level': payload['level'] ?? '',
-      'schedule': payload['schedule'] ?? '',
-      'monthly_fee': _fee(payload['monthly_fee']),
-      'is_active': payload['is_active'] == false ? 0 : 1,
-      'notes': payload['notes'],
-      ...SyncStamp.now(db).touchColumns(),
-    }, where: 'id = ?', whereArgs: [id]);
-    if (updated == 0) throw RepoException('Batch not found');
+    final values = _payloadToRow(payload, partial: true);
+    await d.transaction((txn) async {
+      final name = values['name'];
+      if (name != null) {
+        // The UNIQUE index covers tombstones too, so renaming onto a deleted
+        // batch's name would fail the constraint. The tombstone's name is dead
+        // metadata — the peer matches it by `sync_uuid` — so it is moved out of
+        // the way rather than blocking a name the studio wants to reuse.
+        final clash = await txn.query('batches',
+            columns: ['id', 'deleted_at', 'sync_uuid'],
+            where: 'name = ? AND id <> ?',
+            whereArgs: [name, id],
+            limit: 1);
+        if (clash.isNotEmpty) {
+          if (clash.first['deleted_at'] == null) {
+            throw const RepoException('A batch with that name already exists');
+          }
+          final freed = clash.first['id'] as int;
+          await txn.update(
+              'batches',
+              {
+                'name': SyncCodec.parkedBatchName(
+                    freed, clash.first['sync_uuid']),
+              },
+              where: 'id = ?',
+              whereArgs: [freed]);
+        }
+      }
+      final updated = await txn.update('batches', {
+        ...values,
+        ...SyncStamp.now(db).touchColumns(),
+      }, where: 'id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      if (updated == 0) throw const RepoException('Batch not found');
+    });
     return getBatch(id);
   }
 
   /// Soft delete: tombstone the batch and unassign its students (matching the
   /// original cascade-SET-NULL behaviour), while keeping the batch row so the
   /// deletion can synchronize to the other device.
+  ///
+  /// Both writes happen in one transaction, and the students are *stamped* as
+  /// changed. Clearing `batch_id` without moving `updated_at` would leave the
+  /// unassignment invisible to sync: the other device would apply the batch
+  /// tombstone but keep its students pointing at a batch that no longer
+  /// exists, so the two devices would disagree about who is in which batch.
   Future<void> deleteBatch(int id) async {
     final d = await _d;
-    final stamp = SyncStamp.now(db);
-    final updated = await d.update('batches', {
-      'is_active': 0,
-      ...stamp.tombstoneColumns(),
-    }, where: 'id = ?', whereArgs: [id]);
-    if (updated == 0) throw RepoException('Batch not found');
-    await d.update('students', {'batch_id': null},
-        where: 'batch_id = ?', whereArgs: [id]);
+    final updated = await d.transaction((txn) async {
+      final stamp = SyncStamp.now(db);
+      final rows = await txn.update('batches', {
+        'is_active': 0,
+        ...stamp.tombstoneColumns(),
+      }, where: 'id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      if (rows == 0) return 0;
+      await txn.update('students', {
+        'batch_id': null,
+        ...stamp.touchColumns(),
+      }, where: 'batch_id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      // Events and attendance marks reference the batch too; the FK is
+      // ON DELETE SET NULL / CASCADE on a real delete, which a tombstone never
+      // triggers, so the reference is cleared explicitly. Attendance history is
+      // preserved — only the batch label is dropped.
+      await txn.update('events', {
+        'batch_id': null,
+        ...stamp.touchColumns(),
+      }, where: 'batch_id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      await txn.update('attendance', {
+        'batch_id': null,
+        ...stamp.touchColumns(),
+      }, where: 'batch_id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      return rows;
+    });
+    if (updated == 0) throw const RepoException('Batch not found');
+  }
+
+  /// Map an API payload onto batch columns. With [partial] set, only the keys
+  /// the caller actually sent are written, so an edit cannot blank the fields
+  /// its form does not carry.
+  Map<String, Object?> _payloadToRow(
+    Map<String, dynamic> payload, {
+    bool partial = false,
+  }) {
+    final row = <String, Object?>{};
+    bool has(String key) => !partial || payload.containsKey(key);
+
+    if (has('name')) {
+      // NOT NULL in the schema, so validate instead of casting: an unchecked
+      // cast surfaces in the UI as an unreadable type error.
+      final name = (payload['name'] as String?)?.trim() ?? '';
+      if (name.isEmpty) throw const RepoException('Batch name is required');
+      row['name'] = name;
+    }
+    if (has('dance_style')) row['dance_style'] = payload['dance_style'] ?? '';
+    if (has('level')) row['level'] = payload['level'] ?? '';
+    if (has('schedule')) row['schedule'] = payload['schedule'] ?? '';
+    if (has('monthly_fee')) row['monthly_fee'] = _fee(payload['monthly_fee']);
+    if (has('is_active')) {
+      row['is_active'] = payload['is_active'] == false ? 0 : 1;
+    }
+    if (has('notes')) row['notes'] = payload['notes'];
+    return row;
   }
 
   Batch _batchFromRow(Map<String, Object?> row) => Batch(

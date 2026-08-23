@@ -80,24 +80,65 @@ class FeeRepository {
   /// Create DUE fee records for [month] for every active student with a
   /// non-zero fee who joined on or before that month. Returns the number of
   /// newly inserted rows (existing records are never duplicated).
-  Future<int> _insertMonthFees(Transaction txn, DateTime month) async {
+  Future<int> _insertMonthFees(DatabaseExecutor txn, DateTime month) async {
     final nextMonth = DbFmt.addMonths(month, 1);
     final students = await txn.query('students',
-        where: 'is_active = 1 AND monthly_fee > 0 AND join_date < ?',
+        where:
+            'is_active = 1 AND monthly_fee > 0 AND join_date < ? AND deleted_at IS NULL',
         whereArgs: [DbFmt.date(nextMonth)]);
     var created = 0;
     for (final s in students) {
-      final inserted = await txn.insert('fees', {
-        'student_id': s['id'],
-        'month': DbFmt.month(month),
-        'amount_due': _fee(s['monthly_fee']),
-        'amount_paid': 0,
-        'status': 'due',
-        ...SyncStamp.now(db).columns(),
-      }, conflictAlgorithm: ConflictAlgorithm.ignore);
-      if (inserted != 0) created++;
+      final added = await _ensureFeeRow(txn,
+          studentId: s['id'] as int,
+          month: DbFmt.month(month),
+          amountDue: _fee(s['monthly_fee']));
+      if (added) created++;
     }
     return created;
+  }
+
+  /// Guarantee a live DUE record for [studentId] in [month], returning whether
+  /// one had to be created. Idempotent: a record that already exists is left
+  /// exactly as it is, payments included.
+  ///
+  /// `fees` is UNIQUE (student_id, month), so a *deleted* record for the same
+  /// month would make INSERT OR IGNORE a silent no-op while every read filters
+  /// `deleted_at IS NULL` — the student would then be missing from that month's
+  /// register permanently, and no amount of regeneration could bring them back.
+  /// A tombstone is therefore revived as a fresh DUE record. Reviving also wins
+  /// the next merge (it is the newer edit), so both devices agree, which is the
+  /// behaviour the fee register needs: every eligible student is always listed.
+  Future<bool> _ensureFeeRow(
+    DatabaseExecutor txn, {
+    required int studentId,
+    required String month,
+    required double amountDue,
+  }) async {
+    final inserted = await txn.insert('fees', {
+      'student_id': studentId,
+      'month': month,
+      'amount_due': amountDue,
+      'amount_paid': 0,
+      'status': 'due',
+      ...SyncStamp.now(db).columns(),
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    if (inserted != 0) return true;
+
+    // The insert was ignored, so a row exists. Revive it only if it is a
+    // tombstone — the `deleted_at IS NOT NULL` filter is what keeps a live
+    // record's amounts and payment history untouched.
+    final revived = await txn.update('fees', {
+      'amount_due': amountDue,
+      'amount_paid': 0,
+      'status': 'due',
+      'payment_date': null,
+      'payment_method': null,
+      'deleted_at': null,
+      ...SyncStamp.now(db).touchColumns(),
+    },
+        where: 'student_id = ? AND month = ? AND deleted_at IS NOT NULL',
+        whereArgs: [studentId, month]);
+    return revived > 0;
   }
 
   Future<FeeListResponse> getFees({
@@ -115,7 +156,7 @@ class FeeRepository {
     final args = <Object?>[];
     if (month != null) {
       where.add('f.month = ?');
-      args.add(_monthIso(month));
+      args.add(DbFmt.monthStart(month));
     }
     if (studentId != null) {
       where.add('f.student_id = ?');
@@ -152,14 +193,20 @@ class FeeRepository {
     await ensureMonthWithFees(month);
     final d = await _d;
     final args = <Object?>[];
-    var join = '';
+    // Always joined, so the totals cover exactly the students the register
+    // lists: a deleted student's leftover fee row must not inflate the month.
+    var batchFilter = '';
     if (batchId != null) {
-      join = 'JOIN students s ON s.id = f.student_id AND s.batch_id = ?';
+      batchFilter = 'AND s.batch_id = ?';
       args.add(batchId);
     }
-    args.add(_monthIso(month));
+    final monthIso = DbFmt.monthStart(month);
+    args.add(monthIso);
     final rows = await d.rawQuery('''
-      SELECT f.* FROM fees f $join WHERE f.month = ? AND f.deleted_at IS NULL
+      SELECT f.* FROM fees f
+      JOIN students s ON s.id = f.student_id
+      WHERE s.deleted_at IS NULL $batchFilter
+        AND f.month = ? AND f.deleted_at IS NULL
     ''', args);
     var totalDue = 0.0, totalPaid = 0.0;
     var paid = 0, partial = 0, due = 0;
@@ -174,7 +221,7 @@ class FeeRepository {
       if (st == 'due') due++;
     }
     return FeeSummary(
-      month: _monthIso(month),
+      month: monthIso,
       totalDue: totalDue.toStringAsFixed(2),
       totalPaid: totalPaid.toStringAsFixed(2),
       outstanding: (totalDue - totalPaid).toStringAsFixed(2),
@@ -193,23 +240,20 @@ class FeeRepository {
     final target = DbFmt.month(month);
     final d = await _d;
     var rows = await d.query('fees',
-        where: 'student_id = ? AND month = ?',
+        where: 'student_id = ? AND month = ? AND deleted_at IS NULL',
         whereArgs: [studentId, target]);
     if (rows.isEmpty) {
       final students = await d.query('students',
-          where: 'id = ? AND is_active = 1 AND monthly_fee > 0',
+          where: 'id = ? AND is_active = 1 AND monthly_fee > 0 '
+              'AND deleted_at IS NULL',
           whereArgs: [studentId]);
       if (students.isNotEmpty) {
-        await d.insert('fees', {
-          'student_id': studentId,
-          'month': target,
-          'amount_due': _fee(students.first['monthly_fee']),
-          'amount_paid': 0,
-          'status': 'due',
-          ...SyncStamp.now(db).columns(),
-        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+        await _ensureFeeRow(d,
+            studentId: studentId,
+            month: target,
+            amountDue: _fee(students.first['monthly_fee']));
         rows = await d.query('fees',
-            where: 'student_id = ? AND month = ?',
+            where: 'student_id = ? AND month = ? AND deleted_at IS NULL',
             whereArgs: [studentId, target]);
       }
     }
@@ -224,28 +268,49 @@ class FeeRepository {
   }
 
   Future<Fee> createFee(int studentId, String month, String amountDue) async {
-    final monthIso = _monthIso(month);
+    final monthIso = DbFmt.monthStart(month);
     final d = await _d;
     final existing = await d.query('fees',
         where: 'student_id = ? AND month = ?',
-        whereArgs: [studentId, monthIso]);
-    if (existing.isNotEmpty) {
+        whereArgs: [studentId, monthIso],
+        limit: 1);
+    if (existing.isNotEmpty && existing.first['deleted_at'] == null) {
       throw RepoException(
           'A fee record already exists for this student and month');
     }
     final students = await d.query('students',
-        where: 'id = ?', whereArgs: [studentId], limit: 1);
+        where: 'id = ? AND deleted_at IS NULL',
+        whereArgs: [studentId],
+        limit: 1);
     if (students.isEmpty) throw RepoException('Student not found');
     final due = double.tryParse(amountDue) ?? 0;
     if (due <= 0) throw RepoException('Amount due must be greater than zero');
-    final id = await d.insert('fees', {
-      'student_id': studentId,
-      'month': monthIso,
-      'amount_due': DbFmt.round2(due),
-      'amount_paid': 0,
-      'status': 'due',
-      ...SyncStamp.now(db).columns(),
-    });
+
+    // A deleted record for the same student and month is revived rather than
+    // inserted: `fees` is UNIQUE (student_id, month), so inserting a second one
+    // would fail and leave the student with no record for that month.
+    final int id;
+    if (existing.isEmpty) {
+      id = await d.insert('fees', {
+        'student_id': studentId,
+        'month': monthIso,
+        'amount_due': DbFmt.round2(due),
+        'amount_paid': 0,
+        'status': 'due',
+        ...SyncStamp.now(db).columns(),
+      });
+    } else {
+      id = existing.first['id'] as int;
+      await d.update('fees', {
+        'amount_due': DbFmt.round2(due),
+        'amount_paid': 0,
+        'status': 'due',
+        'payment_date': null,
+        'payment_method': null,
+        'deleted_at': null,
+        ...SyncStamp.now(db).touchColumns(),
+      }, where: 'id = ?', whereArgs: [id]);
+    }
     final rows = await d.query('fees', where: 'id = ?', whereArgs: [id]);
     final row = rows.first;
     final s = await d.query('students',
@@ -259,7 +324,8 @@ class FeeRepository {
   Future<Fee> markFeePaid(int feeId) async {
     final d = await _d;
     return d.transaction((txn) async {
-      final rows = await txn.query('fees', where: 'id = ?', whereArgs: [feeId]);
+      final rows = await txn.query('fees',
+          where: 'id = ? AND deleted_at IS NULL', whereArgs: [feeId]);
       if (rows.isEmpty) throw RepoException('Fee record not found');
       final row = rows.first;
       final studentId = row['student_id'] as int;
@@ -307,7 +373,8 @@ class FeeRepository {
   Future<Fee> markFeeDue(int feeId) async {
     final d = await _d;
     return d.transaction((txn) async {
-      final rows = await txn.query('fees', where: 'id = ?', whereArgs: [feeId]);
+      final rows = await txn.query('fees',
+          where: 'id = ? AND deleted_at IS NULL', whereArgs: [feeId]);
       if (rows.isEmpty) throw RepoException('Fee record not found');
       final row = rows.first;
       final studentId = row['student_id'] as int;
@@ -341,7 +408,8 @@ class FeeRepository {
   ) async {
     final d = await _d;
     return d.transaction((txn) async {
-      final rows = await txn.query('fees', where: 'id = ?', whereArgs: [feeId]);
+      final rows = await txn.query('fees',
+          where: 'id = ? AND deleted_at IS NULL', whereArgs: [feeId]);
       if (rows.isEmpty) throw RepoException('Fee record not found');
       final row = rows.first;
       final studentId = row['student_id'] as int;
@@ -404,7 +472,8 @@ class FeeRepository {
 
   Future<Fee> updateFee(int feeId, {String? amountDue}) async {
     final d = await _d;
-    final rows = await d.query('fees', where: 'id = ?', whereArgs: [feeId]);
+    final rows = await d.query('fees',
+        where: 'id = ? AND deleted_at IS NULL', whereArgs: [feeId]);
     if (rows.isEmpty) throw RepoException('Fee record not found');
     final row = rows.first;
     final due = amountDue != null ? (double.tryParse(amountDue) ?? 0) : _fee(row['amount_due']);
@@ -425,17 +494,30 @@ class FeeRepository {
     final rows = await d.rawQuery('''
       SELECT f.*, s.first_name, s.last_name FROM fees f
       JOIN students s ON s.id = f.student_id
-      WHERE f.id = ?
+      WHERE f.id = ? AND f.deleted_at IS NULL
     ''', [feeId]);
     if (rows.isEmpty) throw RepoException('Fee record not found');
     return _feeFromRow(rows.first, s: _names(rows.first));
   }
 
+  /// Soft-delete a fee record and its ledger entries together, so a deleted
+  /// month never leaves orphaned payments behind (locally or on the peer).
+  ///
+  /// The record can come back: the monthly generator revives a tombstone for an
+  /// eligible student rather than skipping them, because the register must list
+  /// every student (see [_ensureFeeRow]).
   Future<void> deleteFee(int feeId) async {
     final d = await _d;
-    final updated = await d.update('fees', {
-      ...SyncStamp.now(db).tombstoneColumns(),
-    }, where: 'id = ?', whereArgs: [feeId]);
+    final updated = await d.transaction((txn) async {
+      final stamp = SyncStamp.now(db);
+      final rows = await txn.update('fees', {...stamp.tombstoneColumns()},
+          where: 'id = ? AND deleted_at IS NULL', whereArgs: [feeId]);
+      if (rows != 0) {
+        await txn.update('fee_payments', {...stamp.tombstoneColumns()},
+            where: 'fee_id = ? AND deleted_at IS NULL', whereArgs: [feeId]);
+      }
+      return rows;
+    });
     if (updated == 0) throw RepoException('Fee record not found');
   }
 
@@ -443,7 +525,7 @@ class FeeRepository {
   /// the list shown in the Fee screen is always backed by records, so this is
   /// called before listing/aggregating a month. Idempotent.
   Future<void> ensureMonthWithFees(String month) async {
-    final requested = DateTime.tryParse(_monthIso(month));
+    final requested = DateTime.tryParse(DbFmt.monthStart(month));
     if (requested == null) return;
     await ensureMonthlyFees(DateTime.now(), anchor: requested);
     // Guarantee coverage for the requested month itself as well (students
@@ -453,9 +535,6 @@ class FeeRepository {
       await _insertMonthFees(txn, DbFmt.firstOfMonth(requested));
     });
   }
-
-  String _monthIso(String month) =>
-      month.replaceFirst(RegExp(r'-\d{2}$'), '-01');
 
   double _fee(Object? v) {
     final n = double.tryParse(v?.toString() ?? '');

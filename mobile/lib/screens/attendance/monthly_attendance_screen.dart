@@ -77,7 +77,7 @@ class _MonthlyAttendanceScreenState extends State<MonthlyAttendanceScreen> {
                     builder: (context, snapshot) {
                       final batches = snapshot.data ?? _batches;
                       return DropdownButtonFormField<int?>(
-                        value: _batchId,
+                        initialValue: _batchId,
                         isExpanded: true,
                         decoration: const InputDecoration(
                           labelText: 'Batch',
@@ -140,7 +140,7 @@ class _MonthlyAttendanceScreenState extends State<MonthlyAttendanceScreen> {
                 return ListView.separated(
                   padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
                   itemCount: rows.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 8),
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
                   itemBuilder: (ctx, i) => _row(rows[i]),
                 );
               },

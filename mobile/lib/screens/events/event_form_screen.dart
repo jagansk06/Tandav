@@ -145,7 +145,7 @@ class _EventFormScreenState extends State<EventFormScreen> {
               builder: (context, snapshot) {
                 final batches = snapshot.data ?? [];
                 return DropdownButtonFormField<int?>(
-                  value: _batchId,
+                  initialValue: _batchId,
                   isExpanded: true,
                   decoration: const InputDecoration(
                     labelText: 'Batch (linked)',

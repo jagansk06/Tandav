@@ -1,4 +1,6 @@
-import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
 
 import '../database/tandav_database.dart';
 import '../models/attendance.dart';
@@ -8,6 +10,7 @@ import '../models/event.dart';
 import '../models/fee.dart';
 import '../models/progress.dart';
 import '../models/student.dart';
+import '../platform/tandav_platform.dart';
 import '../repositories/attendance_repository.dart';
 import '../repositories/auth_repository.dart';
 import '../repositories/batch_repository.dart';
@@ -16,8 +19,8 @@ import '../repositories/event_repository.dart';
 import '../repositories/fee_repository.dart';
 import '../repositories/progress_repository.dart';
 import '../repositories/student_repository.dart';
+import '../sync/drive/drive_sync_manager.dart';
 import '../sync/sync_engine.dart';
-import '../sync/sync_manager.dart';
 import '../sync/sync_state.dart';
 
 /// Tandav local data service.
@@ -43,8 +46,37 @@ class TandavApi {
   // ---- Sync ----
   late final SyncState syncState = SyncState(db);
   late final SyncEngine syncEngine = SyncEngine(db, syncState);
-  late final SyncManager sync =
-      SyncManager(db: db, state: syncState, engine: syncEngine);
+
+  /// Google Drive synchronization. Works identically on Android and in the
+  /// browser; the platform-specific part is only how the Google access token is
+  /// obtained. Nothing here is required for normal use — Tandav is fully
+  /// functional offline and only touches the network when the user syncs.
+  late final DriveSyncManager sync = DriveSyncManager(
+    db: db,
+    state: syncState,
+    engine: syncEngine,
+  )..onDataChanged = bumpRevision;
+
+  /// Incremented whenever business data changes in a way that other screens
+  /// may already be displaying — a local create/update/delete, a Drive sync
+  /// that applied remote rows, or a database restore.
+  ///
+  /// Screens that cache query results (for example the Attendance batch
+  /// dropdown) listen to this and reload, so a batch created on the Batches
+  /// tab or arriving from the other device shows up without restarting the
+  /// app. Deliberately *not* bumped by high-frequency writes such as marking
+  /// attendance, which would fight with the screen doing the writing.
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
+
+  /// Announce that shared business data changed. Safe to call from anywhere.
+  void bumpRevision() => revision.value++;
+
+  /// Run a mutation, then announce the change once it has committed.
+  Future<T> _mutating<T>(Future<T> op) async {
+    final result = await op;
+    bumpRevision();
+    return result;
+  }
 
   /// Generate missing monthly fee records for the current month (and any
   /// months missed while the app was closed). Idempotent; call at startup
@@ -57,11 +89,13 @@ class TandavApi {
 
   Future<Batch> getBatch(int id) => batches.getBatch(id);
 
-  Future<Batch> createBatch(Map<String, dynamic> payload) => batches.createBatch(payload);
+  Future<Batch> createBatch(Map<String, dynamic> payload) =>
+      _mutating(batches.createBatch(payload));
 
-  Future<Batch> updateBatch(int id, Map<String, dynamic> payload) => batches.updateBatch(id, payload);
+  Future<Batch> updateBatch(int id, Map<String, dynamic> payload) =>
+      _mutating(batches.updateBatch(id, payload));
 
-  Future<void> deleteBatch(int id) => batches.deleteBatch(id);
+  Future<void> deleteBatch(int id) => _mutating(batches.deleteBatch(id));
 
   // ---- Students ----
   Future<StudentListResponse> getStudents({
@@ -81,16 +115,18 @@ class TandavApi {
     // and every month since (existing records are never duplicated).
     final join = DateTime.tryParse(payload['join_date'] ?? '');
     await fees.ensureMonthlyFees(DateTime.now(), anchor: join ?? DateTime.now());
+    bumpRevision();
     return s;
   }
 
-  Future<Student> updateStudent(int id, Map<String, dynamic> payload) => students.updateStudent(id, payload);
+  Future<Student> updateStudent(int id, Map<String, dynamic> payload) =>
+      _mutating(students.updateStudent(id, payload));
 
-  Future<void> deleteStudent(int id) => students.deleteStudent(id);
+  Future<void> deleteStudent(int id) => _mutating(students.deleteStudent(id));
 
-  /// Save a picked photo into app documents and return its local path.
-  Future<String> uploadPhoto(int studentId, File file, String filename) =>
-      students.savePhoto(studentId, file, filename);
+  /// Store a picked photo for a student and return its local handle.
+  Future<String> uploadPhoto(int studentId, Uint8List bytes, String filename) =>
+      students.savePhoto(studentId, bytes, filename);
 
   // ---- Attendance ----
   Future<AttendanceDay> getAttendanceDay(String date, {int? batchId}) =>
@@ -202,9 +238,15 @@ class TandavApi {
       dashboard.getMonthlyReport(month);
 
   // ---- Backup / restore ----
-  Future<File> createBackup() => db.createBackup();
 
-  Future<List<File>> listBackups() => db.listBackups();
+  /// False in the browser, where there is no database file to copy — the
+  /// Backup and Restore actions are hidden there instead of failing.
+  bool get supportsLocalBackup => db.supportsLocalBackup;
 
-  Future<bool> restoreFromBackup(File backup) => db.restoreFromBackup(backup);
+  Future<BackupRef> createBackup() => db.createBackup();
+
+  Future<List<BackupRef>> listBackups() => db.listBackups();
+
+  Future<bool> restoreFromBackup(BackupRef backup) =>
+      _mutating(db.restoreFromBackup(backup));
 }

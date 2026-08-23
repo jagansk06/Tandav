@@ -211,7 +211,7 @@ class _StudentsScreenState extends State<StudentsScreen> {
                   physics: const AlwaysScrollableScrollPhysics(),
                   padding: const EdgeInsets.fromLTRB(16, 10, 16, 24),
                   itemCount: list.items.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 8),
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
                   itemBuilder: (ctx, i) => _studentCard(list.items[i]),
                 ),
               );

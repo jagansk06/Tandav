@@ -25,7 +25,7 @@ class _CostumePaymentSheetState extends State<CostumePaymentSheet> {
 
   static const _methods = ['cash', 'upi', 'card', 'bank_transfer', 'other'];
   String _method = 'cash';
-  DateTime _date = DateTime.now();
+  final DateTime _date = DateTime.now();
 
   @override
   void initState() {

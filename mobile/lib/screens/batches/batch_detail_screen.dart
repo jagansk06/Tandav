@@ -60,6 +60,7 @@ class _BatchDetailScreenState extends State<BatchDetailScreen> {
       ),
     );
     if (confirmed != true) return;
+    if (!mounted) return;
     try {
       final api = context.read<TandavApi>();
       await api.deleteBatch(widget.batchId);

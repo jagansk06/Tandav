@@ -46,7 +46,15 @@ class AuthRepository {
         current, row['password_hash'] as String)) {
       throw const RepoException('Current password is incorrect');
     }
-    if (next.isEmpty) throw const RepoException('Password cannot be empty');
+    // Checked here rather than in the form so the rule holds for every caller.
+    // Only new passwords are affected; existing accounts keep working whatever
+    // their password is.
+    if (next.trim().length < 4) {
+      throw const RepoException('Password must be at least 4 characters');
+    }
+    if (next == current) {
+      throw const RepoException('New password must be different');
+    }
     await d.update('users', {
       'password_hash': TandavDatabase.hashPassword(next),
       'updated_at': DateTime.now().toIso8601String(),

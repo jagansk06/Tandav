@@ -86,7 +86,27 @@ class AuthState extends ChangeNotifier {
   }
 
   /// Called after a backup restore so the UI rebuilds from scratch.
-  void notifyDatabaseRestored() {
+  ///
+  /// The restore replaced the whole database, including the `users` table, so
+  /// the remembered session is re-checked against it. Without this the admin
+  /// would stay signed in as an account the restored data may not contain —
+  /// and every screen that looks the account up (changing the password, for
+  /// one) would fail with "User not found" until the app was reinstalled.
+  Future<void> notifyDatabaseRestored() async {
+    final username = _user?.username;
+    if (username != null) {
+      try {
+        final fresh = await api.auth.findUser(username);
+        if (fresh == null || !fresh.isActive) {
+          await logout();
+          return;
+        }
+        _user = fresh;
+      } catch (_) {
+        await logout();
+        return;
+      }
+    }
     _reloadToken++;
     notifyListeners();
   }

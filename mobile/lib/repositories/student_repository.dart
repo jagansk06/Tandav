@@ -1,11 +1,11 @@
-import 'dart:io';
+import 'dart:typed_data';
 
-import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
 import '../database/db_helpers.dart';
 import '../database/tandav_database.dart';
 import '../models/student.dart';
+import '../platform/tandav_platform.dart';
 import '../sync/sync_meta.dart';
 
 class StudentRepository {
@@ -44,7 +44,7 @@ class StudentRepository {
     final rows = await d.rawQuery('''
       SELECT s.*, b.name AS batch_name
       FROM students s
-      LEFT JOIN batches b ON b.id = s.batch_id
+      LEFT JOIN batches b ON b.id = s.batch_id AND b.deleted_at IS NULL
       WHERE s.deleted_at IS NULL
       ${where.isEmpty ? '' : 'AND ${where.join(' AND ')}'}
       ORDER BY s.first_name COLLATE NOCASE
@@ -60,78 +60,168 @@ class StudentRepository {
     final rows = await d.rawQuery('''
       SELECT s.*, b.name AS batch_name
       FROM students s
-      LEFT JOIN batches b ON b.id = s.batch_id
+      LEFT JOIN batches b ON b.id = s.batch_id AND b.deleted_at IS NULL
       WHERE s.id = ? AND s.deleted_at IS NULL
     ''', [id]);
-    if (rows.isEmpty) throw RepoException('Student not found');
+    if (rows.isEmpty) throw const RepoException('Student not found');
     return _studentFromRow(rows.first);
   }
 
   Future<Student> createStudent(Map<String, dynamic> payload) async {
     final d = await _d;
+    final row = _payloadToRow(payload);
+    await _assertBatchExists(d, row['batch_id']);
     final id = await d.insert('students', {
-      ..._payloadToRow(payload),
+      ...row,
       ...SyncStamp.now(db).columns(),
     });
     return getStudent(id);
   }
 
+  /// Apply an edit. Only the fields present in [payload] are written, so a
+  /// screen that does not carry a column (the form has no photo field, for
+  /// instance) cannot blank it out.
   Future<Student> updateStudent(int id, Map<String, dynamic> payload) async {
     final d = await _d;
     final row = {
-      ..._payloadToRow(payload),
+      ..._payloadToRow(payload, partial: true),
       ...SyncStamp.now(db).touchColumns(),
     };
+    if (payload.containsKey('batch_id')) {
+      await _assertBatchExists(d, row['batch_id']);
+    }
     final updated = await d.update('students', row,
-        where: 'id = ?', whereArgs: [id]);
-    if (updated == 0) throw RepoException('Student not found');
+        where: 'id = ? AND deleted_at IS NULL', whereArgs: [id]);
+    if (updated == 0) throw const RepoException('Student not found');
     return getStudent(id);
+  }
+
+  /// A batch that was deleted (possibly on the other device, arriving in a sync
+  /// while the form was open) would otherwise fail as a foreign-key error or
+  /// leave the student pointing at a tombstone.
+  Future<void> _assertBatchExists(Database d, Object? batchId) async {
+    if (batchId == null) return;
+    final rows = await d.query('batches',
+        columns: ['id'],
+        where: 'id = ? AND deleted_at IS NULL',
+        whereArgs: [batchId],
+        limit: 1);
+    if (rows.isEmpty) {
+      throw const RepoException(
+          'That batch no longer exists. Pick another batch.');
+    }
   }
 
   /// Soft delete: the row becomes a tombstone so the deletion can reach the
   /// other Tandav device during sync instead of vanishing permanently.
+  ///
+  /// The student's own records are tombstoned in the same transaction. The
+  /// schema cascades on a real DELETE, but a soft delete triggers nothing — so
+  /// without this the attendance marks, fees and payments of a deleted student
+  /// would stay live, ship to the other device and keep turning up in totals
+  /// there as rows whose student no longer exists.
   Future<void> deleteStudent(int id) async {
     final d = await _d;
-    final stamp = SyncStamp.now(db);
-    final updated = await d.update('students', {
-      'is_active': 0,
-      ...stamp.tombstoneColumns(),
-    }, where: 'id = ?', whereArgs: [id]);
-    if (updated == 0) throw RepoException('Student not found');
+    final updated = await d.transaction((txn) async {
+      final stamp = SyncStamp.now(db);
+      final rows = await txn.update('students', {
+        'is_active': 0,
+        ...stamp.tombstoneColumns(),
+      }, where: 'id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      if (rows == 0) return 0;
+      for (final table in const [
+        'attendance',
+        'monthly_attendance',
+        'fees',
+        'fee_payments',
+        'event_participations',
+        'monthly_progress',
+      ]) {
+        await txn.update(table, stamp.tombstoneColumns(),
+            where: 'student_id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      }
+      return rows;
+    });
+    if (updated == 0) throw const RepoException('Student not found');
   }
 
-  /// Copy a picked image into app documents and store the local path.
-  Future<String> savePhoto(int studentId, File source, String filename) async {
+  /// Store a picked image for this student and remember where it went.
+  ///
+  /// The returned handle is a file path in the Android app and inline image
+  /// bytes in the browser — the platform decides. It stays on this device:
+  /// `photo_url` is never uploaded to Drive, because the other device cannot
+  /// use it and photos are not part of the studio data being synchronized.
+  Future<String> savePhoto(
+    int studentId,
+    Uint8List bytes,
+    String filename,
+  ) async {
     final d = await _d;
-    final dir = await db.photosDir;
-    final ext = p.extension(filename).isEmpty ? '.jpg' : p.extension(filename);
-    final dest = p.join(dir.path, 'student_${studentId}_${DateTime.now().millisecondsSinceEpoch}$ext');
-    await source.copy(dest);
-    await d.update('students', {
-      'photo_url': dest,
-      ...SyncStamp.now(db).touchColumns(),
-    },
-        where: 'id = ?', whereArgs: [studentId]);
-    return dest;
+    final handle = await tandavPlatform.storePhoto(
+      studentId: studentId,
+      bytes: bytes,
+      filename: filename,
+    );
+    await d.update(
+      'students',
+      {
+        'photo_url': handle,
+        ...SyncStamp.now(db).touchColumns(),
+      },
+      where: 'id = ? AND deleted_at IS NULL',
+      whereArgs: [studentId],
+    );
+    return handle;
   }
 
-  Map<String, Object?> _payloadToRow(Map<String, dynamic> payload) => {
-        'first_name': (payload['first_name'] as String).trim(),
-        'last_name': (payload['last_name'] as String?) ?? '',
-        'gender': (payload['gender'] as String?) ?? '',
-        'dob': payload['dob'],
-        'phone': (payload['phone'] as String?) ?? '',
-        'email': payload['email'],
-        'address': payload['address'],
-        'emergency_contact_name': payload['emergency_contact_name'],
-        'emergency_contact_phone': payload['emergency_contact_phone'],
-        'batch_id': payload['batch_id'],
-        'monthly_fee': _fee(payload['monthly_fee']),
-        'join_date': (payload['join_date'] as String?) ?? DbFmt.date(DateTime.now()),
-        'is_active': payload['is_active'] == false ? 0 : 1,
-        'photo_url': payload['photo_url'],
-        'notes': payload['notes'],
-      };
+  /// Map an API payload onto student columns.
+  ///
+  /// With [partial] set, only the keys the caller actually sent are written —
+  /// what an edit needs. Writing the whole row on an update would blank every
+  /// column the caller omitted; `photo_url` is the one that hurts, since the
+  /// student form has no photo field and would therefore erase the photo on
+  /// every save.
+  Map<String, Object?> _payloadToRow(
+    Map<String, dynamic> payload, {
+    bool partial = false,
+  }) {
+    final row = <String, Object?>{};
+    bool has(String key) => !partial || payload.containsKey(key);
+
+    if (has('first_name')) {
+      final first = (payload['first_name'] as String?)?.trim() ?? '';
+      if (first.isEmpty) throw const RepoException('First name is required');
+      row['first_name'] = first;
+    }
+    if (has('last_name')) {
+      row['last_name'] = (payload['last_name'] as String?)?.trim() ?? '';
+    }
+    if (has('gender')) row['gender'] = (payload['gender'] as String?) ?? '';
+    if (has('dob')) row['dob'] = payload['dob'];
+    if (has('phone')) {
+      row['phone'] = (payload['phone'] as String?)?.trim() ?? '';
+    }
+    if (has('email')) row['email'] = payload['email'];
+    if (has('address')) row['address'] = payload['address'];
+    if (has('emergency_contact_name')) {
+      row['emergency_contact_name'] = payload['emergency_contact_name'];
+    }
+    if (has('emergency_contact_phone')) {
+      row['emergency_contact_phone'] = payload['emergency_contact_phone'];
+    }
+    if (has('batch_id')) row['batch_id'] = payload['batch_id'];
+    if (has('monthly_fee')) row['monthly_fee'] = _fee(payload['monthly_fee']);
+    if (has('join_date')) {
+      row['join_date'] =
+          (payload['join_date'] as String?) ?? DbFmt.date(DateTime.now());
+    }
+    if (has('is_active')) {
+      row['is_active'] = payload['is_active'] == false ? 0 : 1;
+    }
+    if (has('photo_url')) row['photo_url'] = payload['photo_url'];
+    if (has('notes')) row['notes'] = payload['notes'];
+    return row;
+  }
 
   double _fee(Object? v) {
     final n = double.tryParse(v?.toString() ?? '');

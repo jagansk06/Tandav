@@ -1,12 +1,12 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
+
+import '../platform/tandav_platform.dart';
 
 /// Single source of truth for the local Tandav SQLite database.
 ///
@@ -15,6 +15,10 @@ import 'package:uuid/uuid.dart';
 /// - Seeds the default admin account on first creation.
 /// - Injectable [factory]/[overridePath] so tests can use an in-memory or
 ///   temp-file database via sqflite_common_ffi.
+///
+/// The same schema, migrations and queries run on Android and in the browser:
+/// only *where* the database lives differs, and that is decided by
+/// [tandavPlatform] (a file on Android, IndexedDB on the web).
 class TandavDatabase {
   TandavDatabase._();
 
@@ -23,8 +27,9 @@ class TandavDatabase {
   static const dbName = 'tandav.db';
   static const dbVersion = 2;
 
-  /// Business tables that participate in two-device synchronization.
-  /// `users`, `app_settings` and `sync_state` are deliberately excluded.
+  /// Business tables that participate in synchronization.
+  /// `users`, `app_settings` and `sync_state` are deliberately excluded — the
+  /// users table holds password hashes and must never leave the device.
   static const syncTables = [
     'batches',
     'students',
@@ -63,33 +68,18 @@ class TandavDatabase {
   void configureForTest({DatabaseFactory? factory, String? overridePath}) {
     _factory = factory;
     _overridePath = overridePath;
+    // Keep photos and backups next to the test database instead of in the real
+    // app documents directory (path_provider has no test implementation).
+    if (overridePath != null) {
+      tandavPlatform.documentsRootOverride = p.dirname(overridePath);
+    }
   }
 
-  DatabaseFactory get _databaseFactory => _factory ?? databaseFactory;
+  DatabaseFactory get _databaseFactory =>
+      _factory ?? tandavPlatform.databaseFactory;
 
-  Future<String> _resolvePath() async {
-    if (_overridePath != null) return _overridePath!;
-    final dir = await getDatabasesPath();
-    return p.join(dir, dbName);
-  }
-
-  Future<Directory> get photosDir async {
-    final dir = Directory(p.join(await _docsRoot, 'photos'));
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir;
-  }
-
-  Future<Directory> get backupsDir async {
-    final dir = Directory(p.join(await _docsRoot, 'TandavBackups'));
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir;
-  }
-
-  /// App documents root; falls back to the test database directory when a
-  /// test override path is configured (path_provider is unavailable there).
-  Future<String> get _docsRoot async => _overridePath != null
-      ? p.dirname(_overridePath!)
-      : p.dirname((await getApplicationDocumentsDirectory()).path);
+  Future<String> _resolvePath() async =>
+      _overridePath ?? await tandavPlatform.databasePath(dbName);
 
   Future<Database> open() async {
     if (_db != null && _db!.isOpen) return _db!;
@@ -344,8 +334,9 @@ class TandavDatabase {
 
   /// Generate a persistent device id of the form `TANDAV-XXXX`. The suffix is
   /// four random characters drawn from an unambiguous uppercase alphabet (no
-  /// 0/O/1/I), giving ~1M combinations — plenty for a two-device pairing, and
-  /// never derived from a phone number.
+  /// 0/O/1/I). It labels which device last edited each record so conflicts
+  /// resolve identically on both, and is never derived from a phone number.
+  /// It grants no permission and restricts nothing.
   static String generateDeviceId() {
     const chars = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
     final rng = Random.secure();
@@ -375,8 +366,10 @@ class TandavDatabase {
         }
         if (_tablesMissingUpdatedAt.contains(table)) {
           await db.execute(
-              "UPDATE $table SET updated_at = datetime('now') WHERE updated_at = ''");
+              "UPDATE $table SET updated_at = ? WHERE updated_at = ''",
+              [DateTime.now().toUtc().toIso8601String()]);
         }
+        await _normalizeUpdatedAt(db, table);
       }
       await db.execute('''
         CREATE TABLE IF NOT EXISTS sync_state (
@@ -385,6 +378,27 @@ class TandavDatabase {
         )
       ''');
     }
+  }
+
+  /// Rewrite legacy `updated_at` values into the one format conflict
+  /// resolution compares.
+  ///
+  /// Rows written before sync existed carry SQLite's `datetime('now')` shape
+  /// (`2026-08-23 10:30:00`), while every new write uses UTC ISO-8601
+  /// (`2026-08-23T10:30:00.000Z`). Last-write-wins compares these as plain
+  /// strings, so mixing the two formats makes ordering depend on where a space
+  /// sorts against a `T` — a decision no one should have to reason about when
+  /// the answer decides whether a fee shows as paid or due. Values already
+  /// containing `T` are left alone, and `COALESCE` keeps anything unparseable
+  /// exactly as it was rather than risking a NOT NULL violation mid-migration.
+  static Future<void> _normalizeUpdatedAt(
+      DatabaseExecutor db, String table) async {
+    await db.execute('''
+      UPDATE $table
+      SET updated_at = COALESCE(
+            strftime('%Y-%m-%dT%H:%M:%S.000Z', updated_at), updated_at)
+      WHERE COALESCE(updated_at, '') <> '' AND instr(updated_at, 'T') = 0
+    ''');
   }
 
   bool get isAdminSeeded => _seeded;
@@ -423,10 +437,24 @@ class TandavDatabase {
       final parts = stored.split(':');
       if (parts.length != 2) return false;
       final salt = base64Url.decode(parts[0]);
-      return encodeHash(salt, password) == stored;
+      return _constantTimeEquals(encodeHash(salt, password), stored);
     } catch (_) {
       return false;
     }
+  }
+
+  /// Compare two hashes without returning early on the first differing byte.
+  ///
+  /// `==` on strings stops at the first mismatch, so how long a failed login
+  /// takes leaks how much of the hash was guessed correctly. The hashes are the
+  /// same fixed length here, so comparing every character costs nothing.
+  static bool _constantTimeEquals(String a, String b) {
+    var diff = a.length ^ b.length;
+    final len = a.length < b.length ? a.length : b.length;
+    for (var i = 0; i < len; i++) {
+      diff |= a.codeUnitAt(i) ^ b.codeUnitAt(i);
+    }
+    return diff == 0;
   }
 
   /// Close the current database handle (used before restore operations).
@@ -438,47 +466,29 @@ class TandavDatabase {
     _seeded = false;
   }
 
-  /// Copy the live database file as a backup inside app documents.
-  Future<File> createBackup() async {
+  /// Whether this build can keep backup copies on the device itself. False in
+  /// the browser, where Google Drive sync is the off-device copy instead.
+  bool get supportsLocalBackup => tandavPlatform.supportsLocalBackup;
+
+  /// Copy the live database as a backup stored on the device.
+  Future<BackupRef> createBackup() async {
     final db = await open();
-    final path = db.path;
-    final stamp = DateTime.now()
-        .toIso8601String()
-        .replaceAll(':', '-')
-        .split('.')
-        .first;
-    final dir = await backupsDir;
-    final dest = File(p.join(dir.path, 'tandav-backup-$stamp.db'));
-    await File(path).copy(dest.path);
-    return dest;
+    return tandavPlatform.createBackup(livePath: db.path);
   }
 
   /// List locally stored backups (newest first).
-  Future<List<File>> listBackups() async {
-    final dir = await backupsDir;
-    final files = dir
-        .listSync()
-        .whereType<File>()
-        .where((f) => p.extension(f.path) == '.db')
-        .toList()
-      ..sort((a, b) => b.path.compareTo(a.path));
-    return files;
-  }
+  Future<List<BackupRef>> listBackups() => tandavPlatform.listBackups();
 
-  /// Replace the live database with a backup file. Returns true on success.
-  Future<bool> restoreFromBackup(File backup) async {
+  /// Replace the live database with a backup. Returns true on success.
+  Future<bool> restoreFromBackup(BackupRef backup) async {
     final db = await open();
     final livePath = db.path;
-    final backupPath = await backup.absolute.path;
-    if (backupPath == livePath) return false;
-
-    // Copy backup to a staging path first so a failed copy never truncates
-    // the live database.
-    final staging = '$livePath.restore.tmp';
-    await File(backupPath).copy(staging);
-
-    await close();
-    await File(staging).rename(livePath);
+    if (backup.id == livePath) return false;
+    await tandavPlatform.restoreBackup(
+      backup: backup,
+      livePath: livePath,
+      closeDatabase: close,
+    );
     await open();
     return true;
   }

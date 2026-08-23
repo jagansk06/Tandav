@@ -19,29 +19,48 @@ class ProgressRepository {
 
   Future<MonthlyProgress> createProgress(int studentId, Map<String, dynamic> payload) async {
     final d = await _d;
-    final month = _monthIso(payload['month'] as String? ?? DbFmt.month(DateTime.now()));
+    final month =
+        DbFmt.monthStart(payload['month'] as String? ?? DbFmt.month(DateTime.now()));
     final students = await d.query('students',
-        where: 'id = ?', whereArgs: [studentId], limit: 1);
-    if (students.isEmpty) throw RepoException('Student not found');
+        where: 'id = ? AND deleted_at IS NULL',
+        whereArgs: [studentId],
+        limit: 1);
+    if (students.isEmpty) throw const RepoException('Student not found');
+    // Not filtered on deleted_at: `monthly_progress` is UNIQUE
+    // (student_id, month), so a deleted record has to be found and revived —
+    // rejecting it as a duplicate would make that month unrecordable forever.
     final existing = await d.query('monthly_progress',
         where: 'student_id = ? AND month = ?',
         whereArgs: [studentId, month], limit: 1);
-    if (existing.isNotEmpty) {
-      throw RepoException('Progress already recorded for this month');
+    if (existing.isNotEmpty && existing.first['deleted_at'] == null) {
+      throw const RepoException('Progress already recorded for this month');
     }
     final skill = _rating(payload['skill_rating']);
     final perf = _rating(payload['performance_rating']);
     final disc = _rating(payload['discipline_rating']);
-    final id = await d.insert('monthly_progress', {
-      'student_id': studentId,
-      'month': month,
+    final values = {
       'skill_rating': skill,
       'performance_rating': perf,
       'discipline_rating': disc,
       'attendance_percentage': await _attendancePct(d, studentId, month),
       'remarks': payload['remarks'],
-      ...SyncStamp.now(db).columns(),
-    });
+    };
+    final int id;
+    if (existing.isEmpty) {
+      id = await d.insert('monthly_progress', {
+        'student_id': studentId,
+        'month': month,
+        ...values,
+        ...SyncStamp.now(db).columns(),
+      });
+    } else {
+      id = existing.first['id'] as int;
+      await d.update('monthly_progress', {
+        ...values,
+        'deleted_at': null,
+        ...SyncStamp.now(db).touchColumns(),
+      }, where: 'id = ?', whereArgs: [id]);
+    }
     final rows = await d.query('monthly_progress', where: 'id = ?', whereArgs: [id]);
     return _progressFromRow(rows.first);
   }
@@ -49,11 +68,11 @@ class ProgressRepository {
   Future<MonthlyProgress> updateProgress(
       int studentId, String month, Map<String, dynamic> payload) async {
     final d = await _d;
-    final monthIso = _monthIso(month);
+    final monthIso = DbFmt.monthStart(month);
     final existing = await d.query('monthly_progress',
-        where: 'student_id = ? AND month = ?',
+        where: 'student_id = ? AND month = ? AND deleted_at IS NULL',
         whereArgs: [studentId, monthIso], limit: 1);
-    if (existing.isEmpty) throw RepoException('Progress record not found');
+    if (existing.isEmpty) throw const RepoException('Progress record not found');
     final skill = _rating(payload['skill_rating'] ?? existing.first['skill_rating']);
     final perf = _rating(payload['performance_rating'] ?? existing.first['performance_rating']);
     final disc = _rating(payload['discipline_rating'] ?? existing.first['discipline_rating']);
@@ -79,7 +98,7 @@ class ProgressRepository {
     final args = <Object?>[];
     if (month != null) {
       conditions.add('mp.month = ?');
-      args.add(_monthIso(month));
+      args.add(DbFmt.monthStart(month));
     }
     if (studentId != null) {
       conditions.add('mp.student_id = ?');
@@ -107,14 +126,14 @@ class ProgressRepository {
     final d = await _d;
     await d.update('monthly_progress', {
       ...SyncStamp.now(db).tombstoneColumns(),
-    }, where: 'student_id = ? AND month = ?',
-        whereArgs: [studentId, _monthIso(month)]);
+    }, where: 'student_id = ? AND month = ? AND deleted_at IS NULL',
+        whereArgs: [studentId, DbFmt.monthStart(month)]);
   }
 
   Future<double?> _attendancePct(Database d, int studentId, String month) async {
     final rows = await d.query('monthly_attendance',
         where: 'student_id = ? AND month = ? AND deleted_at IS NULL',
-        whereArgs: [studentId, _monthIso(month)], limit: 1);
+        whereArgs: [studentId, DbFmt.monthStart(month)], limit: 1);
     return rows.isEmpty ? null : (rows.first['percentage'] as num?)?.toDouble();
   }
 
@@ -123,9 +142,6 @@ class ProgressRepository {
     if (n == null) return 0;
     return n.clamp(0, 100);
   }
-
-  String _monthIso(String month) =>
-      month.replaceFirst(RegExp(r'-\d{2}$'), '-01');
 
   MonthlyProgress _progressFromRow(Map<String, Object?> row) {
     final skill = (row['skill_rating'] as int?) ?? 0;

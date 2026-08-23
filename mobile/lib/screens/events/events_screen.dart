@@ -124,7 +124,7 @@ class _EventsScreenState extends State<EventsScreen> {
                   child: ListView.separated(
                     padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
                     itemCount: list.items.length,
-                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    separatorBuilder: (_, _) => const SizedBox(height: 8),
                     itemBuilder: (ctx, i) => _eventCard(list.items[i]),
                   ),
                 );

@@ -19,11 +19,23 @@ dependencies:
   path: ^1.9.0
   crypto: ^3.0.6
   url_launcher: ^6.3.0
-  flutter_blue_plus: ^2.3.12
-  ble_peripheral:
-    path: packages/ble_peripheral
-  permission_handler: ^11.3.1
   uuid: ^4.5.1
+
+  # --- Google Drive synchronization ---
+  # Drive v3 is called directly over REST; `googleapis` is deliberately not used
+  # (very large package for the five calls Tandav makes).
+  http: ^1.2.0
+  # Android sign-in only. The browser build uses Google Identity Services
+  # loaded from web/index.html, so no client secret exists on either platform.
+  google_sign_in: ^6.2.1
+
+  # --- Web (iOS Safari) local storage ---
+  # Runs the same SQLite engine as Android, compiled to WebAssembly and backed
+  # by IndexedDB, so every repository and query works unchanged in the browser.
+  # After `flutter pub get`, run once:
+  #   dart run sqflite_common_ffi_web:setup
+  # to copy sqlite3.wasm and sqflite_sw.js into web/.
+  sqflite_common_ffi_web: ^0.4.0
 
 dev_dependencies:
   flutter_test:

@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
@@ -11,6 +9,7 @@ import '../../models/attendance.dart';
 import '../../models/fee.dart';
 import '../../models/progress.dart';
 import '../../models/student.dart';
+import '../../platform/tandav_platform.dart';
 import '../../widgets/states.dart';
 import '../fees/fee_payment_sheet.dart';
 import '../progress/progress_screen.dart';
@@ -31,7 +30,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
   late Future<FeeListResponse> _feesFuture;
   late Future<List<Map<String, dynamic>>> _paymentsFuture;
 
-  String _month = '${DateTime.now().year.toString()}-${DateTime.now().month.toString().padLeft(2, '0')}-01';
+  final String _month = '${DateTime.now().year.toString()}-${DateTime.now().month.toString().padLeft(2, '0')}-01';
   int? _busyFeeId;
 
   @override
@@ -70,9 +69,12 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
     );
     if (image == null) return;
     try {
-      final file = File(image.path);
+      // Bytes rather than a file path: the same call works in the Android app
+      // and in the browser, where the picked image has no filesystem path.
+      final bytes = await image.readAsBytes();
+      if (!mounted) return;
       final api = context.read<TandavApi>();
-      await api.uploadPhoto(widget.studentId, file, 'photo.jpg');
+      await api.uploadPhoto(widget.studentId, bytes, image.name);
       if (!mounted) return;
       Alert.show(context, 'Photo updated');
       _reloadAll();
@@ -389,7 +391,9 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
   }
 
   Widget _header(Student student) {
-    final photoUrl = student.photoUrl;
+    // Resolved by the platform: a file on Android, inline bytes in the browser,
+    // and null when there is nothing to show (then the initial is used).
+    final photo = tandavPlatform.photoImage(student.photoUrl);
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -402,10 +406,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
                   CircleAvatar(
                     radius: 34,
                     backgroundColor: TandavColors.surfaceLight,
-                    foregroundImage: photoUrl != null &&
-                            File(photoUrl).existsSync()
-                        ? FileImage(File(photoUrl))
-                        : null,
+                    foregroundImage: photo,
                     child: Text(
                       student.firstName.isNotEmpty
                           ? student.firstName[0].toUpperCase()
@@ -654,7 +655,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
         leading: CircleAvatar(
           backgroundColor: color.withValues(alpha: 0.15),
           child: Text(
-            '${score.toStringAsFixed(0)}',
+            score.toStringAsFixed(0),
             style: TextStyle(
               color: color,
               fontWeight: FontWeight.w900,
@@ -688,6 +689,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
     try {
       await api.createFee(
           widget.studentId, result['month'] as String, result['amount'] as String);
+      if (!mounted) return;
       Alert.show(context, 'Fee record created');
       _reloadAll();
     } on Exception catch (e) {

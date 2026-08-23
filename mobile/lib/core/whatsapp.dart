@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -8,10 +9,9 @@ enum WhatsAppOpenResult { launched, notInstalled, invalidNumber }
 
 /// WhatsApp messaging helper for fee receipts and reminders.
 ///
-/// Uses the standard WhatsApp deep-link mechanism —
-/// `whatsapp://send?phone=<country_code_and_number>&text=<url_encoded_message>`
-/// (the same intent behind the canonical `https://wa.me/<number>?text=...`
-/// links) — so no WhatsApp Business API, Meta Cloud API or third-party
+/// Uses the standard WhatsApp deep-link mechanism — `whatsapp://send` in the
+/// Android app, the canonical `https://wa.me/<number>?text=...` link in the
+/// browser — so no WhatsApp Business API, Meta Cloud API or third-party
 /// provider is involved. The admin still presses Send inside WhatsApp; this
 /// feature never sends anything automatically.
 ///
@@ -87,15 +87,26 @@ class WhatsAppService {
     final normalized = normalizeIndianNumber(number);
     if (normalized == null) return WhatsAppOpenResult.invalidNumber;
 
-    // Standard WhatsApp deep link. `phone` is the international number without
-    // the leading '+', and `text` is URL-encoded for us by [Uri], so spaces,
-    // line breaks, ₹, emojis and any other special characters survive the
-    // query string intact.
-    final uri = Uri(
-      scheme: 'whatsapp',
-      host: 'send',
-      queryParameters: {'phone': normalized, 'text': message},
-    );
+    // Two spellings of the same WhatsApp deep link:
+    //
+    // * Android app -> `whatsapp://send?phone=...&text=...`, which opens the
+    //   installed app directly (unchanged behaviour).
+    // * Browser (iPhone Safari) -> `https://wa.me/<number>?text=...`. A custom
+    //   scheme cannot be opened from a web page, but wa.me is the canonical
+    //   link Apple/WhatsApp handle: Safari hands it to WhatsApp when installed
+    //   and falls back to WhatsApp Web otherwise.
+    //
+    // `text` is URL-encoded for us by [Uri], so spaces, line breaks, ₹, emojis
+    // and any other special characters survive the query string intact. Still
+    // no WhatsApp Business API, no Meta Cloud API, nothing paid, and the admin
+    // always presses Send inside WhatsApp themselves.
+    final uri = kIsWeb
+        ? Uri.https('wa.me', '/$normalized', {'text': message})
+        : Uri(
+            scheme: 'whatsapp',
+            host: 'send',
+            queryParameters: {'phone': normalized, 'text': message},
+          );
 
     // We deliberately do NOT gate the launch behind canLaunchUrl(): on some
     // devices (package-visibility / OEM restrictions, aggressive battery

@@ -130,7 +130,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 6),
           Text(
-            '${marked}/${s.activeStudents} active students marked (${pct.toStringAsFixed(0)}%)',
+            '$marked/${s.activeStudents} active students marked (${pct.toStringAsFixed(0)}%)',
             style: const TextStyle(
               fontSize: 12,
               fontWeight: FontWeight.w700,

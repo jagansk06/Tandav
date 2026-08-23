@@ -104,7 +104,7 @@ class _ProgressScreenState extends State<ProgressScreen> {
           return ListView.separated(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
             itemCount: items.length,
-            separatorBuilder: (_, __) => const SizedBox(height: 10),
+            separatorBuilder: (_, _) => const SizedBox(height: 10),
             itemBuilder: (ctx, i) => _card(items[i]),
           );
         },
@@ -152,7 +152,7 @@ class _ProgressScreenState extends State<ProgressScreen> {
                     child: Column(
                       children: [
                         Text(
-                          '${score.toStringAsFixed(0)}',
+                          score.toStringAsFixed(0),
                           style: TextStyle(
                             fontSize: 18,
                             fontWeight: FontWeight.w900,
@@ -244,7 +244,7 @@ class _ProgressScreenState extends State<ProgressScreen> {
           SizedBox(
             width: 40,
             child: Text(
-              isPercent ? '${value}%' : '$value',
+              isPercent ? '$value%' : '$value',
               textAlign: TextAlign.right,
               style: TextStyle(
                 fontSize: 12.5,

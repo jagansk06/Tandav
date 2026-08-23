@@ -1,126 +1,158 @@
 # Tandav — Dance Studio Management System
 
-Flutter mobile app + FastAPI backend + PostgreSQL. Dark black/gold "Tandav" theme.
-No external services (no WhatsApp, no payment gateway, no Firebase).
+One Flutter codebase, two ways to run it, and no server anywhere.
+
+- **Android** — a normal installable APK. Admin login, students, batches,
+  attendance, fees and monthly fee management, dashboard, events, WhatsApp
+  messages, local storage, settings. Works completely offline.
+- **iPhone / iPad** — the *same* app served as a responsive web app and opened in
+  Safari. No Swift, no SwiftUI, no Xcode, no Apple developer account, no Mac.
+- **Sync** — through a folder in the studio's own Google Drive. Internet is
+  needed only for that.
+
+Dark black-and-gold Tandav theme throughout. No Firebase, no Supabase, no
+PostgreSQL server, no AWS, no paid hosting, no payment gateway, no WhatsApp
+Business API, no Bluetooth.
 
 ## Folder structure
 
 ```
 Tandav/
-├── backend/                  # FastAPI application
-│   ├── app/
-│   │   ├── main.py           # FastAPI app, CORS, /uploads static, /health
-│   │   ├── core/             # config (env), security (JWT+bcrypt), formatting
-│   │   ├── db/               # session, Base
-│   │   ├── models/           # User, Batch, Student, Attendance, MonthlyAttendance,
-│   │   │                     # Fee, Event, EventParticipation, MonthlyProgress
-│   │   ├── schemas/          # auth, batch, student, attendance, fee, event, progress, dashboard
-│   │   ├── api/v1/           # auth, batches, students, attendance, fees, events, progress, dashboard, reports
-│   │   ├── api/deps.py       # JWT dependency, current user
-│   │   └── seed.py           # demo data (explicit: python -m app.seed)
-│   ├── alembic/              # migrations (initial_schema: 10 tables)
-│   ├── tests/                # conftest + test_api — 40 tests, all passing
-│   ├── requirements.txt
-│   └── .env.example          # documented env vars (no real secrets)
-├── mobile/                   # Flutter app (android + web)
+├── mobile/                     # the application (Android + web)
 │   ├── lib/
-│   │   ├── main.dart         # RootGate → Login / HomeShell (AuthState)
-│   │   ├── core/             # api_client (10.0.2.2 for emulator), auth_state,
-│   │   │                     # theme (TandavColors/TandavTheme), services (TandavApi), format (Fmt/Alert)
-│   │   ├── models/           # user, batch, student, attendance, fee, event, progress, dashboard
-│   │   ├── widgets/states.dart  # LoadingView, ErrorView, EmptyView, StatusBadge, GoldButton
-│   │   └── screens/          # login, home_shell (6 tabs + overflow), dashboard, students,
-│   │                         # batches, attendance (daily + monthly), fees, events,
-│   │                         # progress, reports
-│   └── test/widget_test.dart # 7 unit/widget tests, all passing
-└── scripts/e2e_smoke.py      # end-to-end API smoke test (login → CRUD → reports → cleanup)
+│   │   ├── main.dart           # opens the DB, then RootGate → Login / HomeShell
+│   │   ├── core/               # services (TandavApi facade), auth_state, theme,
+│   │   │                       # format (Fmt/Alert), whatsapp
+│   │   ├── database/           # tandav_database.dart — schema, migrations, backups
+│   │   ├── platform/           # the ONLY Android-vs-web difference (see SYNC.md)
+│   │   ├── models/             # user, batch, student, attendance, fee, event,
+│   │   │                       # progress, dashboard
+│   │   ├── repositories/       # all SQL: auth, batch, student, attendance, fee,
+│   │   │                       # event, progress, dashboard
+│   │   ├── sync/               # sync_engine, sync_codec, sync_meta, sync_state
+│   │   │   └── drive/          # Google Drive transport (auth, REST, payload, manager)
+│   │   ├── screens/            # login, home_shell (6 tabs + overflow), dashboard,
+│   │   │                       # students, batches, attendance, fees, events,
+│   │   │                       # progress, reports, settings/device_sync
+│   │   └── widgets/states.dart # LoadingView, ErrorView, EmptyView, StatusBadge, GoldButton
+│   ├── test/sync_engine_test.dart
+│   ├── web/                    # the iPhone build's shell: index.html, manifest, icons
+│   └── android/                # standard Flutter Android project
+├── SYNC.md                     # Google Drive sync + all setup/build instructions
+├── SUMMARY.md                  # this file
+├── backend/  database/  scripts/   # legacy FastAPI/PostgreSQL prototype — NOT used
+└── app-release.apk             # last built Android artifact
 ```
 
-APK artifact: `mobile/build/app/outputs/flutter-apk/app-debug.apk`
+`backend/`, `database/` and `scripts/` are left over from an earlier
+client-server prototype. Nothing in the app talks to them; the app is entirely
+local plus Drive.
 
-## Tech stack & dependencies
+## Tech stack
 
-| Layer      | Stack                                                            |
-|------------|------------------------------------------------------------------|
-| Backend    | Python 3.12, FastAPI, Uvicorn, SQLAlchemy 2, Alembic, psycopg2, PyJWT, bcrypt, pydantic-settings, pytest+httpx |
-| Mobile     | Flutter 3.44 / Dart 3.12; http, provider, shared_preferences, intl, image_picker, flutter_lints |
-| Database   | PostgreSQL (project-local cluster, port 5433, user `tandav`)     |
+| Layer | Stack |
+| --- | --- |
+| App | Flutter 3.44 / Dart 3.12, Material 3, `provider` |
+| Local storage (Android) | `sqflite` — a SQLite file in the app's data directory |
+| Local storage (web) | `sqflite_common_ffi_web` — the same SQLite engine as WebAssembly, persisted in IndexedDB |
+| Sync transport | Google Drive v3 REST over `package:http`; `google_sign_in` on Android, Google Identity Services in the browser |
+| Other packages | `intl`, `image_picker`, `url_launcher`, `path`, `path_provider`, `crypto`, `uuid`, `shared_preferences` |
 
-## Database schema (10 tables)
+`googleapis` is deliberately not used — a very large dependency for the five
+Drive calls Tandav makes.
 
-`users` · `batches` · `students` · `attendance` · `monthly_attendance` · `fees` ·
-`events` · `event_participations` · `monthly_progress`
+## Database (11 tables, schema version 2)
+
+Business data: `batches` · `students` · `attendance` · `monthly_attendance` ·
+`fees` · `fee_payments` · `events` · `event_participations` · `monthly_progress`
+
+Local-only: `users` (admin login) · `app_settings` · `sync_state`
 
 Key semantics:
-- `students.batch_id` → `batches.id` **SET NULL** (deleting a batch leaves students as "Unassigned" rather than losing them); all student children (attendance, monthly_attendance, fees, participations, progress) **CASCADE** on student delete.
-- `fees.amount_paid` is additive — each recorded payment increments it; `status` derived from due vs paid (due / partial / paid).
-- `event_participations.costume_fee_paid` additive; `costume_status` derived.
-- `MonthlyAttendance` aggregates recomputed after every daily attendance save.
-- `monthly_progress.attendance_percentage` auto-synced from the month's attendance.
 
-## API endpoints (all under `/api/v1`, JWT bearer)
+- `students.batch_id` → `batches.id` **SET NULL**: deleting a batch leaves its
+  students as "Unassigned" rather than losing them. A student's own children
+  (attendance, monthly attendance, fees, participations, progress) cascade.
+- `fees.amount_paid` is additive — each recorded payment increments it, and
+  `status` is derived (due / partial / paid). Marking a fee paid or due is a
+  single tap; there is no payment gateway.
+- Monthly fee records are generated for every student for the current month at
+  startup and on resume, idempotently, so a student added to a batch
+  automatically participates in that month's fee register.
+- `monthly_attendance` aggregates are recomputed after every daily save, and
+  `monthly_progress.attendance_percentage` follows the month's attendance.
+- Every business row also carries `sync_uuid`, `device_id`, `updated_at` and
+  `deleted_at`. Deletes are tombstones, which is what lets two devices converge
+  (see SYNC.md).
 
-| Group | Endpoints |
-|-------|-----------|
-| auth  | POST `/auth/login` · GET `/auth/me` · POST `/auth/change-password` |
-| batches | GET/POST `/batches` · GET/PUT/DELETE `/batches/{id}` |
-| students | GET/POST `/students` (search/filter) · GET/PUT/DELETE `/students/{id}` · POST `/students/{id}/photo` |
-| attendance | GET/PUT `/attendance/day` · POST `/attendance/day/{id}/status` · DELETE `/attendance/day/{id}` · GET `/attendance/monthly` · GET `/attendance/students/{id}/monthly` |
-| fees | GET `/fees` (filters/status) · GET `/fees/summary` · POST `/fees/students/{sid}/{month}` · GET/PUT/DELETE `/fees/{id}` · PUT `/fees/{id}/payment` |
-| events | GET/POST `/events` · GET/PUT/DELETE `/events/{id}` · GET/POST `/events/{id}/participants` · POST `/events/{id}/participants/batch/{bid}` · GET `/events/{id}/costume-summary` · PUT/DELETE `/events/participants/{pid}` · GET `/events/students/{sid}/history` |
-| progress | POST/GET `/progress/students/{sid}` · GET/PUT/DELETE `/progress/students/{sid}/{month}` · GET `/progress` |
-| dashboard | GET `/dashboard` (stats + fees + attendance trend + upcoming events + recent students) |
-| reports | GET `/reports/monthly` (per-batch attendance + fees, incl. Unassigned) |
+## Screens
 
-## Authentication flow
-- Login → JWT (access token) via bcrypt-verified credentials → token stored in `shared_preferences`; every API call sends `Authorization: Bearer <token>`; 401 anywhere → auto-logout to login screen.
-- Admin bootstrap only via seed: `admin` / `admin123` (change after first login).
-- All secrets (JWT key, DB URL, admin seed password) come from env vars documented in `backend/.env.example` — none hardcoded.
+Login · Dashboard (stats, monthly fee collection, attendance trend, upcoming
+events) · Students (search, filters, form, detail with photo, fees, progress,
+attendance) · Batches (list, form, detail with participants) · Attendance (pick
+batch → pick date → mark present/absent/late; monthly summary) · Fees (monthly
+register, payment sheet, WhatsApp receipt/reminder) · Events (participants and
+costume fees) · Progress (monthly ratings and remarks) · Reports (monthly,
+per batch) · Google Drive Sync.
 
-## Flutter screens
-Login · Dashboard (stats/fees/attendance trend/upcoming events) · Students (search, filters, list, form, detail with photo upload, fees, progress, attendance) · Batches (list/form/detail) · Attendance (daily batch editor with present/absent/late, monthly summary) · Fees (monthly list, record payment sheet, summary) · Events (list/form/detail with participant management + costume fee payments) · Progress (month ratings 0–100 + remarks) · Reports (monthly per-batch) · Home shell: 6 tabs + overflow menu (Reports, Sign out).
+Home shell: six tabs (Home, Students, Batches, Attendance, Fees, Events) plus an
+overflow menu with Monthly Reports, Backup, Restore, Google Drive Sync and Sign
+out. Backup and Restore are hidden in the browser, where there is no database
+file to copy — Drive is the off-device copy there.
 
-## Run instructions
+## Authentication
 
-Backend:
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-# PostgreSQL already running on port 5433 (cluster /home/jagan/tandav_pgdata, user tandav)
-alembic upgrade head            # migrate
-python -m app.seed              # demo data (optional; server never auto-seeds)
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+Local only. Credentials live in the `users` table of the on-device database and
+are verified against a SHA-256 hash; the session is remembered through
+`shared_preferences`. The seeded account is `admin` / `admin123` — change it
+after first login. No JWT, no server, and the `users` table is never
+synchronized, so no password material of any kind reaches Google Drive.
+
+## WhatsApp
+
+Unchanged behaviour, on both platforms: after marking a fee PAID or DUE, Tandav
+offers to send a receipt or a reminder. It opens WhatsApp with the message
+pre-filled (`whatsapp://send` in the Android app, the canonical
+`https://wa.me/…` link in the browser) and the admin presses Send. Nothing is
+ever sent automatically, and no WhatsApp Business or Meta Cloud API is involved.
+
+## Build and run
+
+Everything — including the one-time Google Cloud setup, the
+`--dart-define` client id, the `sqflite_common_ffi_web` setup step, hosting the
+web app for an iPhone, and troubleshooting — is in **[SYNC.md](SYNC.md)**.
+The short version, from `mobile/`:
+
+```
+flutter pub get
+
+# once, for the web build only — read SYNC.md, "Web SQLite binaries", first:
+# the two files must come from the same sqlite3 version or the web app cannot
+# open its database
+dart run sqflite_common_ffi_web:setup --no-sqlite3-wasm
+curl.exe -fL -o web/sqlite3.wasm https://github.com/simolus3/sqlite3.dart/releases/download/sqlite3-3.5.2/sqlite3.wasm
+dart run tool/check_web_binaries.dart
+
+flutter analyze
+flutter test
+
+flutter build apk --release                  # Android: build/app/outputs/flutter-apk/
+flutter build web --release --dart-define=TANDAV_GOOGLE_WEB_CLIENT_ID=xxxxx.apps.googleusercontent.com
 ```
 
-Mobile (Android):
-```bash
-cd mobile
-cmd.exe /c "C:\Users\jagan\develop\flutter\bin\flutter.bat run"  # emulator; base URL auto = 10.0.2.2:8000
-cmd.exe /c "C:\Users\jagan\develop\flutter\bin\flutter.bat build apk --debug"
-```
+## Known limitations
 
-Tests:
-```bash
-cd backend && .venv/bin/python -m pytest tests/     # 40 passed
-cd mobile  && cmd.exe /c "...\flutter.bat test"     # 7 passed
-cd ../.. && backend/.venv/bin/python scripts/e2e_smoke.py   # live E2E vs running API (requires server on :8000)
-```
-
-## Verification performed
-- Alembic migration applied; 10 tables created. Seed: 4 batches, 38 students, 3 events, admin user.
-- Backend unit/API suite: **40 passed** (auth, CRUD, photo upload, attendance math, fee payment + history, overpay rejection, events incl. batch/individual participation + costume, progress sync, dashboard, monthly reports, search/filters).
-- `flutter analyze` — 0 errors, 0 warnings (35 info-level lints).
-- `flutter test` — 7 passed.
-- `flutter build apk --debug` — built (Gradle 9.1.0 distribution had to be pulled via WSL and injected into the Windows Gradle cache; subsequent builds ~9s).
-- Live E2E smoke (scripts/e2e_smoke.py) — 14 steps all passed: login → dashboard → create batch/student → daily attendance (100%) → monthly summary → fee record + 2 payments (partial → paid) → event + participant + costume fee partial → progress record (overall = mean of ratings, attendance% synced) → related-data queries → monthly report → wrong-password rejected → cascade cleanup verified.
-  - The E2E caught and fixed a real app bug: `month` params (fees/dashboard/reports/progress) were sent as `YYYY-MM` while the API types them as full dates — now normalized to `YYYY-MM-01` in `services.dart` (`_monthIso`). Rebuilt APK after the fix.
-
-## Known limitations / notes
-- Batch deletion keeps students (FK SET NULL) — they become "Unassigned"; delete students individually to remove them. This is intentional and covered by the monthly report's Unassigned row.
-- Admin password `admin123` is seed-only; change it via the change-password endpoint (no dedicated UI).
-- Android emulator targets `10.0.2.2:8000`; a physical device needs the LAN IP (edit `api_client.dart`).
-- No photo size limits server-side beyond request limits; uploads stored under `UPLOAD_DIR` and served at `/uploads`.
-- Seed data is date-relative to the current month (July 2026 fees/attendance seeded; August intentionally empty so a fresh month starts clean).
-- `flutter analyze` info lints remain (deprecated `value:` on dropdowns kept intentionally for controlled behavior, null-aware suggestions, etc.).
-- E2E leftover data: deleting the smoke batch leaves orphaned "Smoke Student" records (SET NULL behavior); delete them via the students API if they appear.
+- Deleting a batch keeps its students as "Unassigned" (intentional, and shown as
+  its own row in the monthly report).
+- `admin` / `admin123` is a seed credential; there is no password-strength
+  policy yet.
+- The web app needs HTTPS (or `localhost`) to reach Google sign-in. Over a plain
+  LAN `http://` address it still runs, but cannot sync.
+- Safari can evict an ordinary website's storage after roughly a week of no use.
+  Add the web app to the Home Screen and sync regularly; Drive then holds the
+  studio's data.
+- Photos stay on the device that took them — they are deliberately excluded from
+  sync, so the other device shows the student's initial instead.
+- Release APKs are currently signed with the debug keystore
+  (`android/app/build.gradle.kts`), which is also the SHA-1 that must be
+  registered for Google sign-in.

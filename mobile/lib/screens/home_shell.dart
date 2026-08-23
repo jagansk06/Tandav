@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -7,6 +5,7 @@ import '../core/auth_state.dart';
 import '../core/format.dart';
 import '../core/services.dart';
 import '../core/theme.dart';
+import '../platform/tandav_platform.dart';
 import 'attendance/attendance_screen.dart';
 import 'batches/batches_screen.dart';
 import 'dashboard/dashboard_screen.dart';
@@ -26,6 +25,7 @@ class HomeShell extends StatefulWidget {
 class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _index = 0;
   int _dashboardKey = 0;
+  int _attendanceTick = 0;
 
   static const _titles = [
     'Dashboard',
@@ -61,9 +61,9 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     if (!mounted) return;
     final api = context.read<TandavApi>();
     try {
-      final file = await api.createBackup();
+      final backup = await api.createBackup();
       if (!mounted) return;
-      Alert.show(context, 'Backup saved: ${file.uri.pathSegments.last}');
+      Alert.show(context, 'Backup saved: ${backup.name}');
     } on Exception catch (e) {
       if (mounted) {
         Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
@@ -75,7 +75,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   Future<void> _restore() async {
     if (!mounted) return;
     final api = context.read<TandavApi>();
-    final List<File> backups;
+    final List<BackupRef> backups;
     try {
       backups = await api.listBackups();
     } on Exception {
@@ -87,7 +87,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       Alert.show(context, 'No backups found yet', isError: true);
       return;
     }
-    final selected = await showModalBottomSheet<File>(
+    final selected = await showModalBottomSheet<BackupRef>(
       context: context,
       backgroundColor: TandavColors.surface,
       builder: (ctx) => SafeArea(
@@ -105,18 +105,18 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                 ),
               ),
             ),
-            ...backups.map((f) => ListTile(
+            ...backups.map((b) => ListTile(
                   leading: const Icon(Icons.restore_rounded,
                       color: TandavColors.gold),
                   title: Text(
-                    f.uri.pathSegments.last,
+                    b.name,
                     style: const TextStyle(fontSize: 13),
                   ),
                   subtitle: Text(
-                    '${(f.lengthSync() / 1024).toStringAsFixed(1)} KB',
+                    b.sizeLabel,
                     style: const TextStyle(fontSize: 11.5),
                   ),
-                  onTap: () => Navigator.pop(ctx, f),
+                  onTap: () => Navigator.pop(ctx, b),
                 )),
           ],
         ),
@@ -128,9 +128,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       builder: (ctx) => AlertDialog(
         backgroundColor: TandavColors.surface,
         title: const Text('Restore data?'),
-        content: Text(
-            'This replaces all current data with the backup\n'
-            '${selected.uri.pathSegments.last}. This cannot be undone.'),
+        content: Text('This replaces all current data with the backup\n'
+            '${selected.name}. This cannot be undone.'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -149,7 +148,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       if (!ok) throw const FormatException('Restore failed');
       if (!mounted) return;
       Alert.show(context, 'Data restored');
-      context.read<AuthState>().notifyDatabaseRestored();
+      await context.read<AuthState>().notifyDatabaseRestored();
     } on Exception catch (e) {
       if (mounted) {
         Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
@@ -187,15 +186,16 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         ],
       ),
     );
-    if (confirmed == true) {
-      final auth = context.read<AuthState>();
-      await auth.logout();
-    }
+    if (confirmed != true) return;
+    if (!mounted) return;
+    final auth = context.read<AuthState>();
+    await auth.logout();
   }
 
   Future<void> _menu() async {
     if (!mounted) return;
     final auth = context.read<AuthState>();
+    final canBackup = context.read<TandavApi>().supportsLocalBackup;
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: TandavColors.surface,
@@ -251,28 +251,32 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                   );
                 },
               ),
+              // A web page has no database file to copy, so on iPhone/Safari
+              // Google Drive Sync is the off-device copy instead.
+              if (canBackup) ...[
+                ListTile(
+                  leading: const Icon(Icons.backup_outlined,
+                      color: TandavColors.gold),
+                  title: const Text('Backup data'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _backup();
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.restore_outlined,
+                      color: TandavColors.gold),
+                  title: const Text('Restore data'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _restore();
+                  },
+                ),
+              ],
               ListTile(
-                leading: const Icon(Icons.backup_outlined,
+                leading: const Icon(Icons.cloud_sync_outlined,
                     color: TandavColors.gold),
-                title: const Text('Backup data'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _backup();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.restore_outlined,
-                    color: TandavColors.gold),
-                title: const Text('Restore data'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _restore();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.devices_rounded,
-                    color: TandavColors.gold),
-                title: const Text('Device & Sync'),
+                title: const Text('Google Drive Sync'),
                 onTap: () {
                   Navigator.pop(ctx);
                   Navigator.push(
@@ -340,7 +344,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
           DashboardScreen(key: ValueKey('dash-$_dashboardKey')),
           const StudentsScreen(),
           const BatchesScreen(),
-          const AttendanceScreen(),
+          AttendanceScreen(refreshTick: _attendanceTick),
           const FeesScreen(),
           const EventsScreen(),
         ],
@@ -349,6 +353,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         currentIndex: _index,
         onTap: (i) => setState(() {
           if (i == 0 && i != _index) _dashboardKey++;
+          if (i == 3 && i != _index) _attendanceTick++;
           _index = i;
         }),
         selectedFontSize: _navLabelSize,

@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Local build configuration: the Google OAuth *web client id* for this
+# installation, read with --dart-define-from-file (see ../SYNC.md). The client id
+# is public by design, but it is per-installation rather than per-repository, so
+# it does not belong in version control. Copy tandav.env.json.example to start.
+/tandav.env.json

@@ -1,45 +1,186 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <!--
-    If you are serving your web app in a path other than the root, change the
-    href value below to reflect the base path you are serving from.
+    Tandav Studio — web build.
 
-    The path provided below has to start and end with a slash "/" in order for
-    it to work correctly.
+    This is the same Flutter application as the Android APK; only the shell
+    around it differs. It is what runs in Safari on an iPhone/iPad, where a
+    native app cannot be installed without a Mac and an Apple developer
+    account. Nothing here is iOS-only, so the page also works in Chrome,
+    Edge and Safari on a desktop.
 
-    For more details:
-    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
-
-    This is a placeholder for base href that will be replaced by the value of
-    the `--base-href` argument provided to `flutter build`.
+    If you serve the app from a sub-path (for example GitHub Pages at
+    /tandav/), pass it to the build instead of editing this line:
+        flutter build web --base-href /tandav/
   -->
   <base href="$FLUTTER_BASE_HREF">
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
 
-  <!-- iOS meta tags & icons -->
+  <!--
+    Mobile layout is the priority. `viewport-fit=cover` lets the black
+    background reach into the rounded corners / home-indicator area on modern
+    iPhones, and pinning the scale stops Safari from zooming the whole page in
+    when the admin taps a text field (which otherwise leaves the app scrolled
+    sideways after every entry).
+  -->
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="description"
+        content="Tandav Dance Studio — students, batches, attendance and fees.">
+  <meta name="theme-color" content="#0B0B0E">
+
+  <!-- Add to Home Screen: opens without Safari's chrome, like an installed app. -->
   <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <!--
+    `black` (not black-translucent): the iOS status bar stays opaque and the
+    app starts below it, so the TANDAV app bar is never hidden behind the
+    clock and battery.
+  -->
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="tandav_mobile">
-  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+  <meta name="apple-mobile-web-app-title" content="Tandav">
+  <link rel="apple-touch-icon" sizes="192x192" href="icons/Icon-192.png">
+  <link rel="apple-touch-icon" sizes="512x512" href="icons/Icon-512.png">
 
-  <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>tandav_mobile</title>
+  <title>Tandav Studio</title>
   <link rel="manifest" href="manifest.json">
+
+  <!--
+    Google Identity Services — used only to obtain a Google Drive access token
+    when the admin taps "Connect Google Drive" (see lib/sync/drive/).
+
+    Loaded `async defer` on purpose: Tandav is an offline-first app, so a slow,
+    unreachable or ad-blocked accounts.google.com must never delay or break
+    startup. Only the public OAuth client id is involved; there is no client
+    secret anywhere in this build.
+  -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+  <style>
+    :root { color-scheme: dark; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background-color: #0B0B0E;   /* TandavColors.background */
+      /* No rubber-band bounce, so the app feels less like a web page. */
+      overscroll-behavior: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    /*
+      Shown from the very first byte until Flutter paints its first frame.
+      Without it, Safari shows a blank white page for a second or two while
+      the engine and the SQLite worker load, which reads as a crash.
+    */
+    #tandav-splash {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 22px;
+      background-color: #0B0B0E;
+      transition: opacity 0.28s ease-out;
+    }
+
+    #tandav-splash.tandav-splash--gone {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    #tandav-splash img {
+      width: 148px;
+      height: 148px;
+      /* Decoding failure must not leave a broken-image icon on the splash. */
+      object-fit: contain;
+    }
+
+    /* Indeterminate gold sweep in the Tandav accent colour. */
+    #tandav-splash .bar {
+      position: relative;
+      width: 132px;
+      height: 3px;
+      border-radius: 3px;
+      overflow: hidden;
+      background-color: #1E1E26;   /* TandavColors.surfaceLight */
+    }
+
+    #tandav-splash .bar::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 44px;
+      border-radius: 3px;
+      background-image: linear-gradient(90deg, #F2D264, #B8860B);
+      animation: tandav-sweep 1.15s ease-in-out infinite;
+    }
+
+    @keyframes tandav-sweep {
+      0%   { left: -44px; }
+      100% { left: 132px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #tandav-splash .bar::after { animation: none; left: 0; width: 132px; }
+    }
+
+    #tandav-splash .hint {
+      max-width: 260px;
+      padding: 0 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 12.5px;
+      line-height: 1.5;
+      text-align: center;
+      color: #7C7769;              /* TandavColors.textMuted */
+      opacity: 0;
+      transition: opacity 0.4s ease-in;
+    }
+
+    #tandav-splash .hint.show { opacity: 1; }
+  </style>
 </head>
 <body>
-  <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
+  <div id="tandav-splash">
+    <img src="icons/Icon-512.png" alt="Tandav Dance Studio" width="148" height="148">
+    <div class="bar"></div>
+    <div class="hint" id="tandav-hint">
+      Loading Tandav. The first load fetches the app; after that it starts
+      from this device.
+    </div>
+  </div>
 
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
+  <script>
+    // The hint only appears if loading is actually slow, so a fast start stays
+    // clean.
+    setTimeout(function () {
+      var hint = document.getElementById('tandav-hint');
+      if (hint) hint.classList.add('show');
+    }, 2500);
+
+    // Flutter fires this on window as soon as it has painted, which is the
+    // only reliable moment to take the splash away.
+    window.addEventListener('flutter-first-frame', function () {
+      var splash = document.getElementById('tandav-splash');
+      if (!splash) return;
+      splash.classList.add('tandav-splash--gone');
+      setTimeout(function () {
+        if (splash.parentNode) splash.parentNode.removeChild(splash);
+      }, 320);
+    });
+  </script>
+
+  <!--
+    Flutter's own loader. Generated by `flutter build web`; do not rename.
   -->
   <script src="flutter_bootstrap.js" async></script>
 </body>

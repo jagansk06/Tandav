@@ -1,6 +1,4 @@
 import 'dart:io';
-import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -8,7 +6,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:tandav_mobile/database/tandav_database.dart';
-import 'package:tandav_mobile/sync/protocol.dart';
+import 'package:tandav_mobile/sync/drive/sync_payload.dart';
 import 'package:tandav_mobile/sync/sync_codec.dart';
 import 'package:tandav_mobile/sync/sync_engine.dart';
 import 'package:tandav_mobile/sync/sync_meta.dart';
@@ -57,6 +55,31 @@ void main() {
 
   Future<SyncDelta> outbound() =>
       open().then((d) => d.transaction((t) => currentEngine.computeOutbound(t)));
+
+  /// What Google Drive sync publishes: every row this device currently owns.
+  Future<SyncDelta> ownedSnapshot() => open().then((d) =>
+      d.transaction((t) => currentEngine.computeOutbound(t, ownedBy: me())));
+
+  /// Serialise an owned snapshot exactly as it would be written to
+  /// `Tandav/sync/devices/TANDAV-XXXX.json`.
+  String publish(SyncDelta delta, String deviceId) =>
+      SyncPayload.toJsonString(SyncPayload.encodeShard(
+        deviceId: deviceId,
+        delta: delta,
+        uploadedAt: DateTime.now().toUtc().toIso8601String(),
+      ));
+
+  /// Read shard files back and merge them, as [DriveSyncManager] does.
+  Future<SyncApplyResult> mergeShards(
+    List<String> shardJson,
+    String peerDeviceId,
+  ) async {
+    final combined =
+        SyncPayload.combine(shardJson.map(SyncPayload.decode).toList());
+    final d = await open();
+    return d.transaction((t) => currentEngine.applyIncoming(t, combined,
+        peerDeviceId: peerDeviceId));
+  }
 
   Future<SyncApplyResult> applyTo(SyncDelta delta, String peerDeviceId) =>
       open().then((d) => d.transaction((t) => currentEngine.applyIncoming(
@@ -293,37 +316,221 @@ void main() {
     expect(await countWhere('batches', 'deleted_at IS NULL'), 1);
   });
 
-  test('FrameCodec reassembles large payloads; protocol helpers behave',
-      () async {
-    final rng = Random(7);
-    final payload = List<int>.generate(5000, (_) => rng.nextInt(255) + 1);
-    final packets = FrameCodec.encode(payload);
+  // ---------------------------------------------------------------------
+  // Google Drive sync. These exercise the real transport path — owned
+  // snapshot -> JSON shard file -> decode -> combine -> merge — without
+  // needing a network or a Google account.
+  // ---------------------------------------------------------------------
 
-    final acc = FrameAccumulator();
-    Uint8List? reassembled;
-    for (final packet in packets) {
-      final (frame, done) = FrameCodec.feed(acc, packet);
-      if (done) {
-        reassembled = frame;
-        break;
+  test('Drive shards round-trip through JSON and merge both ways', () async {
+    await device('a');
+    final aId = me();
+    final batchId = await seedBatch('Morning');
+    await seedStudent('Ravi', batchId: batchId);
+    final aShard = publish(await ownedSnapshot(), aId);
+
+    // The file really is JSON, tagged with its writer.
+    final aParsed = SyncPayload.decode(aShard);
+    expect(aParsed.deviceId, aId);
+    expect(aParsed.tables['batches']!.length, 1);
+    expect(aParsed.tables['students']!.length, 1);
+
+    await device('b');
+    final bId = me();
+    final applied = await mergeShards([aShard], aId);
+    expect(applied.totalApplied, 2);
+
+    // Foreign keys survived the JSON hop: local ids differ per device, so the
+    // batch link must have been rebuilt from the uuid.
+    final d = await open();
+    final joined = await d.rawQuery('''
+      SELECT s.first_name, b.name AS batch_name
+      FROM students s LEFT JOIN batches b ON b.id = s.batch_id
+      WHERE s.deleted_at IS NULL
+    ''');
+    expect(joined.first['batch_name'], 'Morning');
+
+    // Merging the same shard again is a no-op — no duplicates.
+    final again = await mergeShards([aShard], aId);
+    expect(again.totalApplied, 0);
+    expect((await allStudents()).length, 1);
+
+    // B edits and publishes; A merges and adopts B's newer value.
+    final bRow = await findStudent('Ravi');
+    await renameStudent(bRow!['id'] as int, 'Ravi Kumar');
+    final bShard = publish(await ownedSnapshot(), bId);
+
+    await device('a');
+    await mergeShards([bShard], bId);
+    expect(await findStudent('Ravi Kumar'), isNotNull);
+    expect(await findStudent('Ravi'), isNull);
+    expect((await allStudents()).length, 1);
+  });
+
+  test('owned snapshot keeps publishing our rows after the watermark moves',
+      () async {
+    // This is why Drive sync publishes an owned snapshot instead of a
+    // watermark delta: our shard file is overwritten on every upload, so it
+    // must always carry everything we own. A delta would drop rows a device
+    // that stayed offline for several syncs had not yet read.
+    await device('a');
+    final aId = me();
+    await seedStudent('Ravi');
+    final aShard = publish(await ownedSnapshot(), aId);
+
+    await device('b');
+    final bId = me();
+    await mergeShards([aShard], aId);
+    await seedStudent('Meera');
+    final bShard = publish(await ownedSnapshot(), bId);
+
+    await device('a');
+    await mergeShards([bShard], bId); // advances A's students watermark
+
+    // A watermark delta would now omit Ravi...
+    final delta = await outbound();
+    expect(delta.tables['students'] ?? const [], isEmpty);
+
+    // ...but the owned snapshot still carries it, so a third sync still works.
+    final snapshot = await ownedSnapshot();
+    final names = (snapshot.tables['students'] ?? const [])
+        .map((r) => r['first_name'])
+        .toList();
+    expect(names, contains('Ravi'));
+    expect(names, isNot(contains('Meera')),
+        reason: 'Meera is owned by B, so B publishes her — not A');
+  });
+
+  test('a row leaves our shard once the other device edits it', () async {
+    await device('a');
+    final aId = me();
+    await seedStudent('Shared');
+    final aShard = publish(await ownedSnapshot(), aId);
+
+    await device('b');
+    final bId = me();
+    await mergeShards([aShard], aId);
+    // Before B touches it the row belongs to A, so B must not publish it.
+    expect((await ownedSnapshot()).tables['students'] ?? const [], isEmpty);
+
+    await renameStudent((await findStudent('Shared'))!['id'] as int, 'Mine now');
+    final bShard = publish(await ownedSnapshot(), bId);
+    expect(SyncPayload.decode(bShard).tables['students']!.length, 1);
+
+    await device('a');
+    await mergeShards([bShard], bId);
+    // Ownership moved to B, so A stops publishing it. Every row therefore
+    // lives in exactly one shard and the union stays complete.
+    expect((await ownedSnapshot()).tables['students'] ?? const [], isEmpty);
+    expect((await allStudents()).length, 1);
+  });
+
+  test('tombstones travel through a Drive shard', () async {
+    await device('a');
+    final aId = me();
+    final id = await seedStudent('Doomed');
+    final liveShard = publish(await ownedSnapshot(), aId);
+
+    await device('b');
+    await mergeShards([liveShard], aId);
+    expect(await countWhere('students', 'deleted_at IS NULL'), 1);
+
+    await device('a');
+    await tombstoneStudent(id);
+    final deletedShard = publish(await ownedSnapshot(), aId);
+
+    await device('b');
+    await mergeShards([deletedShard], aId);
+    expect(await countWhere('students', 'deleted_at IS NULL'), 0);
+    expect(await countWhere('students', 'deleted_at IS NOT NULL'), 1);
+  });
+
+  test('combine keeps the newest copy when a row appears in two shards',
+      () async {
+    // A stale shard from the previous owner and a fresh one from the new owner
+    // both describe the same record; the newer must win regardless of order.
+    Map<String, Object?> row(String name, String updatedAt, String device) => {
+          'first_name': name,
+          'sync_uuid': 'uuid-1',
+          'device_id': device,
+          'updated_at': updatedAt,
+          'deleted_at': null,
+        };
+
+    final stale = ParsedPayload(
+      deviceId: 'TANDAV-A001',
+      uploadedAt: '',
+      tables: {
+        'students': [row('Old', '2026-08-01T10:00:00.000Z', 'TANDAV-A001')],
+      },
+    );
+    final fresh = ParsedPayload(
+      deviceId: 'TANDAV-B002',
+      uploadedAt: '',
+      tables: {
+        'students': [row('New', '2026-08-02T10:00:00.000Z', 'TANDAV-B002')],
+      },
+    );
+
+    for (final order in [
+      [stale, fresh],
+      [fresh, stale],
+    ]) {
+      final merged = SyncPayload.combine(order);
+      expect(merged['students']!.length, 1);
+      expect(merged['students']!.first['first_name'], 'New');
+    }
+
+    // Exact timestamp tie: the higher device id wins on both devices.
+    final tieA = ParsedPayload(deviceId: 'TANDAV-A001', uploadedAt: '', tables: {
+      'students': [row('FromA', '2026-08-03T10:00:00.000Z', 'TANDAV-A001')],
+    });
+    final tieB = ParsedPayload(deviceId: 'TANDAV-B002', uploadedAt: '', tables: {
+      'students': [row('FromB', '2026-08-03T10:00:00.000Z', 'TANDAV-B002')],
+    });
+    expect(SyncPayload.combine([tieA, tieB])['students']!.first['first_name'],
+        'FromB');
+    expect(SyncPayload.combine([tieB, tieA])['students']!.first['first_name'],
+        'FromB');
+  });
+
+  test('shards never carry credentials or device-local file paths', () async {
+    await device('a');
+    final aId = me();
+    final id = await seedStudent('Photographed');
+    final d = await open();
+    await d.update('students', {'photo_url': '/data/user/0/photos/9.jpg'},
+        where: 'id = ?', whereArgs: [id]);
+
+    final shard = publish(await ownedSnapshot(), aId);
+
+    // A device-local absolute path is meaningless (and mildly private) on the
+    // other device, so it is stripped. Being *absent* rather than null also
+    // means merging leaves each device's own photo path untouched.
+    expect(shard.contains('photo_url'), isFalse);
+    expect(shard.contains('/data/user/0/photos'), isFalse);
+
+    // The users table holds password hashes and is not a syncable table at
+    // all, so no credential can reach Drive by construction.
+    expect(SyncCodec.applyOrder, isNot(contains('users')));
+    for (final table in SyncCodec.applyOrder) {
+      for (final column in SyncCodec.columnsFor(table)) {
+        expect(
+          RegExp('password|secret|token|credential|private_key',
+                  caseSensitive: false)
+              .hasMatch(column),
+          isFalse,
+          reason: '$table.$column looks like a credential',
+        );
       }
     }
-    expect(reassembled, isNotNull);
-    expect(reassembled!.length, payload.length);
-    expect(reassembled, equals(payload));
+  });
 
-    final msg = envelope(SyncMsgType.hello, {'deviceId': 'TANDAV-X1'});
-    expect(typeOf(msg), SyncMsgType.hello);
-
-    final codeA = pairingCode('TANDAV-A7F3', 'TANDAV-B291');
-    final codeB = pairingCode('TANDAV-B291', 'TANDAV-A7F3');
-    expect(codeA, codeB);
-    expect(RegExp(r'^\d{6}$').hasMatch(codeA), true);
-
-    final token = authToken('TANDAV-A7F3', 'secret-x', 'nonce-1');
-    expect(token, authToken('TANDAV-A7F3', 'secret-x', 'nonce-1'));
-    expect(token, isNot(authToken('TANDAV-A7F3', 'secret-x', 'nonce-2')));
-    expect(token, isNot(authToken('TANDAV-A7F3', 'secret-y', 'nonce-1')));
+  test('a newer sync file format is refused with a clear message', () {
+    expect(
+      () => SyncPayload.decode('{"formatVersion": 99, "tables": {}}'),
+      throwsA(isA<FormatException>()),
+    );
   });
 
   test('SyncCodec round trips payloads with FKs', () {

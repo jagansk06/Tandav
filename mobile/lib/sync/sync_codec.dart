@@ -132,4 +132,15 @@ class SyncCodec {
 
   static String encodeSyncUuid(int epochMillis, int suffix) =>
       'sync-$epochMillis-$suffix';
+
+  /// Name parked on a deleted batch so a live batch can reuse its name.
+  ///
+  /// `batches.name` is UNIQUE and the index covers tombstones, so a deleted
+  /// batch keeps its name reserved. Because the name of a tombstone is dead
+  /// metadata — the other device matches it by `sync_uuid`, never by name — it
+  /// can be moved aside instead of blocking a name the studio wants to reuse.
+  /// Both the batch repository and the merge engine use this exact form so they
+  /// cannot disagree about what a parked name looks like.
+  static String parkedBatchName(int localId, Object? syncUuid) =>
+      'deleted:$localId:${syncUuid ?? ''}';
 }

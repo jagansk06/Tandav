@@ -11,15 +11,23 @@ import '../../models/batch.dart';
 import '../../widgets/states.dart';
 
 class AttendanceScreen extends StatefulWidget {
-  const AttendanceScreen({super.key});
+  /// Bumped by [HomeShell] each time the Attendance tab is (re)entered so the
+  /// batch dropdown and roster pick up batches/students created on other tabs.
+  final int refreshTick;
+  const AttendanceScreen({super.key, this.refreshTick = 0});
 
   @override
   State<AttendanceScreen> createState() => _AttendanceScreenState();
 }
 
 class _AttendanceScreenState extends State<AttendanceScreen> {
-  late Future<List<Batch>> _batchesFuture;
+  /// The batch list is held as plain state rather than a `Future` handed to a
+  /// `FutureBuilder`: a reassigned future briefly rebuilds with no data, and
+  /// any load error used to leave the previous (stale) list on screen.
   List<Batch> _batches = [];
+  bool _batchesLoading = true;
+  String? _batchesError;
+
   int? _selectedBatchId;
   DateTime _date = DateTime.now();
 
@@ -27,24 +35,87 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   Map<int, String> _liveStatuses = {};
   int _resetToken = 0;
 
+  TandavApi? _api;
+
   @override
   void initState() {
     super.initState();
+    _dayFuture = Future.value(_emptyDay);
+    _api = context.read<TandavApi>();
+    // Reload whenever business data changes anywhere in the app — a batch
+    // created on the Batches tab, a student reassigned, or rows arriving from
+    // the other device via a Google Drive sync. Without this the dropdown only
+    // refreshed when the Attendance tab was re-entered, so newly created and
+    // freshly synced batches were missing from it.
+    _api!.revision.addListener(_onDataChanged);
     _loadBatches();
   }
 
+  @override
+  void dispose() {
+    _api?.revision.removeListener(_onDataChanged);
+    super.dispose();
+  }
+
+  void _onDataChanged() {
+    if (mounted) _loadBatches();
+  }
+
+  @override
+  void didUpdateWidget(AttendanceScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Re-entering the tab (tick changed) reloads batches + roster too, so the
+    // screen is correct even if a write bypassed the revision notifier.
+    if (oldWidget.refreshTick != widget.refreshTick) {
+      _loadBatches();
+    }
+  }
+
+  static const AttendanceDay _emptyDay = AttendanceDay(
+      date: '',
+      batchId: 0,
+      batchName: '',
+      total: 0,
+      present: 0,
+      absent: 0,
+      late: 0,
+      unmarked: 0,
+      percentage: 0,
+      records: []);
+
+  /// Load every batch registered in Tandav. Uses the shared batch data (no
+  /// separate attendance-only batch list) so Attendance always agrees with the
+  /// Batches tab.
   Future<void> _loadBatches() async {
-    _batchesFuture =
-        context.read<TandavApi>().getBatches().then((r) => r.items);
+    final api = _api;
+    if (api == null) return;
     try {
-      final res = await _batchesFuture;
+      final res = (await api.getBatches()).items;
       if (!mounted) return;
+      final ids = res.map((b) => b.id).toSet();
       setState(() {
         _batches = res;
-        _selectedBatchId = _batches.isNotEmpty ? _batches.first.id : null;
+        _batchesLoading = false;
+        _batchesError = null;
+        // Preserve the current selection if it still exists; otherwise fall
+        // back to the first batch (or none if there are no batches).
+        if (_selectedBatchId == null || !ids.contains(_selectedBatchId)) {
+          _selectedBatchId = res.isNotEmpty ? res.first.id : null;
+        }
       });
+      // Refetch the roster as well: the trigger for a reload is always either
+      // first load, re-entering the tab, or an external data change (a new
+      // student, a reassignment, a Drive sync), any of which can change who
+      // belongs in this batch. Marking attendance deliberately does not bump
+      // the revision notifier, so this cannot clobber an in-progress edit.
       _reloadDay();
-    } catch (_) {}
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _batchesLoading = false;
+        _batchesError = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
   }
 
   String get _iso =>
@@ -53,16 +124,12 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   void _reloadDay() {
     if (_selectedBatchId == null) {
       setState(() {
-        _dayFuture = Future.value(
-            const AttendanceDay(date: '', batchId: 0, batchName: '', total: 0,
-                present: 0, absent: 0, late: 0, unmarked: 0, percentage: 0,
-                records: []));
+        _dayFuture = Future.value(_emptyDay);
       });
       return;
     }
     setState(() {
-      _dayFuture = context
-          .read<TandavApi>()
+      _dayFuture = (_api ?? context.read<TandavApi>())
           .getAttendanceDay(_iso, batchId: _selectedBatchId);
     });
   }
@@ -109,35 +176,36 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
           child: Row(
             children: [
               Expanded(
-                child: FutureBuilder<List<Batch>>(
-                  future: _batchesFuture,
-                  builder: (context, snapshot) {
-                    final batches = snapshot.data ?? [];
-                    return DropdownButtonFormField<int?>(
-                      value: _selectedBatchId,
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Batch',
-                        prefixIcon: Icon(Icons.grid_view_outlined),
-                        contentPadding:
-                            EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                      ),
-                      items: batches
-                          .map((b) => DropdownMenuItem<int?>(
-                                value: b.id,
-                                child: Text(b.name,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis),
-                              ))
-                          .toList(),
-                      onChanged: (v) {
-                        setState(() {
-                          _selectedBatchId = v;
-                          _liveStatuses = {};
-                        });
-                        _reloadDay();
-                      },
-                    );
+                child: DropdownButtonFormField<int?>(
+                  // `_batches` is the single source of truth, so the list can
+                  // never momentarily render empty while a future resolves.
+                  initialValue: _batches.any((b) => b.id == _selectedBatchId)
+                      ? _selectedBatchId
+                      : null,
+                  isExpanded: true,
+                  decoration: InputDecoration(
+                    labelText: 'Batch',
+                    prefixIcon: const Icon(Icons.grid_view_outlined),
+                    contentPadding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                    hintText: _batchesLoading
+                        ? 'Loading batches…'
+                        : (_batches.isEmpty ? 'No batches yet' : 'Select batch'),
+                  ),
+                  items: _batches
+                      .map((b) => DropdownMenuItem<int?>(
+                            value: b.id,
+                            child: Text(b.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis),
+                          ))
+                      .toList(),
+                  onChanged: (v) {
+                    setState(() {
+                      _selectedBatchId = v;
+                      _liveStatuses = {};
+                    });
+                    _reloadDay();
                   },
                 ),
               ),
@@ -154,12 +222,32 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
           child: FutureBuilder<AttendanceDay>(
             future: _dayFuture,
             builder: (context, snapshot) {
-              if (_selectedBatchId == null) {
+              // Distinguish the three reasons no roster is showing, instead of
+              // always claiming "No batches yet" (which was misleading while
+              // batches were still loading or had failed to load).
+              if (_batchesLoading) {
+                return const LoadingView(message: 'Loading batches…');
+              }
+              if (_batchesError != null) {
+                return ErrorView(
+                  message: _batchesError!,
+                  onRetry: _loadBatches,
+                );
+              }
+              if (_batches.isEmpty) {
                 return const EmptyView(
                   icon: Icons.fact_check_outlined,
                   title: 'No batches yet',
                   subtitle:
                       'Create a batch first, then mark attendance for its students.',
+                );
+              }
+              if (_selectedBatchId == null) {
+                return const EmptyView(
+                  icon: Icons.grid_view_outlined,
+                  title: 'Select a batch',
+                  subtitle:
+                      'Choose a batch above to mark attendance for its students.',
                 );
               }
               if (snapshot.connectionState != ConnectionState.done) {

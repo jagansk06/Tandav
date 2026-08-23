@@ -10,6 +10,24 @@ class DbFmt {
   static String month(DateTime d) => '${d.year.toString().padLeft(4, '0')}-'
       '${d.month.toString().padLeft(2, '0')}-01';
 
+  /// Normalize a month string to the first of that month (`YYYY-MM-01`).
+  ///
+  /// Accepts `2026-08`, `2026-08-17` and full ISO timestamps alike, and returns
+  /// the month unchanged when it is already normalized. Anything unrecognisable
+  /// is reported instead of being silently reinterpreted — a month that quietly
+  /// changes value would corrupt the fee register for a whole month.
+  static String monthStart(String month) {
+    final match = RegExp(r'^(\d{4})-(\d{1,2})').firstMatch(month.trim());
+    if (match == null) {
+      throw RepoException('Invalid month "$month" (expected YYYY-MM)');
+    }
+    final m = int.parse(match.group(2)!);
+    if (m < 1 || m > 12) {
+      throw RepoException('Invalid month "$month" (month must be 01-12)');
+    }
+    return '${match.group(1)}-${m.toString().padLeft(2, '0')}-01';
+  }
+
   static DateTime firstOfMonth(DateTime d) => DateTime(d.year, d.month, 1);
 
   static DateTime addMonths(DateTime d, int count) =>

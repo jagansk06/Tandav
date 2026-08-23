@@ -40,7 +40,7 @@ class EventRepository {
              (SELECT COUNT(*) FROM event_participations ep
               WHERE ep.event_id = e.id AND ep.deleted_at IS NULL) AS participant_count
       FROM events e
-      LEFT JOIN batches b ON b.id = e.batch_id
+      LEFT JOIN batches b ON b.id = e.batch_id AND b.deleted_at IS NULL
       ${where.isEmpty ? 'WHERE e.deleted_at IS NULL' : 'WHERE ${where.join(' AND ')} AND e.deleted_at IS NULL'}
       ORDER BY e.event_date DESC, e.id DESC
       LIMIT 200
@@ -58,10 +58,10 @@ class EventRepository {
              (SELECT COUNT(*) FROM event_participations ep
               WHERE ep.event_id = e.id AND ep.deleted_at IS NULL) AS participant_count
       FROM events e
-      LEFT JOIN batches b ON b.id = e.batch_id
+      LEFT JOIN batches b ON b.id = e.batch_id AND b.deleted_at IS NULL
       WHERE e.id = ? AND e.deleted_at IS NULL
     ''', [id]);
-    if (rows.isEmpty) throw RepoException('Event not found');
+    if (rows.isEmpty) throw const RepoException('Event not found');
     return _eventFromRow(rows.first);
   }
 
@@ -72,26 +72,46 @@ class EventRepository {
     return getEvent(id);
   }
 
+  /// Apply an edit, writing only the fields present in [payload] so a caller
+  /// that sends a subset cannot blank the rest of the event.
   Future<EventItem> updateEvent(int id, Map<String, dynamic> payload) async {
     final d = await _d;
-    final row = _payloadToRow(payload);
+    final row = _payloadToRow(payload, partial: true);
     row.addAll(SyncStamp.now(db).touchColumns());
-    final updated = await d.update('events', row, where: 'id = ?', whereArgs: [id]);
-    if (updated == 0) throw RepoException('Event not found');
+    final updated = await d.update('events', row,
+        where: 'id = ? AND deleted_at IS NULL', whereArgs: [id]);
+    if (updated == 0) throw const RepoException('Event not found');
     return getEvent(id);
   }
 
+  /// Soft delete, together with the event's participations — the schema
+  /// cascades on a real DELETE, but a tombstone triggers nothing, so the
+  /// participations would otherwise stay live and sync on as rows belonging to
+  /// an event that no longer exists.
   Future<void> deleteEvent(int id) async {
     final d = await _d;
-    final updated = await d.update('events', {
-      ...SyncStamp.now(db).tombstoneColumns(),
-    }, where: 'id = ?', whereArgs: [id]);
-    if (updated == 0) throw RepoException('Event not found');
+    final updated = await d.transaction((txn) async {
+      final stamp = SyncStamp.now(db);
+      final rows = await txn.update('events', {
+        'is_active': 0,
+        ...stamp.tombstoneColumns(),
+      }, where: 'id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      if (rows != 0) {
+        await txn.update('event_participations', stamp.tombstoneColumns(),
+            where: 'event_id = ? AND deleted_at IS NULL', whereArgs: [id]);
+      }
+      return rows;
+    });
+    if (updated == 0) throw const RepoException('Event not found');
   }
 
   Future<ParticipationListResponse> getParticipants(int eventId, {String? costumeStatus}) async {
     final d = await _d;
-    final conditions = <String>['ep.event_id = ?', 'ep.deleted_at IS NULL'];
+    final conditions = <String>[
+      'ep.event_id = ?',
+      'ep.deleted_at IS NULL',
+      's.deleted_at IS NULL',
+    ];
     final args = <Object?>[eventId];
     if (costumeStatus != null && costumeStatus.isNotEmpty) {
       conditions.add('ep.costume_status = ?');
@@ -101,7 +121,7 @@ class EventRepository {
       SELECT ep.*, s.first_name, s.last_name, b.name AS batch_name
       FROM event_participations ep
       JOIN students s ON s.id = ep.student_id
-      LEFT JOIN batches b ON b.id = s.batch_id
+      LEFT JOIN batches b ON b.id = s.batch_id AND b.deleted_at IS NULL
       WHERE ${conditions.join(' AND ')}
       ORDER BY s.first_name COLLATE NOCASE
     ''', args);
@@ -128,6 +148,10 @@ class EventRepository {
   }
 
   /// Add every student of a batch to the event (duplicates skipped).
+  ///
+  /// A costume fee greater than zero implies a costume is required — the batch
+  /// dialog has no separate switch, and without this the fee would be charged
+  /// while the status stayed "none".
   Future<ParticipationListResponse> addBatchParticipants(
     int eventId,
     int batchId, {
@@ -139,7 +163,9 @@ class EventRepository {
         whereArgs: [batchId]);
     await _insertParticipants(d, eventId,
         students.map((s) => s['id'] as int).toList(),
-        costumeFee: costumeFee);
+        costumeFee: costumeFee,
+        isCostumeRequired: (double.tryParse(costumeFee) ?? 0) > 0,
+        source: 'batch');
     return getParticipants(eventId);
   }
 
@@ -158,6 +184,15 @@ class EventRepository {
     return getParticipants(eventId);
   }
 
+  /// Register students for an event, skipping anyone already registered.
+  ///
+  /// A participant who is already live is left completely untouched. Re-adding a
+  /// batch is a routine action, and rewriting the row would reset
+  /// `costume_fee_paid` to 0 — silently erasing a costume payment the admin had
+  /// already recorded. Only a tombstoned participation is rewritten, which is
+  /// how a removed student can be added back: `event_participations` is UNIQUE
+  /// (event_id, student_id), so the deleted row must be revived rather than
+  /// inserted again.
   Future<void> _insertParticipants(
     Database d,
     int eventId,
@@ -168,8 +203,10 @@ class EventRepository {
   }) async {
     if (studentIds.isEmpty) return;
     final event = await d.query('events',
-        where: 'id = ?', whereArgs: [eventId], limit: 1);
-    if (event.isEmpty) throw RepoException('Event not found');
+        where: 'id = ? AND deleted_at IS NULL',
+        whereArgs: [eventId],
+        limit: 1);
+    if (event.isEmpty) throw const RepoException('Event not found');
     final due = double.tryParse(costumeFee) ?? 0;
     await d.transaction((t) async {
       for (final sid in studentIds) {
@@ -177,33 +214,34 @@ class EventRepository {
             where: 'id = ? AND deleted_at IS NULL', whereArgs: [sid], limit: 1);
         if (student.isEmpty) continue;
         final existing = await t.query('event_participations',
+            columns: ['id', 'deleted_at'],
             where: 'event_id = ? AND student_id = ?',
-            whereArgs: [eventId, sid], limit: 1);
+            whereArgs: [eventId, sid],
+            limit: 1);
         final stamp = SyncStamp.now(db);
-        if (existing.isNotEmpty) {
-          await t.update('event_participations', {
-            'source': source,
-            'is_costume_required': isCostumeRequired ? 1 : 0,
-            'costume_fee_due': DbFmt.round2(due),
-            'costume_fee_paid': 0,
-            'costume_status':
-                costumeStatus(required: isCostumeRequired, due: due, paid: 0),
-            'deleted_at': null,
-            ...stamp.touchColumns(),
-          }, where: 'event_id = ? AND student_id = ?',
-              whereArgs: [eventId, sid]);
-        } else {
+        final values = {
+          'source': source,
+          'is_costume_required': isCostumeRequired ? 1 : 0,
+          'costume_fee_due': DbFmt.round2(due),
+          'costume_fee_paid': 0,
+          'costume_status':
+              costumeStatus(required: isCostumeRequired, due: due, paid: 0),
+        };
+        if (existing.isEmpty) {
           await t.insert('event_participations', {
             'event_id': eventId,
             'student_id': sid,
-            'source': source,
-            'is_costume_required': isCostumeRequired ? 1 : 0,
-            'costume_fee_due': DbFmt.round2(due),
-            'costume_fee_paid': 0,
-            'costume_status':
-                costumeStatus(required: isCostumeRequired, due: due, paid: 0),
+            ...values,
             ...stamp.columns(),
           });
+        } else if (existing.first['deleted_at'] != null) {
+          await t.update('event_participations', {
+            ...values,
+            'costume_paid_date': null,
+            'costume_payment_method': null,
+            'deleted_at': null,
+            ...stamp.touchColumns(),
+          }, where: 'id = ?', whereArgs: [existing.first['id']]);
         }
       }
     });
@@ -213,19 +251,22 @@ class EventRepository {
       int id, Map<String, dynamic> payload) async {
     final d = await _d;
     final existing = await d.query('event_participations',
-        where: 'id = ?', whereArgs: [id], limit: 1);
-    if (existing.isEmpty) throw RepoException('Participation not found');
+        where: 'id = ? AND deleted_at IS NULL', whereArgs: [id], limit: 1);
+    if (existing.isEmpty) throw const RepoException('Participation not found');
     final row = existing.first;
 
     final required = (payload['is_costume_required'] as bool?) ?? (row['is_costume_required'] as int? ?? 0) == 1;
     final due = _payloadFee(payload['costume_fee_due']) ?? _fee(row['costume_fee_due']);
     final paid = _payloadFee(payload['costume_fee_paid']) ?? _fee(row['costume_fee_paid']);
     if (paid > due + 0.001) {
-      throw RepoException('Payment exceeds total fee');
+      throw const RepoException('Payment exceeds total fee');
     }
     final status = costumeStatus(required: required, due: due, paid: paid);
 
-    final update = <String, Object?>{
+    // One statement: the business columns and the sync stamp have to move
+    // together, or a sync landing between two writes would ship the old
+    // `updated_at` with the new amounts and the peer would discard them.
+    final updated = await d.update('event_participations', {
       'is_costume_required': required ? 1 : 0,
       'costume_fee_due': DbFmt.round2(due),
       'costume_fee_paid': DbFmt.round2(paid),
@@ -235,19 +276,18 @@ class EventRepository {
       'costume_payment_method':
           payload['costume_payment_method'] ?? row['costume_payment_method'],
       'notes': payload['notes'] ?? row['notes'],
-    };
-    await d.update('event_participations', update, where: 'id = ?', whereArgs: [id]);
-    await d.update('event_participations', {
       ...SyncStamp.now(db).touchColumns(),
-    }, where: 'id = ?', whereArgs: [id]);
+    }, where: 'id = ? AND deleted_at IS NULL', whereArgs: [id]);
+    if (updated == 0) throw const RepoException('Participation not found');
 
     final rows = await d.rawQuery('''
       SELECT ep.*, s.first_name, s.last_name, b.name AS batch_name
       FROM event_participations ep
       JOIN students s ON s.id = ep.student_id
-      LEFT JOIN batches b ON b.id = s.batch_id
+      LEFT JOIN batches b ON b.id = s.batch_id AND b.deleted_at IS NULL
       WHERE ep.id = ?
     ''', [id]);
+    if (rows.isEmpty) throw const RepoException('Participation not found');
     return _participationFromRow(rows.first);
   }
 
@@ -255,8 +295,8 @@ class EventRepository {
     final d = await _d;
     final updated = await d.update('event_participations', {
       ...SyncStamp.now(db).tombstoneColumns(),
-    }, where: 'id = ?', whereArgs: [id]);
-    if (updated == 0) throw RepoException('Participation not found');
+    }, where: 'id = ? AND deleted_at IS NULL', whereArgs: [id]);
+    if (updated == 0) throw const RepoException('Participation not found');
   }
 
   Future<ParticipationListResponse> studentParticipationHistory(int studentId) async {
@@ -267,7 +307,7 @@ class EventRepository {
       FROM event_participations ep
       JOIN students s ON s.id = ep.student_id
       JOIN events e ON e.id = ep.event_id
-      LEFT JOIN batches b ON b.id = s.batch_id
+      LEFT JOIN batches b ON b.id = s.batch_id AND b.deleted_at IS NULL
       WHERE ep.student_id = ? AND ep.deleted_at IS NULL
         AND e.deleted_at IS NULL AND s.deleted_at IS NULL
       ORDER BY e.event_date DESC
@@ -278,15 +318,42 @@ class EventRepository {
     );
   }
 
-  Map<String, Object?> _payloadToRow(Map<String, dynamic> payload) => {
-        'name': (payload['name'] as String).trim(),
-        'description': payload['description'],
-        'event_type': (payload['event_type'] as String?) ?? '',
-        'event_date': payload['event_date'],
-        'location': payload['location'],
-        'batch_id': payload['batch_id'],
-        'is_active': payload['is_active'] == false ? 0 : 1,
-      };
+  /// Map an API payload onto event columns.
+  ///
+  /// With [partial] set, only the keys the caller actually sent are written, so
+  /// an edit that carries just one field cannot blank the rest of the event.
+  ///
+  /// `name` and `event_date` are NOT NULL in the schema, so they are validated
+  /// rather than cast — an unchecked cast raises a type error the UI shows as
+  /// gibberish, and a null date would abort the insert with a constraint error.
+  Map<String, Object?> _payloadToRow(
+    Map<String, dynamic> payload, {
+    bool partial = false,
+  }) {
+    final row = <String, Object?>{};
+    bool has(String key) => !partial || payload.containsKey(key);
+
+    if (has('name')) {
+      final name = (payload['name'] as String?)?.trim() ?? '';
+      if (name.isEmpty) throw const RepoException('Event name is required');
+      row['name'] = name;
+    }
+    if (has('description')) row['description'] = payload['description'];
+    if (has('event_type')) {
+      row['event_type'] = (payload['event_type'] as String?) ?? '';
+    }
+    if (has('event_date')) {
+      final date = (payload['event_date'] as String?)?.trim() ?? '';
+      if (date.isEmpty) throw const RepoException('Event date is required');
+      row['event_date'] = date;
+    }
+    if (has('location')) row['location'] = payload['location'];
+    if (has('batch_id')) row['batch_id'] = payload['batch_id'];
+    if (has('is_active')) {
+      row['is_active'] = payload['is_active'] == false ? 0 : 1;
+    }
+    return row;
+  }
 
   double? _payloadFee(Object? v) {
     if (v == null) return null;

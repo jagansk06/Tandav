@@ -7,6 +7,11 @@ import 'fee_repository.dart';
 
 /// Aggregations for the dashboard and monthly reports — every number is
 /// computed live from SQLite data (never hardcoded).
+///
+/// Every query filters `deleted_at IS NULL`. Deletes are tombstones (rows stay
+/// in the table so the other device learns about them), so a query that forgets
+/// the filter silently counts deleted students, batches and fees — and the
+/// numbers would drift further apart with every sync.
 class DashboardRepository {
   final TandavDatabase db;
   final FeeRepository fees;
@@ -19,31 +24,40 @@ class DashboardRepository {
     final d = await _d;
     final today = DateTime.now();
     final todayIso = DbFmt.date(today);
-    final target = DbFmt.month(month != null ? DateTime.parse(_monthIso(month)) : today);
+    final target =
+        DbFmt.month(month != null ? DateTime.parse(DbFmt.monthStart(month)) : today);
 
     // Ensure fee records exist for the target month (idempotent).
     await fees.ensureMonthlyFees(today, anchor: DateTime.parse(target));
 
-    final totalStudents = Sqflite.firstIntValue(
-            await d.rawQuery('SELECT COUNT(*) FROM students')) ??
+    final totalStudents = Sqflite.firstIntValue(await d
+            .rawQuery('SELECT COUNT(*) FROM students WHERE deleted_at IS NULL')) ??
         0;
-    final activeStudents = Sqflite.firstIntValue(
-            await d.rawQuery('SELECT COUNT(*) FROM students WHERE is_active = 1')) ??
+    final activeStudents = Sqflite.firstIntValue(await d.rawQuery(
+            'SELECT COUNT(*) FROM students '
+            'WHERE is_active = 1 AND deleted_at IS NULL')) ??
         0;
-    final totalBatches =
-        Sqflite.firstIntValue(await d.rawQuery('SELECT COUNT(*) FROM batches')) ?? 0;
-    final activeBatches = Sqflite.firstIntValue(
-            await d.rawQuery('SELECT COUNT(*) FROM batches WHERE is_active = 1')) ??
+    final totalBatches = Sqflite.firstIntValue(await d
+            .rawQuery('SELECT COUNT(*) FROM batches WHERE deleted_at IS NULL')) ??
         0;
-    final totalEvents =
-        Sqflite.firstIntValue(await d.rawQuery('SELECT COUNT(*) FROM events')) ?? 0;
-    final upcomingEvents = Sqflite.firstIntValue(
-            await d.rawQuery('SELECT COUNT(*) FROM events WHERE event_date >= ?',
-                [todayIso])) ??
+    final activeBatches = Sqflite.firstIntValue(await d.rawQuery(
+            'SELECT COUNT(*) FROM batches '
+            'WHERE is_active = 1 AND deleted_at IS NULL')) ??
+        0;
+    final totalEvents = Sqflite.firstIntValue(await d
+            .rawQuery('SELECT COUNT(*) FROM events WHERE deleted_at IS NULL')) ??
+        0;
+    final upcomingEvents = Sqflite.firstIntValue(await d.rawQuery(
+            'SELECT COUNT(*) FROM events '
+            'WHERE event_date >= ? AND deleted_at IS NULL',
+            [todayIso])) ??
         0;
 
-    final todayMarks = await d.query('attendance',
-        where: 'attendance_date = ?', whereArgs: [todayIso]);
+    final todayMarks = await d.rawQuery('''
+      SELECT a.status FROM attendance a
+      JOIN students s ON s.id = a.student_id AND s.deleted_at IS NULL
+      WHERE a.attendance_date = ? AND a.deleted_at IS NULL
+    ''', [todayIso]);
     var todayPresent = 0, todayAbsent = 0, todayLate = 0;
     for (final m in todayMarks) {
       switch (m['status'] as String) {
@@ -73,11 +87,13 @@ class DashboardRepository {
 
     // Daily attendance trend for the month (same shape as before).
     final trendRows = await d.rawQuery('''
-      SELECT attendance_date, status, COUNT(*) AS cnt
-      FROM attendance
-      WHERE attendance_date >= ? AND attendance_date < ?
-      GROUP BY attendance_date, status
-      ORDER BY attendance_date
+      SELECT a.attendance_date, a.status, COUNT(*) AS cnt
+      FROM attendance a
+      JOIN students s ON s.id = a.student_id AND s.deleted_at IS NULL
+      WHERE a.attendance_date >= ? AND a.attendance_date < ?
+        AND a.deleted_at IS NULL
+      GROUP BY a.attendance_date, a.status
+      ORDER BY a.attendance_date
     ''', [target, DbFmt.date(DbFmt.addMonths(DateTime.parse(target), 1))]);
     final daily = <String, Map<String, int>>{};
     for (final r in trendRows) {
@@ -93,9 +109,10 @@ class DashboardRepository {
     final upcoming = await d.rawQuery('''
       SELECT e.*,
              (SELECT COUNT(*) FROM event_participations ep
-              WHERE ep.event_id = e.id) AS participant_count
+              WHERE ep.event_id = e.id AND ep.deleted_at IS NULL)
+             AS participant_count
       FROM events e
-      WHERE e.event_date >= ?
+      WHERE e.event_date >= ? AND e.deleted_at IS NULL
       ORDER BY e.event_date ASC
       LIMIT 5
     ''', [todayIso]);
@@ -113,7 +130,8 @@ class DashboardRepository {
     final recent = await d.rawQuery('''
       SELECT s.*, b.name AS batch_name
       FROM students s
-      LEFT JOIN batches b ON b.id = s.batch_id
+      LEFT JOIN batches b ON b.id = s.batch_id AND b.deleted_at IS NULL
+      WHERE s.deleted_at IS NULL
       ORDER BY s.id DESC
       LIMIT 5
     ''');
@@ -148,11 +166,12 @@ class DashboardRepository {
   /// Per-batch monthly report, including the "Unassigned" bucket.
   Future<MonthlyReport> getMonthlyReport(String month) async {
     final d = await _d;
-    final monthIso = _monthIso(month);
+    final monthIso = DbFmt.monthStart(month);
     final dateObj = DateTime.parse(monthIso);
     final nextMonth = DbFmt.date(DbFmt.addMonths(dateObj, 1));
 
-    final batches = await d.query('batches', orderBy: 'name COLLATE NOCASE');
+    final batches = await d.query('batches',
+        where: 'deleted_at IS NULL', orderBy: 'name COLLATE NOCASE');
     final rows = <MonthlyReportRow>[];
     for (final b in batches) {
       rows.add(await _rowForBatch(d, b['id'] as int, b['name'] as String,
@@ -171,10 +190,13 @@ class DashboardRepository {
   ) async {
     final totalStudents = batchId == null
         ? (Sqflite.firstIntValue(await d.rawQuery(
-                'SELECT COUNT(*) FROM students WHERE batch_id IS NULL')) ??
+                'SELECT COUNT(*) FROM students '
+                'WHERE batch_id IS NULL AND deleted_at IS NULL')) ??
             0)
         : (Sqflite.firstIntValue(await d.rawQuery(
-                'SELECT COUNT(*) FROM students WHERE batch_id = ?', [batchId])) ??
+                'SELECT COUNT(*) FROM students '
+                'WHERE batch_id = ? AND deleted_at IS NULL',
+                [batchId])) ??
             0);
 
     final args = <Object?>[monthIso, nextMonth];
@@ -186,9 +208,10 @@ class DashboardRepository {
       batchCond = 'AND s.batch_id IS NULL';
     }
     final attRows = await d.rawQuery('''
-      SELECT a.* FROM attendance a
-      JOIN students s ON s.id = a.student_id
-      WHERE a.attendance_date >= ? AND a.attendance_date < ? $batchCond
+      SELECT a.status FROM attendance a
+      JOIN students s ON s.id = a.student_id AND s.deleted_at IS NULL
+      WHERE a.attendance_date >= ? AND a.attendance_date < ?
+        AND a.deleted_at IS NULL $batchCond
     ''', args);
     final attTotal = attRows.length;
     final attPresent = attRows.where((r) => r['status'] == 'present').length;
@@ -198,16 +221,15 @@ class DashboardRepository {
         : ((attPresent + attLate) / attTotal * 100).clamp(0, 100).toDouble();
 
     final feeArgs = <Object?>[];
-    var feeJoin = '';
-    if (batchId != null) {
-      feeJoin = 'JOIN students s ON s.id = f.student_id AND s.batch_id = ?';
-      feeArgs.add(batchId);
-    } else {
-      feeJoin = 'JOIN students s ON s.id = f.student_id AND s.batch_id IS NULL';
-    }
+    final batchFilter =
+        batchId == null ? 's.batch_id IS NULL' : 's.batch_id = ?';
+    if (batchId != null) feeArgs.add(batchId);
     feeArgs.add(monthIso);
-    final fees = await d.rawQuery(
-        'SELECT * FROM fees f $feeJoin WHERE f.month = ?', feeArgs);
+    final fees = await d.rawQuery('''
+      SELECT f.amount_due, f.amount_paid FROM fees f
+      JOIN students s ON s.id = f.student_id AND s.deleted_at IS NULL
+      WHERE $batchFilter AND f.month = ? AND f.deleted_at IS NULL
+    ''', feeArgs);
     var feesDue = 0.0, feesPaid = 0.0;
     for (final f in fees) {
       feesDue += _fee(f['amount_due']);
@@ -229,9 +251,6 @@ class DashboardRepository {
       feeCollectionRate: collectionRate,
     );
   }
-
-  String _monthIso(String month) =>
-      month.replaceFirst(RegExp(r'-\d{2}$'), '-01');
 
   double _fee(Object? v) {
     final n = double.tryParse(v?.toString() ?? '');
