@@ -107,8 +107,10 @@ class SyncEngine {
     required String peerDeviceId,
   }) async {
     final result = SyncApplyResult();
-    // uuid -> local id, built as parent tables are applied first so child
-    // foreign keys can be resolved.
+    // table -> {sync_uuid: local id}. Seeded as parent tables are applied
+    // first (see SyncCodec.applyOrder) and filled in on demand by
+    // _resolveParentId for parents that are already in the database rather
+    // than in this payload, so it acts as a cache over the whole merge.
     final uuidMap = <String, Map<String, int>>{};
 
     for (final table in SyncCodec.applyOrder) {
@@ -149,7 +151,8 @@ class SyncEngine {
             remapped[entry.key] = null;
             continue;
           }
-          final localParentId = uuidMap[parent]?[parentUuid];
+          final localParentId =
+              await _resolveParentId(txn, uuidMap, parent, parentUuid);
           if (localParentId == null) {
             orphaned = true;
             break;
@@ -215,6 +218,8 @@ class SyncEngine {
 
       // Advance the watermark only if nothing was orphaned — an orphaned row
       // may need the parent to arrive in a future sync, so it must be retried.
+      // After _resolveParentId this means a parent that is genuinely nowhere on
+      // this device yet, not merely one absent from this payload.
       if (advanceable.isNotEmpty && !orphans) {
         final current = await state.readWithin(txn, 'watermark.$table') ?? '';
         final maxSeen = advanceable.reduce((a, b) => a.compareTo(b) > 0 ? a : b);
@@ -225,6 +230,44 @@ class SyncEngine {
     }
     await state.writeWithin(txn, 'last_sync_at', DateTime.now().toUtc().toIso8601String());
     return result;
+  }
+
+  /// Resolve a parent row's `sync_uuid` to the local integer id we store it
+  /// under, consulting [uuidMap] first and the database second.
+  ///
+  /// The database fallback is not an optimisation — it is what makes a
+  /// per-device payload work at all. [uuidMap] only knows about rows applied
+  /// during *this* merge, but a device's shard carries only the rows that
+  /// device currently owns, so a child whose parent was last written by
+  /// somebody else (very often by *us*) arrives with no parent alongside it
+  /// even though the parent is sitting in our database. Resolving only from
+  /// [uuidMap] classed such a child as an orphan and skipped it, and because
+  /// orphans deliberately hold the watermark back it was retried and skipped
+  /// again on every future sync — a silently dropped edit, reported to the user
+  /// as "N already current". Repro: this device creates a batch and a student,
+  /// the other device edits only the student, and the edit never lands here.
+  ///
+  /// Tombstoned parents are matched too. A soft-deleted parent is still the row
+  /// the foreign key legitimately points at, every read already filters
+  /// `deleted_at IS NULL`, and refusing to match one would recreate exactly the
+  /// orphan-forever behaviour this method exists to prevent.
+  Future<int?> _resolveParentId(
+    Transaction txn,
+    Map<String, Map<String, int>> uuidMap,
+    String parentTable,
+    String parentUuid,
+  ) async {
+    final cached = uuidMap[parentTable]?[parentUuid];
+    if (cached != null) return cached;
+    final rows = await txn.query(parentTable,
+        columns: ['id'],
+        where: 'sync_uuid = ?',
+        whereArgs: [parentUuid],
+        limit: 1);
+    if (rows.isEmpty) return null;
+    final id = rows.first['id'] as int;
+    uuidMap.putIfAbsent(parentTable, () => {})[parentUuid] = id;
+    return id;
   }
 
   /// Make sure no *other* local row already owns the unique key [remapped] is

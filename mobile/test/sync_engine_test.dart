@@ -367,6 +367,76 @@ void main() {
     expect((await allStudents()).length, 1);
   });
 
+  test('a shard carrying only the child still merges (parent stays with peer)',
+      () async {
+    // Regression: a shard holds only the rows its device owns, so when the
+    // other device edits just the student the batch is absent from the payload
+    // even though it is sitting in our database. Resolving the parent from the
+    // payload alone classed the student as an orphan and skipped it, and
+    // because orphans hold the watermark back it was skipped again on every
+    // later sync — the edit was silently lost and reported as "1 already
+    // current". The parent must be resolved by sync_uuid from the database.
+    await device('a');
+    final aId = me();
+    final batchId = await seedBatch('Morning');
+    await seedStudent('Ravi', batchId: batchId);
+    final aShard = publish(await ownedSnapshot(), aId);
+
+    await device('b');
+    final bId = me();
+    await mergeShards([aShard], aId);
+    await renameStudent((await findStudent('Ravi'))!['id'] as int, 'Ravi Kumar');
+
+    // Establish the precondition the bug depended on: B owns only the student.
+    final bShard = publish(await ownedSnapshot(), bId);
+    final bTables = SyncPayload.decode(bShard).tables;
+    expect(bTables['students']!.length, 1);
+    expect(bTables['batches'] ?? const [], isEmpty,
+        reason: 'the batch is still owned by A, so B must not publish it');
+
+    await device('a');
+    final applied = await mergeShards([bShard], bId);
+    expect(applied.orphansSkipped['students'] ?? 0, 0,
+        reason: 'the parent batch is already local, so this is not an orphan');
+    expect(applied.totalApplied, 1);
+    expect(await findStudent('Ravi Kumar'), isNotNull);
+    expect(await findStudent('Ravi'), isNull);
+
+    // The foreign key must still resolve to the right batch after the remap.
+    final d = await open();
+    final joined = await d.rawQuery('''
+      SELECT b.name AS batch_name
+      FROM students s LEFT JOIN batches b ON b.id = s.batch_id
+      WHERE s.first_name = 'Ravi Kumar'
+    ''');
+    expect(joined.first['batch_name'], 'Morning');
+
+    // A genuinely unknown parent must still be treated as an orphan, so the
+    // fallback cannot paper over a real gap: the row waits for its parent
+    // instead of being inserted with a dangling or null link.
+    final orphanShard = SyncPayload.toJsonString(SyncPayload.encodeShard(
+      deviceId: bId,
+      delta: SyncDelta()
+        ..tables['students'] = [
+          {
+            '_table': 'students',
+            '_fk': {'batches': 'uuid-that-does-not-exist'},
+            'first_name': 'Nowhere',
+            'last_name': '',
+            'batch_id': 4242,
+            'sync_uuid': 'uuid-orphan-1',
+            'device_id': bId,
+            'updated_at': '2099-01-01T00:00:00.000Z',
+            'deleted_at': null,
+          }
+        ],
+      uploadedAt: DateTime.now().toUtc().toIso8601String(),
+    ));
+    final orphaned = await mergeShards([orphanShard], bId);
+    expect(orphaned.orphansSkipped['students'], 1);
+    expect(await findStudent('Nowhere'), isNull);
+  });
+
   test('owned snapshot keeps publishing our rows after the watermark moves',
       () async {
     // This is why Drive sync publishes an owned snapshot instead of a

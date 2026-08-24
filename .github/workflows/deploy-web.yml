@@ -1,0 +1,128 @@
+name: Deploy Tandav Web
+
+# Builds the Flutter web app and publishes it to GitHub Pages at
+# https://jagansk06.github.io/Tandav/
+#
+# Prerequisites, both one-time:
+#   1. Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+#   2. Settings -> Secrets and variables -> Actions -> New repository secret,
+#      named TANDAV_GOOGLE_WEB_CLIENT_ID, holding the OAuth *web* client id.
+#      The id is public by design (Google exposes it in the page), so this is
+#      about keeping it out of the committed source, not about secrecy.
+#
+# Also add https://jagansk06.github.io to "Authorised JavaScript origins" on
+# that OAuth client. Origins have no path component, so do NOT include /Tandav/.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a newer push supersede an in-flight deploy rather than racing it, but
+# never cancel a deploy that is already publishing.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # Must satisfy `environment: sdk: ^3.12.2` in mobile/pubspec.yaml.
+          # Flutter 3.35 ships Dart 3.9 and fails `pub get` outright. This is
+          # pinned to the version the app is developed against, so CI cannot
+          # drift away from what was tested locally.
+          flutter-version: '3.44.9'
+          channel: stable
+          cache: true
+
+      - name: Flutter Pub Get
+        working-directory: mobile
+        run: flutter pub get
+
+      - name: Check the OAuth client id is configured
+        env:
+          CLIENT_ID: ${{ secrets.TANDAV_GOOGLE_WEB_CLIENT_ID }}
+        run: |
+          if [ -z "$CLIENT_ID" ]; then
+            echo "::error::Repository secret TANDAV_GOOGLE_WEB_CLIENT_ID is not set. Without it the app builds and runs but the Google Drive Sync screen reports that no client id is compiled in. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "Client id is present (${#CLIENT_ID} characters)."
+
+      - name: Setup SQLite for the web
+        working-directory: mobile
+        run: |
+          # The setup command compiles web/sqflite_sw.js from the sqlite3
+          # version in pubspec.lock, but downloads web/sqlite3.wasm from a
+          # release hardcoded in sqflite_common_ffi_web (0.4.5+4 pins
+          # sqlite3-2.4.6) and silently ignores --sqlite3-wasm-url. Running it
+          # bare therefore ships a worker and an engine built to different
+          # ABIs, and the deployed app dies at startup with
+          # "Unsupported operation: unsupported result null (null)".
+          #
+          # So: skip the download, then fetch the engine that matches the
+          # worker. The version is read from pubspec.lock rather than hardcoded
+          # here, so a future `flutter pub upgrade` cannot reintroduce the skew.
+          dart run sqflite_common_ffi_web:setup --no-sqlite3-wasm
+
+          SQLITE3_VERSION=$(awk '/^  sqlite3:/{f=1} f && /^    version:/{gsub(/["[:space:]]/,"",$2); print $2; exit}' pubspec.lock)
+          if [ -z "$SQLITE3_VERSION" ]; then
+            echo "::error::Could not read the resolved sqlite3 version from mobile/pubspec.lock."
+            exit 1
+          fi
+          echo "sqlite3 resolved to $SQLITE3_VERSION"
+
+          curl -fL --retry 3 -o web/sqlite3.wasm \
+            "https://github.com/simolus3/sqlite3.dart/releases/download/sqlite3-${SQLITE3_VERSION}/sqlite3.wasm"
+
+          # Parses the wasm export table and fails the build if the two halves
+          # disagree, so a broken pair can never reach the live site.
+          dart run tool/check_web_binaries.dart
+
+      - name: Build Flutter Web
+        working-directory: mobile
+        env:
+          CLIENT_ID: ${{ secrets.TANDAV_GOOGLE_WEB_CLIENT_ID }}
+        run: |
+          flutter build web --release \
+            --base-href "/Tandav/" \
+            --dart-define=TANDAV_GOOGLE_WEB_CLIENT_ID="$CLIENT_ID"
+
+      - name: Confirm the web SQLite files were bundled
+        working-directory: mobile
+        run: |
+          # flutter build web copies web/ into build/web; if either file were
+          # missing the site would fail at startup rather than at build time.
+          ls -l build/web/sqlite3.wasm build/web/sqflite_sw.js
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: mobile/build/web
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
