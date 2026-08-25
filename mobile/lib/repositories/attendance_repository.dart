@@ -275,6 +275,13 @@ class AttendanceRepository {
         }, where: 'id = ?', whereArgs: [existing.first['id']]);
       }
       // Sync attendance percentage into that month's progress record if any.
+      //
+      // On the attender's build `monthly_progress` is never synced in and has no
+      // screen that writes it, so this matches zero rows and does nothing. It is
+      // left unguarded on purpose: an UPDATE cannot create a row, so it cannot
+      // put an owner-only record on that phone, and a role check here would be a
+      // second place for the table scope to be stated and get out of step with
+      // [syncTables].
       await txn.rawUpdate('''
         UPDATE monthly_progress SET attendance_percentage = ?
         WHERE student_id = ? AND month = ?

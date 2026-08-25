@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/app_role.dart';
 import '../../core/format.dart';
 import '../../core/services.dart';
 import '../../core/theme.dart';
@@ -11,14 +12,16 @@ import '../../widgets/states.dart';
 
 /// Device & Sync.
 ///
-/// One way to sync: both devices sign into the **same Google account** and
-/// leave changes for each other in one small file each. The two studios can be
-/// in different cities and neither has to wait for the other to be online.
+/// One way to sync: every device signs into the **same Google account** and
+/// leaves changes for the others in one small file each. Up to
+/// [CloudSyncManager.maxDevices] devices share an account — the two studio
+/// owners and the attender — and they can be in different cities, because none
+/// of them waits for the others to be online.
 ///
 /// A Bluetooth path used to sit below this as a "same room" fast path. It was
 /// removed deliberately — see `SYNC.md`. It could never satisfy the actual
-/// requirement (the two devices are remote), it doubled the number of code
-/// paths into the merge engine that had to be trusted, and Safari has no Web
+/// requirement (the devices are remote), it doubled the number of code paths
+/// into the merge engine that had to be trusted, and Safari has no Web
 /// Bluetooth so the iPhone could never have used it anyway.
 class DeviceSyncScreen extends StatefulWidget {
   const DeviceSyncScreen({super.key});
@@ -34,7 +37,7 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
   String? _deviceId;
   bool _connected = false;
   String? _account;
-  String? _peer;
+  List<String> _peers = const [];
   String? _lastSync;
   int _pending = 0;
 
@@ -67,13 +70,13 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
   Future<void> _refresh() async {
     final api = context.read<TandavApi>();
     final account = await api.cloudSync.cloudAccount;
-    final peer = await api.cloudSync.cloudPeerId;
+    final peers = await api.cloudSync.knownPeers();
     final last = await api.cloudSync.lastCloudSyncAt;
     final pending = await api.cloudSync.pendingRowCount();
     if (!mounted) return;
     setState(() {
       _account = account;
-      _peer = peer;
+      _peers = peers;
       _lastSync = last;
       _pending = pending;
     });
@@ -110,12 +113,12 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
         backgroundColor: TandavColors.surface,
         title: const Text('Disconnect sync?'),
         content: const Text(
-          'Changes will stop travelling between the two devices until you '
-          'connect the account again. Nothing on this device is deleted, and '
-          'the files already in Drive are left alone.\n\n'
-          'This also forgets which device you sync with, so reconnecting pairs '
-          'with whichever device syncs next and sends it a full copy of this '
-          'device\'s data.',
+          'Changes will stop travelling between your devices until you connect '
+          'the account again. Nothing on this device is deleted, and the files '
+          'already in Drive are left alone.\n\n'
+          'This also forgets which devices you sync with, so reconnecting pairs '
+          'with whichever devices sync next and sends each of them a full copy '
+          'of this device\'s data.',
         ),
         actions: [
           TextButton(
@@ -138,38 +141,50 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
     setState(() {
       _connected = false;
       _account = null;
-      _peer = null;
+      _peers = const [];
     });
   }
 
-  /// Clear the remembered peer so a replacement device can be adopted.
+  /// Clear the remembered peers so replacement devices can be adopted.
   ///
-  /// The peer is adopted silently on the first sync and matched by exact id
+  /// Peers are adopted silently on the first sync and matched by exact id
   /// afterwards, so a phone that was replaced or factory-reset comes back with
   /// a new TANDAV-XXXX and never matches again. Without this button the studio
   /// would be stuck: sync fails, and reinstalling to clear it would wipe the
   /// local database — their only copy.
   ///
+  /// It forgets **all** of them rather than offering a per-device choice. The
+  /// customer pressing this is being told "sync stopped working", not "device
+  /// two of three is stale", and re-adopting a device that is still healthy
+  /// costs one larger upload and nothing else. A picker would be a decision they
+  /// have no way to get right.
+  ///
   /// It also re-offers the whole database, because "already sent" was only ever
-  /// true of the device being forgotten (see [CloudSyncManager.forgetCloudPeer]).
+  /// true of the devices being forgotten (see [CloudSyncManager.forgetCloudPeer]).
   /// The dialog says so: a customer who is told nothing changed except the
   /// pairing has no reason to expect a longer first sync, and no reason to
   /// realise this is also the fix for "the other device is missing everything".
   Future<void> _forgetPeer() async {
-    final peer = _peer;
+    final named = _peers.isEmpty
+        ? 'the other devices'
+        : _peers.join(' and ');
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: TandavColors.surface,
-        title: const Text('Forget the other device?'),
+        title: Text(
+          _peers.length > 1
+              ? 'Forget the other devices?'
+              : 'Forget the other device?',
+        ),
         content: Text(
-          'Tandav will stop waiting for ${peer ?? 'the other device'} and will '
-          'sync with whichever device uses this Google account next. Use this '
-          'if the other phone was replaced, reset, or had Tandav reinstalled.'
+          'Tandav will stop waiting for $named and will sync with whichever '
+          'devices use this Google account next. Use this if a phone was '
+          'replaced, reset, or had Tandav reinstalled.'
           '\n\nThe next sync will then send ALL of this device\'s data, so the '
           'new device gets a complete copy and not just recent changes. That '
           'one sync takes a little longer.'
-          '\n\nNothing is deleted on either device.',
+          '\n\nNothing is deleted on any device.',
         ),
         actions: [
           TextButton(
@@ -193,7 +208,7 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
     Alert.show(
       context,
       problem ??
-          'Forgotten. The next device to sync will be paired, and will receive '
+          'Forgotten. The next devices to sync will be paired, and will receive '
               'a full copy of this device\'s data.',
       isError: problem != null,
     );
@@ -220,13 +235,13 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
         content: const Text(
           'Normally Tandav only sends what changed recently. This makes the '
           "next sync send ALL of this device's data instead.\n\n"
-          'Use it when the other device lost its data — it was replaced, reset, '
+          'Use it when another device lost its data — it was replaced, reset, '
           'or had Tandav reinstalled — and needs a fresh copy.\n\n'
-          'It is safe to use at any time. The other device keeps anything it '
-          'edited more recently and ignores what it already has. The only '
+          'It is safe to use at any time. The other devices keep anything they '
+          'edited more recently and ignore what they already have. The only '
           'difference is that this sync takes a little longer.\n\n'
-          'If the other device came back with a NEW name, use "Forget the '
-          'other device" instead — that does this as well as re-pairing.',
+          'If a device came back with a NEW name, use "Forget the other '
+          'device" instead — that does this as well as re-pairing.',
         ),
         actions: [
           TextButton(
@@ -273,11 +288,46 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
                 const SizedBox(height: 8),
                 const Text(
                   'Each device has its own id. It names the file this device '
-                  'writes in Drive, so the other one can tell your changes '
-                  'apart from its own.',
+                  'writes in Drive, so the others can tell your changes apart '
+                  'from their own.',
                   style: TextStyle(
                     fontSize: 12.5,
                     height: 1.45,
+                    color: TandavColors.textMuted,
+                  ),
+                ),
+                if (roleBadge != null) ...[
+                  const SizedBox(height: 10),
+                  // The attender build looks identical otherwise, and "which
+                  // app is on this phone?" gets asked over the phone during
+                  // support. Saying it here, next to the id, means the answer
+                  // and the id are read out together.
+                  const Text(
+                    'This is the ATTENDER app. It holds attendance and fees '
+                    'only — the rest of the studio\'s records never reach this '
+                    'phone.',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      height: 1.45,
+                      fontWeight: FontWeight.w600,
+                      color: TandavColors.gold,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                // Printed, not just declared. `roleStamp` has to survive the
+                // tree shaker because `tools/verify-apk.ps1` reads that exact
+                // string out of the built APK to tell the owner build from the
+                // attender build before either reaches a phone — and a constant
+                // nothing references is a constant the compiler drops. Rendering
+                // it also makes this screen answer the same question on a phone
+                // that is already in someone's hand.
+                Text(
+                  'Build: $roleLabel · $roleStamp',
+                  style: const TextStyle(
+                    fontSize: 10.5,
+                    height: 1.4,
+                    letterSpacing: 0.3,
                     color: TandavColors.textMuted,
                   ),
                 ),
@@ -297,16 +347,19 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
                   'Tandav syncs on its own — when you open the app, when you '
                   'come back to it, and every few minutes while it is open. '
                   '"Sync now" is only there for when you do not want to wait.\n\n'
-                  'Both devices must use the SAME Google account. Two different '
+                  'Every device must use the SAME Google account. Two different '
                   'accounts are two separate Drives, and nothing can travel '
                   'between them.\n\n'
+                  'Up to three devices can share one account. If a fourth ever '
+                  'appears, Tandav says so and names the file to delete rather '
+                  'than guessing which one to drop.\n\n'
                   'Everything keeps working with no internet at all. Changes '
                   'queue up on this device and go out the next time it can '
                   'reach Drive.\n\n'
-                  'Drive carries CHANGES between the two devices — it is not a '
+                  'Drive carries CHANGES between your devices — it is not a '
                   'backup of your studio. Keep using Backup & Restore for that. '
-                  'If the other device ever loses its data, use "Send '
-                  'everything again" here to rebuild it from this one.',
+                  'If another device ever loses its data, use "Send everything '
+                  'again" here to rebuild it from this one.',
                   style: TextStyle(
                     fontSize: 12.5,
                     height: 1.55,
@@ -355,7 +408,7 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
                         'the iPhone version asks for this once each time you '
                         'open the app.'
                     : 'Not connected. Sign in with the SAME Google account on '
-                        'both devices — changes then travel between them on '
+                        'every device — changes then travel between them on '
                         'their own.',
             style: TextStyle(
               fontSize: 13.5,
@@ -367,7 +420,12 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
           ),
           if (connected) ...[
             const SizedBox(height: 12),
-            _kv('Other device', _peer ?? 'Waiting for its first sync'),
+            _kv(
+              _peers.length > 1 ? 'Other devices' : 'Other device',
+              _peers.isEmpty
+                  ? 'Waiting for their first sync'
+                  : _peers.join(', '),
+            ),
             _kv('Last sync', _ago(_lastSync)),
             _kv(
               'Waiting to send',
@@ -440,14 +498,16 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
                 ),
               ),
             ),
-            if (_peer != null) ...[
+            if (_peers.isNotEmpty) ...[
               const SizedBox(height: 8),
               Center(
                 child: TextButton(
                   onPressed: busy ? null : _forgetPeer,
-                  child: const Text(
-                    'Forget the other device',
-                    style: TextStyle(color: TandavColors.danger),
+                  child: Text(
+                    _peers.length > 1
+                        ? 'Forget the other devices'
+                        : 'Forget the other device',
+                    style: const TextStyle(color: TandavColors.danger),
                   ),
                 ),
               ),

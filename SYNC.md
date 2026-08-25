@@ -1,13 +1,18 @@
-# Tandav — Two-Master-Device Sync
+# Tandav — Multi-Master Device Sync
 
 Tandav is local-first: everything lives in the on-device SQLite database and
-the app works with no internet at all. Two devices run the same database as
-**two equal masters** and keep each other in sync.
+the app works with no internet at all. Up to **three devices** run the same
+database as **equal masters** and keep each other in sync.
 
-There is exactly **one carrier**: a **Google Drive mailbox**. Both devices sign
-into the same Google account and leave one small file each for the other to
-pick up. It works anywhere in the world and needs internet only briefly, when
-it actually syncs.
+There is exactly **one carrier**: a **Google Drive mailbox**. Every device signs
+into the same Google account and leaves one small file for the others to pick
+up. It works anywhere in the world and needs internet only briefly, when it
+actually syncs.
+
+The third device is normally the studio's **attender**, whose build syncs a
+subset of the tables. That scoping is described in `ATTENDER.md`; the merge
+itself does not care how many tables a peer holds, which is why it needed no
+special case here.
 
 ## Why there is only one carrier
 
@@ -129,9 +134,9 @@ flight, a tick does nothing at all.
 ### Pairing over Drive
 
 There is **no 6-digit code**. The shared Google account *is* the trust
-boundary — only someone signed into it can write to the folder. The first peer
-file a device reads is adopted as its pair and stored in `sync_state` under
-`cloud_peer_device_id`.
+boundary — only someone signed into it can write to the folder. Peer files a
+device reads are adopted and stored in `sync_state` under `cloud_peer_device_ids`
+as a comma-separated list, up to `CloudSyncManager.maxPeers` (2) of them.
 
 That key is deliberately **not** `paired_device_id`. That name belonged to the
 deleted Bluetooth transport and may still hold a stale value in any database
@@ -140,26 +145,49 @@ back an old BLE peer id on exactly the devices that have been in the field
 longest. Three now-dead keys may linger for the same reason and are simply
 ignored: `paired_device_id`, `pairing_secret`, `last_sync_at`.
 
-A **third device** is refused, not merged — with two unknown peer files the
-app stops and says so rather than guessing. The message **names the files** and
-how long ago each was written, because "delete one of these in Drive" is the
-remedy and a bare `TANDAV-XXXX` is not something a customer can point at. The
-usual culprit is a leftover bundle from `tools/fake-peer.html`, which is always
-the oldest, so the dates do the choosing for them.
+The **single**-peer key `cloud_peer_device_id` is the previous version of this
+one and is still read, never written: `knownPeers()` folds it into the list so a
+phone that has been syncing since before three devices were supported keeps its
+pairing across the upgrade instead of silently re-adopting.
+
+**Three devices total** (`maxDevices`), so two peers each. A **fourth** is
+refused, not merged — the app stops and says so rather than guessing which of
+four phones to drop. The message **names the files** and how long ago each was
+written, because "delete one of these in Drive" is the remedy and a bare
+`TANDAV-XXXX` is not something a customer can point at. The usual culprit is a
+leftover bundle from `tools/fake-peer.html`, which is always the oldest, so the
+dates do the choosing for them.
+
+Adoption is **all or nothing per sync**: if more strangers are present than there
+are free slots, *none* are adopted. Taking the newest two would be worse than
+failing — it silently picks the studio's sync partners by upload time, and the
+customer would never be told a choice had been made.
+
+The order inside `_run()` is what makes three work: **list → snapshot → upload →
+record delivery → apply**. Listing first means a peer adopted on this run is
+already in the peer set when the outbound delta is computed, so a newcomer gets a
+full bundle on the *same* sync it is discovered, not the next one.
 
 ### Rebuilding a device that lost its data
 
 **The files in Drive are deltas, not backups.** Each one holds only what its
-device has not yet delivered, so once a device has sent everything, its file is
-empty. That is fine while both devices are healthy and fatal when one is not: a
-phone that was wiped, replaced, or reinstalled comes back with an empty
-database, reads the peer's near-empty file, and finds nothing to restore from.
+device has not yet delivered, so once a device has sent everything to everyone,
+its file is empty. That is fine while every device is healthy and fatal when one
+is not: a phone that was wiped, replaced, or reinstalled comes back with an empty
+database, reads the peers' near-empty files, and finds nothing to restore from.
 There is no server to ask instead.
 
+A phone that comes back with a **new** `TANDAV-XXXX` is not in this trouble — it
+is a stranger with no sent mark, which drops the outbound floor to "everything",
+so the others re-offer their whole database on the next sync by themselves. The
+trap is the phone that comes back **with its old device id** (a restored
+`app_settings`, or a database file copied across): the peers still hold marks
+saying it has been told everything, so they send it nothing.
+
 **Settings → Device & Sync → "Send everything again"** is the way out. It calls
-`CloudSyncManager.resendEverything()`, which **deletes every `sent.<table>`
-key** (`SyncEngine.clearSentMarks`) and then syncs, so the next upload is a full
-copy of the local database again.
+`CloudSyncManager.resendEverything()`, which **deletes every sent mark** for
+every peer (`SyncEngine.clearSentMarks`, matching the `sent.` prefix) and then
+syncs, so the next upload is a full copy of the local database again.
 
 Details that are easy to get wrong if this is ever rewritten:
 
@@ -183,25 +211,31 @@ Details that are easy to get wrong if this is ever rewritten:
   only cost is a larger upload. That property is load-bearing: a customer who
   cannot tell whether they need the button must be able to press it anyway.
 
-If the other device came back with a **new** `TANDAV-XXXX`, "Forget the other
-device" is what to press instead — it does the same full re-offer *and* re-pairs
-(see below). Its old file still has to be deleted from the Drive folder, or the
-account holds three files and sync refuses to guess.
+A device that came back with a **new** `TANDAV-XXXX` usually needs **nothing
+pressed at all** now. If a slot is free it is adopted on the next sync, and
+because a peer with no mark drops the outbound floor to "everything", it receives
+the studio's full history on that same run. Its old file should still be deleted
+from the Drive folder — otherwise a dead name holds a slot and the fourth real
+device is the one refused.
 
-### `sent.<table>` is a claim about a **specific** peer
+"Forget the other device" is for the case that cannot fix itself: **every** slot
+held by devices that will never write again. It clears the peers and their marks,
+so the next sync adopts whoever is actually there and re-offers everything.
+
+### `sent.<peerId>.<table>` is a claim about **one named peer**
 
 This is the single easiest thing to get wrong in this file, and getting it wrong
 loses data silently.
 
-`sent.<table>` does **not** mean "we uploaded this". It means **"the peer we are
-paired with already holds everything up to this timestamp"** — which is why
-`markDeltaSent` may only run after a *confirmed* write. The claim is about one
-named device. **So anything that clears `cloud_peer_device_id` must clear the
-sent marks in the same transaction**, because the next device to be adopted is a
-different device and it holds nothing.
+A sent mark does **not** mean "we uploaded this". It means **"that specific
+device already holds everything up to this timestamp"** — which is why
+`markDeltaSent` may only run after a *confirmed* write, and why the peer id is
+part of the key. **So anything that forgets a peer must clear that peer's marks
+in the same transaction**, because the next device adopted is a different device
+and it holds nothing.
 
-Both places that forget a peer now do this: `forgetCloudPeer()` and
-`disconnect()`. When only the first half was done, the failure looked like this:
+Both places that forget a peer do this: `forgetCloudPeer()` and `disconnect()`.
+When only the first half was done, the failure looked like this:
 
 - the replacement device was adopted normally;
 - **both** devices reported a successful sync;
@@ -217,6 +251,33 @@ The consequence for the UI is that **"Forget the other device" implies "Send
 everything again"**, so the customer no longer has to know to press the second
 button. Its dialog says the next sync will be a full copy and will take longer,
 which is the only visible difference.
+
+#### Why the mark is per peer, and what the floor is
+
+One file serves every reader, so the bundle has to satisfy **whoever is furthest
+behind**. `computeOutbound` therefore takes the **minimum** mark across the
+current peers, and:
+
+- **a peer with no mark drops the floor to "send everything"** — which is exactly
+  what makes a device joining an established studio receive its whole history;
+- **an empty peer set also means "send everything"**, and `markDeltaSent` with no
+  peers is a **no-op**. Nothing has been delivered to nobody. The single-mark
+  version got this wrong in a way that cost data: a first phone used for a week
+  alone marked its rows delivered, then overwrote its own file with an empty
+  delta, and the second phone arrived to an empty mailbox and a first phone
+  insisting it had already sent everything.
+
+`pendingRowCount()` follows the same rule, so a device with no peer yet honestly
+reports its **whole database** as pending rather than zero. That is not a bug to
+tidy away: nothing has been delivered, and the count is the answer to "what would
+the next sync send".
+
+One limitation stands, documented rather than fixed: marks advance on a
+**confirmed upload**, not a confirmed *read*. If a peer is offline across two of
+our uploads, the second overwrites the first and the peer never sees the rows
+that were only in the first — unless a later edit or **Send everything again**
+re-offers them. Closing it properly needs an `ack` field in the bundle plus
+per-peer received marks.
 
 ### One-time developer setup (do this once, ever)
 
@@ -249,6 +310,11 @@ All nine business tables, in dependency order (parents before children):
 
 `batches → students → attendance → monthly_attendance → fees →
 fee_payments → events → event_participations → monthly_progress`
+
+On the **attender's build** that list stops after `fee_payments`: the last three
+are filtered out of both the outbound delta and anything inbound, so his phone
+neither sends nor stores them. The six he keeps are foreign-key closed, so the
+short list is still a valid database. See `ATTENDER.md`.
 
 Never synced: `users` and `app_settings`, and the `sync_state` table itself
 (except through the manager). This matters for more than tidiness — the bundle
@@ -298,9 +364,10 @@ backups as secrets.)
 
 ## Tests
 
-Both test files simulate two devices by re-opening the database singleton
-against two different SQLite files, so a full two-master exchange is provable
-on one laptop with **no phones, no network and no Google account**.
+Both test files simulate several devices by re-opening the database singleton
+against different SQLite files, so a full three-master exchange — including the
+attender's restricted build — is provable on one laptop with **no phones, no
+network and no Google account**.
 
 `test/sync_engine_test.dart` (merge engine):
 
@@ -318,7 +385,11 @@ on one laptop with **no phones, no network and no Google account**.
   the snapshot-before-apply ordering; it fails if the order is ever reversed,
 - LWW when the same student is edited on both devices,
 - tombstones propagate through the mailbox,
-- a third device is refused instead of merged,
+- **three devices share the account and a fourth is refused** — two owners plus
+  the attender fill the cap, and the extra one is named rather than merged,
+- **the attender build never puts owner-only rows in the mailbox** — `events`,
+  `event_participations` and `monthly_progress` are filtered out even when they
+  are somehow present in the local database (see `ATTENDER.md`),
 - a **failed upload changes nothing locally** and the retry resends the same
   rows,
 - a damaged / half-uploaded file fails cleanly and applies nothing,
@@ -340,29 +411,38 @@ flutter test
 
 ## Remaining manual validation
 
-1. Complete the one-time Cloud Console setup above, then install the *same
-   release-signed* APK on both phones. **Install over the top**
-   (`adb install -r`, which is what `ship.ps1` does) — never uninstall first,
-   because uninstalling erases the studio's only copy of its data.
-2. Sign both into the **same** Google account from Settings → Device & Sync →
-   Connect Google Drive. Confirm the account email shows on both.
+1. Complete the one-time Cloud Console setup above, then build both roles with
+   `.\ship.ps1 -Both` and install the *same release-signed* APK on each phone —
+   `Tandav-Owner-*` on the two owner phones, `Tandav-Attendance-*` on the
+   attender's. **Install over the top** (`adb install -r`, which is what
+   `ship.ps1` does) — never uninstall first, because uninstalling erases the
+   studio's only copy of its data.
+2. Sign all three into the **same** Google account from Settings → Device &
+   Sync → Connect Google Drive. Confirm the account email shows on each.
 3. Add a student on A → Sync now. On B → Sync now → the student appears.
-4. Airplane mode **on**, edit on both phones, airplane mode **off**, sync
+4. Airplane mode **on**, edit on both owner phones, airplane mode **off**, sync
    both → both databases match and nothing was lost.
 5. Kill Wi-Fi mid-upload; confirm the error is friendly and the next sync
    recovers with no duplicates.
-6. Leave the app open on both phones for ~10 minutes with no taps, and confirm
-   an edit on A reaches B on its own (the foreground timer).
-7. Check the Drive folder holds exactly **two** `tandav-*.json` files.
-8. Connect a third device and verify it is refused, not merged.
-9. **Recovery.** On phone B, uninstall Tandav (the one time doing that is
-   correct) and reinstall, so it comes back empty with a new id. Delete B's old
-   `tandav-*.json` from the Drive folder. On phone A tap **Forget the other
-   device**, then **Send everything again**, then sync B — B must come back with
-   the full studio. Then tap **Send everything again** on a healthy pair and
-   confirm nothing duplicates.
+6. Leave the app open on both owner phones for ~10 minutes with no taps, and
+   confirm an edit on A reaches B on its own (the foreground timer).
+7. Check the Drive folder holds exactly **three** `tandav-*.json` files.
+8. Connect a **fourth** device and verify it is refused, not merged, and that
+   the message names the files it can see.
+9. **The attender's phone.** Mark attendance and toggle a fee on it → sync →
+   both changes reach the owners. Create an **event** on an owner phone, sync
+   everything, then confirm the attender's phone still has no events (Settings →
+   Device & Sync shows it synced, and no event screen exists there). Verify the
+   Fees tab on his build shows the register and the paid/partial/due counts but
+   **no Expected / Collected / Pending money row**.
+10. **Recovery.** On phone B, uninstall Tandav (the one time doing that is
+    correct) and reinstall, so it comes back empty with a new id. Delete B's old
+    `tandav-*.json` from the Drive folder. Sync B — a free slot plus no sent mark
+    should hand it the full studio with nothing pressed on A. If B came back with
+    its **old** id instead, tap **Send everything again** on A. Then tap **Send
+    everything again** on a healthy account and confirm nothing duplicates.
 
 **iPhone**
 
-10. Build the PWA, host it, and confirm a shared OAuth **Web** client can see
+11. Build the PWA, host it, and confirm a shared OAuth **Web** client can see
     the Android-created files (see the iPhone note above).

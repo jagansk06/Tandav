@@ -20,6 +20,7 @@ import '../sync/drive_mailbox.dart';
 import '../sync/sync_engine.dart';
 import '../sync/sync_mailbox.dart';
 import '../sync/sync_state.dart';
+import 'app_role.dart';
 
 /// Tandav local data service.
 ///
@@ -47,16 +48,24 @@ class TandavApi {
 
   // ---- Sync ----
   late final SyncState syncState = SyncState(db);
-  late final SyncEngine syncEngine = SyncEngine(db, syncState);
 
-  /// Where the two devices leave files for each other. Built lazily so tests
-  /// can inject a fake and never construct a Google client.
+  /// The merge engine, scoped to the tables **this build** is allowed to hold.
+  ///
+  /// [syncTables] is passed explicitly even though the engine defaults to it,
+  /// because this is the one line in the app where the attender build's data
+  /// boundary is actually established. An implicit default here would make the
+  /// most security-relevant decision in the codebase invisible at its call site.
+  late final SyncEngine syncEngine =
+      SyncEngine(db, syncState, tables: syncTables);
+
+  /// Where the studio's devices leave files for each other. Built lazily so
+  /// tests can inject a fake and never construct a Google client.
   late final SyncMailbox mailbox = _mailbox ?? DriveMailbox();
 
   /// The one and only sync path: a shared Google Drive account acting as a
   /// store-and-forward mailbox. A Bluetooth transport used to sit alongside
-  /// this; it was removed because the two masters are in different places, so
-  /// it could never carry the everyday case.
+  /// this; it was removed because the masters are in different places, so it
+  /// could never carry the everyday case.
   late final CloudSyncManager cloudSync = CloudSyncManager(
     db: db,
     state: syncState,

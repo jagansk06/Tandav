@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/app_role.dart';
 import '../../core/format.dart';
 import '../../core/services.dart';
 import '../../core/theme.dart';
@@ -315,34 +316,45 @@ class _FeesScreenState extends State<FeesScreen> {
         padding: const EdgeInsets.all(14),
         child: Column(
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: _sum('Expected',
-                      Fmt.money(double.tryParse(s.totalDue) ?? 0)),
-                ),
-                Expanded(
-                  child:
-                      _sum('Collected', Fmt.money(double.tryParse(s.totalPaid) ?? 0)),
-                ),
-                Expanded(
-                  child: _sum('Pending',
-                      Fmt.money(double.tryParse(s.outstanding) ?? 0),
-                      color: TandavColors.danger),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: LinearProgressIndicator(
-                value: (pct / 100).clamp(0, 1),
-                minHeight: 8,
-                backgroundColor: TandavColors.surfaceBorder,
-                valueColor: const AlwaysStoppedAnimation(TandavColors.gold),
+            // The month's expected, collected and outstanding money — the
+            // studio's takings in three numbers. Withheld from the attender
+            // build for the same reason the Dashboard and Monthly Reports are:
+            // his job is recording what each student owes and has paid, one
+            // student at a time, and the register below gives him exactly that.
+            // The totals are the owners' business.
+            //
+            // The counts row survives on both builds. "5 due" is how he knows
+            // there is still work in this month; it says nothing about revenue.
+            if (!isAttenderBuild) ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: _sum('Expected',
+                        Fmt.money(double.tryParse(s.totalDue) ?? 0)),
+                  ),
+                  Expanded(
+                    child:
+                        _sum('Collected', Fmt.money(double.tryParse(s.totalPaid) ?? 0)),
+                  ),
+                  Expanded(
+                    child: _sum('Pending',
+                        Fmt.money(double.tryParse(s.outstanding) ?? 0),
+                        color: TandavColors.danger),
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(height: 6),
+              const SizedBox(height: 8),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: (pct / 100).clamp(0, 1),
+                  minHeight: 8,
+                  backgroundColor: TandavColors.surfaceBorder,
+                  valueColor: const AlwaysStoppedAnimation(TandavColors.gold),
+                ),
+              ),
+              const SizedBox(height: 6),
+            ],
             Row(
               children: [
                 Text(
@@ -352,14 +364,15 @@ class _FeesScreenState extends State<FeesScreen> {
                       fontSize: 12, color: TandavColors.textSecondary),
                 ),
                 const Spacer(),
-                Text(
-                  '${pct.toStringAsFixed(1)}% collected',
-                  style: const TextStyle(
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w800,
-                    color: TandavColors.gold,
+                if (!isAttenderBuild)
+                  Text(
+                    '${pct.toStringAsFixed(1)}% collected',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w800,
+                      color: TandavColors.gold,
+                    ),
                   ),
-                ),
               ],
             ),
           ],

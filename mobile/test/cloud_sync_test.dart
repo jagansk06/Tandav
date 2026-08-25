@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'package:tandav_mobile/core/app_role.dart';
 import 'package:tandav_mobile/database/tandav_database.dart';
 import 'package:tandav_mobile/sync/cloud_sync.dart';
 import 'package:tandav_mobile/sync/sync_bundle.dart';
@@ -129,9 +130,13 @@ void main() {
   });
 
   /// Switch to a device: re-point the database singleton at that device's file
-  /// and rebuild the sync stack around it. Both devices share one [mailbox],
-  /// exactly as two phones share one Drive account.
-  Future<void> device(String name, {Duration? syncTimeout}) async {
+  /// and rebuild the sync stack around it. Every device shares one [mailbox],
+  /// exactly as the studio's phones share one Drive account.
+  ///
+  /// [tables] scopes the engine the way `TANDAV_ROLE` does in a real build —
+  /// pass `syncTablesFor(AppRole.attendance)` to stand up the attender's APK.
+  Future<void> device(String name,
+      {Duration? syncTimeout, List<String>? tables}) async {
     await TandavDatabase.instance.close();
     final db = TandavDatabase.instance;
     db.configureForTest(
@@ -143,7 +148,7 @@ void main() {
     cloud = CloudSyncManager(
       db: db,
       state: state,
-      engine: SyncEngine(db, state),
+      engine: SyncEngine(db, state, tables: tables),
       mailbox: mailbox,
       syncTimeout: syncTimeout ?? const Duration(seconds: 90),
     );
@@ -200,6 +205,21 @@ void main() {
       'photo_url': null,
       'notes': null,
       ...stamp.columns(),
+    });
+  }
+
+  /// A row from a table the attender's build must never hold or forward.
+  Future<int> seedEvent(String name, {int? batchId}) async {
+    final d = await open();
+    return d.insert('events', {
+      'name': name,
+      'description': null,
+      'event_type': 'annual_day',
+      'event_date': '2026-12-20',
+      'location': null,
+      'batch_id': batchId,
+      'is_active': 1,
+      ...SyncStamp.now(TandavDatabase.instance).columns(),
     });
   }
 
@@ -385,7 +405,7 @@ void main() {
     expect(rows, hasLength(1), reason: 'tombstone row must be kept');
   });
 
-  test('a third device is refused instead of merged', () async {
+  test('three devices share the account and a fourth is refused', () async {
     await device('a');
     final aId = me();
     await seedBatch('Morning');
@@ -395,29 +415,87 @@ void main() {
     await cloud.syncNow();
     expect(await cloud.cloudPeerId, aId);
 
-    // Someone installs Tandav on a third phone and signs into the same
-    // account. Two masters is the documented limit.
+    // The attender's phone signs in. Three devices is the shape the studio
+    // actually bought — two owners and the attender — so this must be adopted,
+    // not refused. The two-device build turned this file away.
     mailbox.plant('TANDAV-9ZZZ', SyncBundle.encode(
       deviceId: 'TANDAV-9ZZZ',
       delta: SyncDelta(),
     ));
+    final three = await cloud.syncNow();
+    expect(three.ok, isTrue, reason: three.message);
+    expect(three.peerDeviceIds, containsAll(<String>[aId, 'TANDAV-9ZZZ']));
+    expect(await cloud.knownPeers(), hasLength(CloudSyncManager.maxPeers));
+    // One name is still exposed for the screens that show a single "other
+    // device", and it stays the first device adopted rather than shuffling.
+    expect(three.peerDeviceId, aId);
 
-    // The known pair still syncs fine — the stranger is simply not chosen.
-    final ok = await cloud.syncNow();
-    expect(ok.ok, isTrue);
-    expect(ok.peerDeviceId, aId);
+    // A fourth signs into the same account. B's slots are full, so the newcomer
+    // is ignored rather than swapped in: the devices B already knows keep
+    // syncing normally while the extra one is sorted out.
+    mailbox.plant('TANDAV-7YYY', SyncBundle.encode(
+      deviceId: 'TANDAV-7YYY',
+      delta: SyncDelta(),
+    ));
+    final ignored = await cloud.syncNow();
+    expect(ignored.ok, isTrue, reason: ignored.message);
+    expect(ignored.peerDeviceIds, isNot(contains('TANDAV-7YYY')));
+    expect(await cloud.knownPeers(), hasLength(CloudSyncManager.maxPeers));
 
-    // A brand-new device cannot tell which of the two is its partner, so it
+    // A brand-new device cannot tell which of the four are its partners, so it
     // refuses rather than guessing — and names the FILES, because "delete one
     // of these in Drive" is the remedy and a bare TANDAV-XXXX is not something
     // the customer can point at in a folder listing.
-    await device('c');
+    await device('d');
     final fresh = await cloud.syncNow();
     expect(fresh.ok, isFalse);
-    expect(fresh.message, contains('more than one other device'));
+    expect(fresh.message, contains('4 other devices'));
     expect(fresh.message, contains('Tandav Sync'));
     expect(fresh.message, contains(SyncMailbox.fileNameFor('TANDAV-9ZZZ')));
+    expect(fresh.message, contains(SyncMailbox.fileNameFor('TANDAV-7YYY')));
     expect(fresh.message, contains(SyncMailbox.fileNameFor(aId)));
+  });
+
+  test('the attender build never puts owner-only rows in the mailbox', () async {
+    // The engine tests prove the scope filter; this proves it holds on the
+    // artifact that actually leaves the phone. A bundle is a plain JSON file in
+    // someone's Drive, so "the attender does not hold events" has to be true of
+    // the file, not only of the screens.
+    await device('owner');
+    final ownerId = me();
+    final batchId = await seedBatch('Morning');
+    await seedStudent('Ravi', batchId: batchId);
+    await seedEvent('Annual Day', batchId: batchId);
+    await cloud.syncNow();
+    final ownerFile = SyncMailbox.fileNameFor(ownerId);
+    expect(SyncBundle.decode(mailbox.files[ownerFile]!).tables.keys,
+        contains('events'),
+        reason: 'the owner build does send events — otherwise this proves '
+            'nothing');
+
+    await device('attender', tables: syncTablesFor(AppRole.attendance));
+    final attenderId = me();
+    final joined = await cloud.syncNow();
+    expect(joined.ok, isTrue, reason: joined.message);
+    expect(joined.applied, 2, reason: 'the batch and the student, not the event');
+    final d = await open();
+    expect(await d.query('events'), isEmpty,
+        reason: "the owner's bundle carried an event and it was skipped");
+    expect(await findStudent('Ravi'), isNotNull);
+
+    // And the send half, with a row planted straight into SQLite because
+    // nothing in this build can create one. Even a row that arrived some other
+    // way — a restored file, a hand-edited database — is not forwarded.
+    await seedEvent('Should never leave');
+    final second = await cloud.syncNow();
+    expect(second.ok, isTrue, reason: second.message);
+    expect(
+      SyncBundle.decode(mailbox.files[SyncMailbox.fileNameFor(attenderId)]!)
+          .tables
+          .keys,
+      isNot(contains('events')),
+    );
+    expect(await cloud.pendingByTable(), isNot(contains('events')));
   });
 
   test('a failed upload changes nothing locally', () async {
@@ -446,6 +524,14 @@ void main() {
     expect(before, 2);
 
     // B's pair uploaded a truncated file (killed app, dropped connection…).
+    //
+    // Seeded through the singular `kCloudPeerId` on purpose. That is the key
+    // written by every build before three devices were supported, so a phone
+    // upgrading today still has it and nothing else. Reading it back proves
+    // `knownPeers()` folds the legacy key into the list instead of treating an
+    // established peer as a stranger — which would have made the first sync
+    // after an update either re-adopt or refuse the phone it had been syncing
+    // with all along.
     mailbox.plant('TANDAV-8QQQ', '{ this is not json');
     await SyncState(TandavDatabase.instance)
         .write(CloudSyncManager.kCloudPeerId, 'TANDAV-8QQQ');
@@ -533,22 +619,37 @@ void main() {
     expect(await findStudent('Second-Edit-On-A'), isNotNull);
   });
 
-  test('a replaced phone can be adopted after forgetting the old one', () async {
-    // The scenario this guards: one of the two studios loses or factory-resets
-    // its phone. Tandav comes back with a brand-new TANDAV-XXXX, so the id the
-    // surviving phone remembers will never appear again. Before the fix that
-    // was terminal — the peer id was adopted silently, matched by exact id, and
-    // nothing in the app could clear it. The only "fix" available to the
-    // customer was reinstalling, which erases the local database and with it
-    // their only copy of the data.
+  test('a replaced phone is adopted into a free slot and gets the history',
+      () async {
+    // The scenario this guards: one of the studios loses or factory-resets its
+    // phone. Tandav comes back with a brand-new TANDAV-XXXX, so the id the
+    // surviving phone remembers will never appear again. With a slot free the
+    // newcomer is simply adopted, and the *per-peer* delivered marks are what
+    // make that safe: the surviving phone has no mark for a device it has never
+    // met, so its floor drops to "everything" and the studio's history goes out
+    // on that very first sync.
+    //
+    // The two-device build got this wrong in the worst available way. One mark
+    // per table meant "already delivered" was a claim about the *old* phone, so
+    // the replacement was adopted, both devices reported a clean sync, and only
+    // rows edited from that moment onwards ever reached it. Nothing on screen
+    // said so, and the two symptoms it produces ("the phone is not sending" and
+    // "the iPhone is not sending") look like two faults and are one.
     await device('a');
     final aId = me();
     await seedBatch('Morning');
     await cloud.syncNow();
 
     await device('b');
-    await cloud.syncNow();
+    await cloud.syncNow(); // adopts A, learns Morning
     expect(await cloud.cloudPeerId, aId);
+    await tick();
+    await seedStudent('Ravi');
+    await cloud.syncNow(); // B delivers Morning + Ravi to A
+    await cloud.syncNow(); // …and B's own file drains to empty
+    final bFile = SyncMailbox.fileNameFor(me());
+    expect(await cloud.pendingRowCount(), 0);
+    expect(SyncBundle.decode(mailbox.files[bFile]!).rowCount, 0);
 
     // Phone A is gone for good: its bundle is removed from the account, and a
     // replacement phone signs in and syncs under a different id.
@@ -558,19 +659,89 @@ void main() {
     final cId = me();
     expect(cId, isNot(aId));
     await seedBatch('Evening');
+    final blank = await cloud.syncNow();
+    expect(blank.ok, isTrue, reason: blank.message);
+    expect(blank.applied, 0,
+        reason: 'a drained delta holds no copy of anything — which is why the '
+            'floor, not the file, has to do the work below');
+
+    await device('b');
+    final adopted = await cloud.syncNow();
+    expect(adopted.ok, isTrue, reason: adopted.message);
+    expect(adopted.peerDeviceIds, contains(cId));
+    expect(adopted.sent, 2,
+        reason: 'C holds nothing, so the floor drops back to "everything" even '
+            'though A was fully caught up');
+    // The dead id is still remembered. It costs a slot, and "Forget the other
+    // device" is how that slot comes back, but it no longer blocks anything.
+    expect(await cloud.knownPeers(), containsAll(<String>[aId, cId]));
+
+    final onB = await open();
+    expect(
+      await onB.query('batches', where: 'name = ?', whereArgs: ['Evening']),
+      hasLength(1),
+      reason: "the replacement phone's records never arrived",
+    );
+
+    await device('c');
+    final backfilled = await cloud.syncNow();
+    expect(backfilled.ok, isTrue, reason: backfilled.message);
+    expect(await findStudent('Ravi'), isNotNull);
+    final onC = await open();
+    expect(
+      await onC.query('batches', where: 'name = ?', whereArgs: ['Morning']),
+      hasLength(1),
+      reason: 'a per-table sent mark claimed the new device already had this',
+    );
+  });
+
+  test('peers that have all vanished are recoverable by forgetting them',
+      () async {
+    // The remaining stuck state, now that a replacement fits in a spare slot:
+    // every slot is held by a device that will never write again. Then there is
+    // nowhere to put the newcomer, and the app must say which devices it is
+    // waiting for and what to press — not blame device count, which is both
+    // untrue and unactionable.
+    await device('a');
+    final aId = me();
+    await seedBatch('Morning');
     await cloud.syncNow();
 
-    // B still expects A, which will never be back. The failure must name the
-    // missing device and point at the remedy rather than blaming device count.
+    await device('b');
+    await cloud.syncNow();
+    mailbox.plant('TANDAV-9ZZZ', SyncBundle.encode(
+      deviceId: 'TANDAV-9ZZZ',
+      delta: SyncDelta(),
+    ));
+    await cloud.syncNow(); // fills B's second slot, delivering Morning to both
+    await cloud.syncNow(); // …and drains B's file
+    expect(await cloud.knownPeers(), hasLength(CloudSyncManager.maxPeers));
+    expect(await cloud.pendingRowCount(), 0);
+
+    // Both are gone: one phone replaced, and the other file was a leftover from
+    // tools/fake-peer.html that somebody finally deleted.
+    for (final id in [aId, 'TANDAV-9ZZZ']) {
+      mailbox.files.remove(SyncMailbox.fileNameFor(id));
+      mailbox.times.remove(SyncMailbox.fileNameFor(id));
+    }
+
+    await device('c');
+    final cId = me();
+    await seedBatch('Evening');
+    await cloud.syncNow();
+
     await device('b');
     final stuck = await cloud.syncNow();
     expect(stuck.ok, isFalse);
     expect(stuck.message, contains(aId));
+    expect(stuck.message, contains('TANDAV-9ZZZ'));
+    expect(stuck.message, contains(cId));
     expect(stuck.message, contains('Forget the other device'));
 
     // The escape hatch, as the sync screen invokes it.
     expect(await cloud.forgetCloudPeer(), isNull);
     expect(await cloud.cloudPeerId, isNull);
+    expect(await cloud.knownPeers(), isEmpty);
 
     final recovered = await cloud.syncNow();
     expect(recovered.ok, isTrue, reason: recovered.message);
@@ -579,16 +750,17 @@ void main() {
 
     // And real data actually flows from the replacement phone.
     final d = await open();
-    final batches = await d.query('batches', where: 'name = ?',
-        whereArgs: ['Evening']);
-    expect(batches, hasLength(1),
-        reason: 'the replacement phone\'s records never arrived');
+    expect(
+      await d.query('batches', where: 'name = ?', whereArgs: ['Evening']),
+      hasLength(1),
+      reason: "the replacement phone's records never arrived",
+    );
 
-    // The other direction is the half that was silently broken. B had already
-    // delivered 'Morning' to A, so its sent marks covered that row — and the
-    // replacement phone C has never seen it. Forgetting the peer has to
-    // invalidate those marks, or the studio's whole history stays on B forever
-    // while both devices report a clean sync.
+    // The other direction is the half that was silently broken. B had delivered
+    // 'Morning' to both of the devices it knew, so its marks covered that row —
+    // and C has never seen it. Forgetting the peers has to invalidate those
+    // marks, or the studio's whole history stays on B forever while both
+    // devices report a clean sync.
     await device('c');
     final backfilled = await cloud.syncNow();
     expect(backfilled.ok, isTrue, reason: backfilled.message);
@@ -596,7 +768,7 @@ void main() {
     expect(
       await onC.query('batches', where: 'name = ?', whereArgs: ['Morning']),
       hasLength(1),
-      reason: 'forgetting the peer left the sent marks claiming the NEW device '
+      reason: 'forgetting the peers left the sent marks claiming the NEW device '
           'already had these rows, so they were never offered to it',
     );
   });
@@ -632,11 +804,11 @@ void main() {
   });
 
   test('forgetting the peer re-offers the whole database', () async {
-    // The bug this pins, found on real hardware: `sent.<table>` does not mean
-    // "uploaded", it means "the peer already holds this". Forgetting the peer
-    // makes that false, so keeping the marks meant the replacement device was
-    // adopted, both devices reported a clean sync, and the studio's history was
-    // never offered to the new one. Nothing on screen said so.
+    // The bug this pins, found on real hardware: `sent.<peerId>.<table>` does
+    // not mean "uploaded", it means "that peer already holds this". Forgetting
+    // the peer makes that false, so keeping the marks meant the replacement
+    // device was adopted, both devices reported a clean sync, and the studio's
+    // history was never offered to the new one. Nothing on screen said so.
     await device('a');
     await seedBatch('Morning');
     await seedStudent('Ravi');
@@ -648,9 +820,14 @@ void main() {
         reason: 'B holds these rows and re-offers them until A confirms — the '
             'echo is expected, and A discards it as unchanged');
 
+    // A syncs again, now that B has left a file behind: that is the run where A
+    // adopts B and its marks start meaning something. Before a peer exists there
+    // is nobody to have delivered anything to, and pending correctly reports the
+    // whole database.
     await device('a');
+    await cloud.syncNow();
     expect(await cloud.pendingRowCount(), 0,
-        reason: 'A delivered both rows, so its marks cover them');
+        reason: 'A delivered both rows to B, so its marks cover them');
 
     expect(await cloud.forgetCloudPeer(), isNull);
     expect(await cloud.cloudPeerId, isNull);
@@ -666,9 +843,10 @@ void main() {
     await device('a', syncTimeout: const Duration(milliseconds: 50));
     await seedBatch('Morning');
 
-    // The upload succeeds; it is the folder listing that never comes back —
-    // a hung request rather than a failing one, which is the case with no
-    // natural error to catch.
+    // The folder listing never comes back — a hung request rather than a
+    // failing one, which is the case with no natural error to catch. It is also
+    // the earliest thing a run does now that peers are settled before the
+    // snapshot, so this stalls with nothing uploaded and nothing marked.
     mailbox.hangOnList = true;
 
     final seen = <CloudSyncStatus>[];
@@ -677,12 +855,13 @@ void main() {
     // `status` is a broadcast controller, so emits are delivered a turn later.
     // The terminal `failed` emit happens as syncNow returns, so without
     // yielding here it is still queued when the subscription is cancelled and
-    // the assertion below reads the stale `downloading` phase instead.
+    // the assertion below reads the stale `connecting` phase instead.
     await Future<void>.delayed(Duration.zero);
     await sub.cancel();
 
     expect(result.ok, isFalse);
     expect(result.message, contains('timed out'));
+    expect(mailbox.files, isEmpty, reason: 'the run never reached the upload');
 
     // This is the assertion that matters. device_sync_screen disables its Sync
     // button whenever the last emitted phase is a busy one, so without a
@@ -732,9 +911,11 @@ void main() {
     final bId = me();
     expect((await cloud.syncNow()).applied, 3);
 
-    // A syncs once more with nothing new, which is what leaves the account
-    // holding no copy of anything.
+    // A syncs twice more: the first run adopts B and hands the three rows over,
+    // the second finds nothing left to say. That second, empty upload is what
+    // leaves the account holding no copy of anything.
     await device('a');
+    await cloud.syncNow();
     await cloud.syncNow();
     final own = SyncMailbox.fileNameFor(aId);
     expect(
@@ -827,6 +1008,13 @@ void main() {
     await device('a');
     await seedBatch('Morning');
     await seedStudent('Ravi');
+    // A peer has to exist for "delivered" to mean anything: a sent mark is a
+    // claim about one named device, so with nobody in the account the engine
+    // correctly reports the whole database as still pending.
+    mailbox.plant('TANDAV-9ZZZ', SyncBundle.encode(
+      deviceId: 'TANDAV-9ZZZ',
+      delta: SyncDelta(),
+    ));
     expect((await cloud.syncNow()).sent, 2);
     expect(await cloud.pendingRowCount(), 0);
 

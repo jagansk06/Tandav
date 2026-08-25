@@ -61,6 +61,23 @@ class SyncState {
     }
   }
 
+  /// Delete every key beginning with [prefix]; returns how many rows went.
+  ///
+  /// Exists so [SyncEngine.clearSentMarks] can wipe the per-peer sent marks
+  /// without knowing the peer ids — which is the whole point, since the reason
+  /// to clear them is usually that a peer id is stale or forgotten. `LIKE` with
+  /// an escaped prefix, not string interpolation, so a peer id can never smuggle
+  /// a wildcard or a quote into the pattern.
+  Future<int> deleteWithPrefix(SyncExecutor ex, String prefix) async {
+    final escaped =
+        prefix.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
+    return ex.delete(
+      'sync_state',
+      where: "key LIKE ? ESCAPE '\\'",
+      whereArgs: ['$escaped%'],
+    );
+  }
+
   String get deviceId => db.deviceId;
 
   // NOTE: the per-table sync marks deliberately live in SyncEngine
@@ -68,5 +85,5 @@ class SyncState {
   // inside the same transaction as the rows they describe. Convenience getters
   // used to sit here and invited the assumption that one mark governs both
   // directions, which cost us a data-loss bug; there are two marks and only
-  // `sent.<table>` may gate what we transmit.
+  // `sent.<peerId>.<table>` may gate what we transmit.
 }

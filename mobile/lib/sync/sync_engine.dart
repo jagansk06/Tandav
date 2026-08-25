@@ -1,5 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 
+import '../core/app_role.dart';
 import '../database/tandav_database.dart';
 import 'sync_codec.dart';
 import 'sync_state.dart';
@@ -36,31 +37,55 @@ class SyncApplyResult {
 /// The incremental, conflict-resolving merge engine.
 ///
 /// Strategy:
-/// - **Incremental** – every table keeps TWO independent per-table marks, and
-///   conflating them was a data-loss bug, so keep them apart:
-///     * `sent.<table>` – the newest `updated_at` we have actually **delivered**
-///       to the peer. This, and only this, decides what [computeOutbound]
-///       sends. It is advanced by [markDeltaSent] after a *confirmed* send.
-///     * `watermark.<table>` – the newest `updated_at` we have **received** from
-///       the peer. Bookkeeping/diagnostics only.
+/// - **Incremental** – every table keeps TWO independent marks, and conflating
+///   them was a data-loss bug, so keep them apart:
+///     * `sent.<peerId>.<table>` – the newest `updated_at` we have actually
+///       **delivered** to *that specific peer*. This, and only this, decides
+///       what [computeOutbound] sends. It is advanced by [markDeltaSent] after a
+///       *confirmed* send.
+///     * `watermark.<table>` – the newest `updated_at` we have **received**.
+///       Bookkeeping/diagnostics only.
 ///   Filtering our own outbound rows by the *received* mark is wrong: the
 ///   peer's timestamps say nothing about which of OUR rows the peer has seen.
 ///   If the peer's clock ran even a minute ahead, every local edit we made in
 ///   that minute sorted below the mark and became permanently unsendable.
+///
+///   The sent mark is keyed **per peer** because it is a claim about one
+///   device's contents, not about our upload history. With a third device in the
+///   account a single `sent.<table>` was actively wrong: the two owner phones
+///   would have advanced it months before the attender's phone existed, so the
+///   newcomer's first sync would find our file nearly empty and it would never
+///   receive the studio's history — a silent hole, reported as a clean sync on
+///   both sides. Per-peer marks make the newcomer's absent mark mean what it
+///   should: "this device holds nothing, send it everything."
 /// - **Conflict resolution** – last-write-wins by `updated_at` (UTC ISO-8601).
 ///   On equal timestamps the lexicographically higher `device_id` wins
-///   (deterministic and stable across both devices).
+///   (deterministic and stable across all devices).
 /// - **Identity** – every record carries a stable `sync_uuid`; local integer
 ///   ids differ per device and are re-mapped on merge via FK->uuid resolution.
 /// - **Deletions** – records are soft-deleted (tombstoned with `deleted_at`),
-///   so a deletion reaches the peer instead of vanishing permanently.
+///   so a deletion reaches the peers instead of vanishing permanently.
 /// - **Atomicity** – all inbound rows for all tables are applied inside one
 ///   transaction with the watermark advances; a failure rolls everything back
 ///   and the local database is never left half-updated.
+/// - **Scope** – [tables] is the set of tables this build participates in. The
+///   attender's APK carries a strict subset, and because every loop here
+///   iterates [tables] rather than [SyncCodec.applyOrder], rows outside it are
+///   neither sent nor stored. See [syncTables].
 class SyncEngine {
   final TandavDatabase db;
   final SyncState state;
-  SyncEngine(this.db, this.state);
+
+  /// Tables this build syncs, in parent-before-child order.
+  ///
+  /// Defaults to the build's role scope rather than to every table, so a caller
+  /// that forgets to pass it still gets the *restricted* behaviour on an
+  /// attender build. Defaulting the other way would silently store the tables
+  /// that build exists to keep off the device.
+  final List<String> tables;
+
+  SyncEngine(this.db, this.state, {List<String>? tables})
+      : tables = tables ?? syncTables;
 
   /// Foreign-key columns per table: column name -> parent table.
   static const Map<String, Map<String, String>> fkMap = {
@@ -74,30 +99,69 @@ class SyncEngine {
     'monthly_progress': {'student_id': 'students'},
   };
 
-  /// Key holding the newest `updated_at` we have successfully delivered to the
-  /// peer for [table]. Absent (== '') means "the peer has never had anything
-  /// from us", which correctly forces a full send.
-  static String sentKey(String table) => 'sent.$table';
+  /// Key holding the newest `updated_at` we have successfully delivered to
+  /// [peerId] for [table]. Absent (== '') means "that peer has never had
+  /// anything from us", which correctly forces a full send.
+  static String sentKey(String peerId, String table) =>
+      'sent.$peerId.$table';
 
-  /// Key holding the newest `updated_at` we have received from the peer for
-  /// [table]. Deliberately NOT used to filter outbound rows — see the class
-  /// doc for why that was a bug.
+  /// Prefix of every sent mark, used to clear them all without enumerating
+  /// peers we may no longer know about.
+  static const sentKeyPrefix = 'sent.';
+
+  /// The pre-per-peer key shape, still present in databases written by older
+  /// builds.
+  ///
+  /// Nothing reads it any more: the new keys carry a peer segment, so on the
+  /// first sync after an upgrade every peer's mark is absent and the whole
+  /// database is re-offered — which is exactly the migration this change needs,
+  /// achieved by *not* writing migration code. The old rows are deleted
+  /// opportunistically by [clearSentMarks] so they cannot be misread if these
+  /// keys ever mean something again.
+  static String legacySentKey(String table) => 'sent.$table';
+
+  /// Key holding the newest `updated_at` we have received for [table].
+  /// Deliberately NOT used to filter outbound rows — see the class doc for why
+  /// that was a bug.
   static String receivedKey(String table) => 'watermark.$table';
 
-  /// Rows we must send to the peer: everything we have not already delivered.
+  /// Rows we must send: everything the least caught-up peer has not seen.
   ///
-  /// Called with a read-only transaction so the snapshot is consistent with
-  /// the mark it is based on.
-  Future<SyncDelta> computeOutbound(Transaction txn) async {
+  /// Called with a read-only transaction so the snapshot is consistent with the
+  /// marks it is based on.
+  ///
+  /// ## Why the *minimum* across peers
+  ///
+  /// The mailbox holds **one file per device**, and every peer reads the same
+  /// one. So the file has to satisfy whichever peer is furthest behind: the
+  /// floor is the lowest sent mark across [peers], and any peer with no mark at
+  /// all drops the floor to "everything". A peer that is already up to date
+  /// simply re-reads rows it has, matches them by `sync_uuid`, and skips them as
+  /// unchanged echoes — bigger uploads in exchange for never leaving a device
+  /// short, which is the only acceptable direction for this trade.
+  ///
+  /// ## Why an empty [peers] means "send everything"
+  ///
+  /// With nobody adopted yet we cannot know who will read the file, so the only
+  /// safe content is the whole database. [markDeltaSent] refuses to advance any
+  /// mark in that state, which together fix a real hole in the two-device
+  /// version: a first phone used for a week before the second one existed used
+  /// to mark its rows delivered to nobody, and then overwrite its own file with
+  /// an empty delta. The second phone arrived to find an empty mailbox and the
+  /// first one insisting it had already sent everything.
+  Future<SyncDelta> computeOutbound(
+    Transaction txn, {
+    Set<String> peers = const {},
+  }) async {
     final delta = SyncDelta();
     // Read our clock BEFORE querying, so every row written after this point is
     // strictly above the mark markDeltaSent will set.
     delta.snapshotAt = DateTime.now().toUtc().toIso8601String();
-    for (final table in SyncCodec.applyOrder) {
-      final sent = await state.readWithin(txn, sentKey(table)) ?? '';
-      final rows = sent.isEmpty
+    for (final table in tables) {
+      final floor = await _outboundFloor(txn, table, peers);
+      final rows = floor.isEmpty
           ? await _selectAll(txn, table)
-          : await txn.query(table, where: 'updated_at > ?', whereArgs: [sent]);
+          : await txn.query(table, where: 'updated_at > ?', whereArgs: [floor]);
       if (rows.isEmpty) continue;
       final out = <Map<String, Object?>>[];
       for (final r in rows) {
@@ -111,15 +175,54 @@ class SyncEngine {
     return delta;
   }
 
-  /// Record that every row in [delta] has reached the peer, so the next
+  /// Lowest delivered mark across [peers] for [table]; '' meaning "send
+  /// everything" when there are no peers or any one of them has no mark.
+  Future<String> _outboundFloor(
+    Transaction txn,
+    String table,
+    Set<String> peers,
+  ) async {
+    if (peers.isEmpty) return '';
+    var floor = '';
+    for (final peer in peers) {
+      final mark = await state.readWithin(txn, sentKey(peer, table)) ?? '';
+      if (mark.isEmpty) return ''; // this peer holds nothing for this table
+      if (floor.isEmpty || mark.compareTo(floor) < 0) floor = mark;
+    }
+    return floor;
+  }
+
+  /// Record that every row in [delta] has reached each of [peers], so the next
   /// [computeOutbound] does not send it again.
   ///
   /// **Only call this once delivery is confirmed.** Over the Drive mailbox that
-  /// is a successful file write — the bundle now sits in the account and the
+  /// is a successful file write — the bundle now sits in the account and each
   /// peer will read it whenever it next syncs. Calling it merely because we
   /// *attempted* a send would drop rows whenever the upload failed; calling it
   /// late only costs a harmless re-send, so when in doubt, call it late.
-  Future<void> markDeltaSent(Transaction txn, SyncDelta delta) async {
+  ///
+  /// With no [peers] this does **nothing**, deliberately. A sent mark is a claim
+  /// about a specific device's contents, so with no device to name there is no
+  /// claim to record — and recording one anyway is how the first phone of a pair
+  /// used to declare its data delivered before the second phone existed.
+  ///
+  /// ## Known limitation: a peer that stays offline across two uploads
+  ///
+  /// Each upload **overwrites** our single file, so rows from upload N are gone
+  /// once upload N+1 lands. We mark them delivered at upload N because the file
+  /// was readable then, which is a claim about reachability rather than about
+  /// reading. A peer that is offline across both uploads therefore never sees
+  /// the first batch, and nothing here can tell. The remedy is the one the app
+  /// already has — **Send everything again** on a device that holds the data —
+  /// and the honest fix is an acknowledgement in the bundle so marks advance on
+  /// *confirmed read* instead. Until that exists, treat onboarding a device that
+  /// has been away a long time as "resend, then sync".
+  Future<void> markDeltaSent(
+    Transaction txn,
+    SyncDelta delta, {
+    Set<String> peers = const {},
+  }) async {
+    if (peers.isEmpty) return;
     final ceiling = delta.snapshotAt;
     for (final entry in delta.tables.entries) {
       var max = '';
@@ -135,18 +238,26 @@ class SyncEngine {
       // exchange for never losing an edit.
       if (ceiling.isNotEmpty && max.compareTo(ceiling) > 0) max = ceiling;
       if (max.isEmpty) continue;
-      final key = sentKey(entry.key);
-      final current = await state.readWithin(txn, key) ?? '';
-      // Never move the mark backwards: a clock that jumped back would
-      // otherwise re-send, and worse, a later correct value would be lost.
-      if (max.compareTo(current) > 0) {
-        await state.writeWithin(txn, key, max);
+      for (final peer in peers) {
+        final key = sentKey(peer, entry.key);
+        final current = await state.readWithin(txn, key) ?? '';
+        // Never move a mark backwards: a clock that jumped back would otherwise
+        // re-send, and worse, a later correct value would be lost.
+        if (max.compareTo(current) > 0) {
+          await state.writeWithin(txn, key, max);
+        }
       }
     }
   }
 
-  /// Forget which of our rows the peer has already received, so the next sync
+  /// Forget which of our rows a peer has already received, so the next sync
   /// offers the **whole** local dataset again. Returns how many marks existed.
+  ///
+  /// Pass [peers] to clear specific devices, or omit it to clear **every** sent
+  /// mark in the database — including marks for peers this build no longer knows
+  /// the ids of, and the pre-per-peer `sent.<table>` rows left by older builds.
+  /// "Forget everything I believed anyone had" is the only version of this that
+  /// is safe to offer a customer who cannot diagnose which peer is stale.
   ///
   /// This is the recovery path for a peer whose database is gone — a phone that
   /// was wiped or replaced, or an iPhone whose PWA storage Safari evicted (which
@@ -158,7 +269,7 @@ class SyncEngine {
   /// local-first app with no server this is the only route back.
   ///
   /// The keys are **deleted**, not set to `''`. [computeOutbound] branches on
-  /// `sent.isEmpty` and falls back to selecting every row, so an empty string
+  /// an empty floor and falls back to selecting every row, so an empty string
   /// happens to work today — but the two branches do not agree on edge cases.
   /// `attendance`, `fee_payments` and `event_participations` gained
   /// `updated_at` by `ALTER TABLE … NOT NULL DEFAULT ''`, so an empty
@@ -174,20 +285,40 @@ class SyncEngine {
   /// button must be able to press it without risk.
   ///
   /// Deliberately does **not** touch `watermark.<table>`. Those record what we
-  /// have *received*, and lowering them would make us re-apply the peer's rows
+  /// have *received*, and lowering them would make us re-apply the peers' rows
   /// against our own — pointless work with real conflict-resolution risk.
-  Future<int> clearSentMarks(SyncExecutor ex) async {
+  Future<int> clearSentMarks(SyncExecutor ex, {Set<String>? peers}) async {
+    if (peers == null) {
+      // Everything under the prefix, so an unknown or already-forgotten peer
+      // cannot leave a mark behind claiming it holds our data.
+      return state.deleteWithPrefix(ex, sentKeyPrefix);
+    }
     var cleared = 0;
-    for (final table in SyncCodec.applyOrder) {
-      final key = sentKey(table);
-      if (await state.readWithin(ex, key) == null) continue;
-      await state.writeWithin(ex, key, null); // null deletes the row
-      cleared++;
+    for (final table in tables) {
+      // Older builds wrote one mark per table with no peer segment. Clear it
+      // whenever we clear anything, so the dead row cannot be misread later.
+      final legacy = legacySentKey(table);
+      if (await state.readWithin(ex, legacy) != null) {
+        await state.writeWithin(ex, legacy, null);
+        cleared++;
+      }
+      for (final peer in peers) {
+        final key = sentKey(peer, table);
+        if (await state.readWithin(ex, key) == null) continue;
+        await state.writeWithin(ex, key, null); // null deletes the row
+        cleared++;
+      }
     }
     return cleared;
   }
 
-  /// Apply rows received from the peer inside one transaction.
+  /// Apply rows received from a peer inside one transaction.
+  ///
+  /// Iterates [tables], which is what keeps the attender's build from ever
+  /// storing the tables it has no business holding: an owner device's bundle
+  /// carries events, and on that build those rows are skipped rather than
+  /// inserted. Skipping is not deleting — an absent or ignored table means "no
+  /// news", never "remove these" — so the owners keep their events untouched.
   Future<SyncApplyResult> applyIncoming(
     Transaction txn,
     Map<String, List<Map<String, Object?>>> incoming, {
@@ -198,7 +329,7 @@ class SyncEngine {
     // foreign keys can be resolved.
     final uuidMap = <String, Map<String, int>>{};
 
-    for (final table in SyncCodec.applyOrder) {
+    for (final table in tables) {
       final rows = incoming[table];
       if (rows == null || rows.isEmpty) continue;
       result.applied[table] = 0;

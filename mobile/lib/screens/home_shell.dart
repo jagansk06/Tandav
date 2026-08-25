@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../core/app_role.dart';
 import '../core/auth_state.dart';
 import '../core/format.dart';
 import '../core/services.dart';
@@ -18,6 +19,19 @@ import 'settings/account_screen.dart';
 import 'settings/device_sync_screen.dart';
 import 'students/students_screen.dart';
 
+/// The signed-in app: bottom navigation plus the overflow menu.
+///
+/// Which tabs exist is decided by [appRole] at **compile time**. On the
+/// attender's build there are two — Attendance and Fees — and the other screens
+/// are not merely hidden, they are absent from the widget tree. That distinction
+/// matters because [IndexedStack] builds *every* child eagerly: a
+/// hidden-but-constructed `EventsScreen` would still run its queries against
+/// tables the attender's database does not contain. Leaving them out of the list
+/// is what stops them running.
+///
+/// Hiding tabs is not the security boundary — see [syncTables] for the part that
+/// is. This is the ergonomic half: the attender opens the app on the screen he
+/// needs and never has to be told to ignore the rest.
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key});
 
@@ -29,7 +43,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _index = 0;
   int _dashboardKey = 0;
 
-  static const _titles = [
+  static const _ownerTitles = [
     'Dashboard',
     'Students',
     'Batches',
@@ -37,6 +51,10 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     'Fees',
     'Events',
   ];
+
+  static const _attenderTitles = ['Attendance', 'Students', 'Batches', 'Fees'];
+
+  static const _titles = isAttenderBuild ? _attenderTitles : _ownerTitles;
 
   /// How often the app syncs while it is simply sitting open.
   ///
@@ -290,24 +308,35 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                 ],
               ),
               const Divider(height: 28),
-              ListTile(
-                leading: const Icon(Icons.bar_chart_rounded,
-                    color: TandavColors.gold),
-                title: const Text('Monthly Reports'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                        builder: (_) => const ReportsScreen()),
-                  );
-                },
-              ),
+              // Reports lead with the month's collections and revenue, so they
+              // are an owner's view rather than a shared one. The attender needs
+              // to record what is due and paid; he does not need the total.
+              if (!isAttenderBuild)
+                ListTile(
+                  leading: const Icon(Icons.bar_chart_rounded,
+                      color: TandavColors.gold),
+                  title: const Text('Monthly Reports'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => const ReportsScreen()),
+                    );
+                  },
+                ),
               // Hidden rather than disabled in the iPhone build: a greyed-out
               // "Backup data" invites the customer to believe their data is
               // being backed up somewhere. Drive sync is not a backup, so the
               // honest thing is to not offer the menu item at all.
-              if (appFiles.supportsBackups) ...[
+              //
+              // Withheld from the attender build for two independent reasons. A
+              // backup is the whole `.db` file, so it carries the password hash
+              // and the account recovery code in plaintext — a copy of it on a
+              // staff phone is a copy of the studio's credentials. And Restore
+              // *replaces everything*, which on this device would overwrite a
+              // day of attendance with whatever that file happens to hold.
+              if (appFiles.supportsBackups && !isAttenderBuild) ...[
                 ListTile(
                   leading: const Icon(Icons.backup_outlined,
                       color: TandavColors.gold),
@@ -394,6 +423,30 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
               ),
             ),
             const SizedBox(width: 10),
+            if (roleBadge != null) ...[
+              // Both builds are the same package with the same icon, so on a
+              // phone in someone's hand they are indistinguishable. This label
+              // is how "which app am I looking at?" gets answered during a
+              // support call, without anyone opening a settings screen.
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                decoration: BoxDecoration(
+                  border: Border.all(color: TandavColors.gold, width: 1),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  roleBadge!,
+                  style: const TextStyle(
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.1,
+                    color: TandavColors.gold,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+            ],
             Text(_titles[_index]),
           ],
         ),
@@ -406,58 +459,92 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       ),
       body: IndexedStack(
         index: _index,
-        children: [
-          // Rebuilt on every visit to Home so fee collection totals and
-          // today's attendance reflect the latest SQLite state immediately.
-          DashboardScreen(key: ValueKey('dash-$_dashboardKey')),
-          const StudentsScreen(),
-          const BatchesScreen(),
-          const AttendanceScreen(),
-          const FeesScreen(),
-          const EventsScreen(),
-        ],
+        // Kept in the same order as _titles and the nav items below — three
+        // parallel lists indexed by _index. Separate lists rather than one table
+        // of records because the Dashboard needs a fresh key on every visit and
+        // so cannot be const.
+        children: isAttenderBuild
+            ? const [AttendanceScreen(), StudentsScreen(), BatchesScreen(), FeesScreen()]
+            : [
+                // Rebuilt on every visit to Home so fee collection totals and
+                // today's attendance reflect the latest SQLite state
+                // immediately.
+                DashboardScreen(key: ValueKey('dash-$_dashboardKey')),
+                const StudentsScreen(),
+                const BatchesScreen(),
+                const AttendanceScreen(),
+                const FeesScreen(),
+                const EventsScreen(),
+              ],
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _index,
         onTap: (i) => setState(() {
-          if (i == 0 && i != _index) _dashboardKey++;
+          // Index 0 is the Dashboard only on the owner build; on the attender's
+          // it is Attendance, and there is no dashboard to re-key.
+          if (!isAttenderBuild && i == 0 && i != _index) _dashboardKey++;
           _index = i;
         }),
         selectedFontSize: _navLabelSize,
         unselectedFontSize: _navLabelSize,
-        items: const [
-          BottomNavigationBarItem(
-            icon: Icon(Icons.dashboard_outlined),
-            activeIcon: Icon(Icons.dashboard_rounded),
-            label: 'Home',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.groups_outlined),
-            activeIcon: Icon(Icons.groups_rounded),
-            label: 'Students',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.grid_view_outlined),
-            activeIcon: Icon(Icons.grid_view_rounded),
-            label: 'Batches',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.fact_check_outlined),
-            activeIcon: Icon(Icons.fact_check_rounded),
-            label: 'Attendance',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.account_balance_wallet_outlined),
-            activeIcon: Icon(Icons.account_balance_wallet_rounded),
-            label: 'Fees',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.event_outlined),
-            activeIcon: Icon(Icons.event_rounded),
-            label: 'Events',
-          ),
-        ],
+        items: isAttenderBuild ? _attenderNavItems : _ownerNavItems,
       ),
     );
   }
+
+  static const _attenderNavItems = [
+    BottomNavigationBarItem(
+      icon: Icon(Icons.fact_check_outlined),
+      activeIcon: Icon(Icons.fact_check_rounded),
+      label: 'Attendance',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.groups_outlined),
+      activeIcon: Icon(Icons.groups_rounded),
+      label: 'Students',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.grid_view_outlined),
+      activeIcon: Icon(Icons.grid_view_rounded),
+      label: 'Batches',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.account_balance_wallet_outlined),
+      activeIcon: Icon(Icons.account_balance_wallet_rounded),
+      label: 'Fees',
+    ),
+  ];
+
+  static const _ownerNavItems = [
+    BottomNavigationBarItem(
+      icon: Icon(Icons.dashboard_outlined),
+      activeIcon: Icon(Icons.dashboard_rounded),
+      label: 'Home',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.groups_outlined),
+      activeIcon: Icon(Icons.groups_rounded),
+      label: 'Students',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.grid_view_outlined),
+      activeIcon: Icon(Icons.grid_view_rounded),
+      label: 'Batches',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.fact_check_outlined),
+      activeIcon: Icon(Icons.fact_check_rounded),
+      label: 'Attendance',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.account_balance_wallet_outlined),
+      activeIcon: Icon(Icons.account_balance_wallet_rounded),
+      label: 'Fees',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.event_outlined),
+      activeIcon: Icon(Icons.event_rounded),
+      label: 'Events',
+    ),
+  ];
 }

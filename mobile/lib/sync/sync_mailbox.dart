@@ -70,7 +70,8 @@ abstract class SyncMailbox {
   static const fileSuffix = '.json';
 
   /// File name this device writes to. One fixed name per device means the
-  /// mailbox holds exactly two files once both masters have synced.
+  /// mailbox holds one file per device that has ever synced — three at most,
+  /// which is [CloudSyncManager.maxDevices].
   static String fileNameFor(String deviceId) =>
       '$filePrefix$deviceId$fileSuffix';
 

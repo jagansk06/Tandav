@@ -6,8 +6,9 @@ reports. Dark black/gold theme.
 
 **Local-first.** Everything lives in an on-device SQLite database and the whole
 app works with no internet at all. There is **no Tandav server** and nothing to
-renew. Two devices run the same data as **two equal masters** and keep each
-other in sync through a shared Google Drive account.
+renew. Up to **three devices** — two owners plus the studio's attender — run the
+same data as **equal masters** and keep each other in sync through a shared
+Google Drive account.
 
 > **This file was rewritten on 2026-08-23.** Every earlier version described a
 > FastAPI + PostgreSQL + JWT client-server app and referenced
@@ -34,9 +35,11 @@ Tandav/
 ├── OAUTH-SETUP.md           # one-time Google Cloud Console setup
 ├── PWA.md                   # the iPhone build: flags, deploy, offline, limits
 ├── IPHONE-INVITE.md         # the link + paste-ready message for an iPhone user
-├── ship.ps1                 # build + verify signature + install + capture logs
+├── ATTENDER.md              # the attendance-only APK: build it, send it, limits
+├── ship.ps1                 # build (either role) + verify + name + install + logs
+├── dist/                    # the named, verified APKs to send out (gitignored)
 ├── tools/
-│   ├── verify-apk.ps1       # signature gate for a hand-copied APK (no cable)
+│   ├── verify-apk.ps1       # signature AND build-role gate, no cable needed
 │   ├── deploy-pwa.ps1       # build + prune + stamp + publish the public site
 │   ├── make-web-icons.py    # PWA icons from the studio logo
 │   ├── fake-peer.html       # impersonate a 2nd device from a browser
@@ -45,7 +48,8 @@ Tandav/
 │   ├── lib/
 │   │   ├── main.dart        # RootGate → Signup / Login / HomeShell
 │   │   ├── core/            # services (TandavApi facade), auth_state, theme,
-│   │   │                    # format, whatsapp (deep links)
+│   │   │                    # format, whatsapp (deep links), app_role (which
+│   │   │                    # build this is — see ATTENDER.md)
 │   │   ├── platform/        # the Android/web split — see below
 │   │   ├── database/        # tandav_database.dart (schema, migrations, backups)
 │   │   ├── models/          # plain data classes
@@ -55,7 +59,7 @@ Tandav/
 │   │   └── widgets/states.dart
 │   ├── web/                 # PWA shell: index.html, manifest, tandav_sw.js,
 │   │   │                    # icons/, sqlite3.wasm (no sqflite_sw.js — see PWA.md)
-│   └── test/                # 7 files, 64 tests
+│   └── test/                # 7 files, 69 tests
 ├── backend/                 # DEAD (see above)
 └── scripts/e2e_smoke.py     # DEAD (drives the dead API)
 ```
@@ -134,24 +138,39 @@ mistake here:
   empty" (it never is) or a separate flag (which can drift out of step with the
   row) — so an APK already handed out gets prompted on its next launch instead
   of staying on `admin123` forever. `users` is not a synced table.
-- **Google account — one, shared by both phones, mandatory.** It *is* the sync
+- **Google account — one, shared by every device, mandatory.** It *is* the sync
   mailbox. Two different Google accounts means two private Drives and sync can
   never work. Advise each studio to create a **fresh Google account used only
-  for Tandav**, not either person's personal Gmail.
+  for Tandav**, not either person's personal Gmail. App logins are **per device**
+  and never sync, so sharing the Google account does not share a password.
+
+## Two builds from one codebase
+
+`--dart-define=TANDAV_ROLE=attendance` produces the **attender's APK**: two tabs
+(Attendance, Fees), no money totals, and a database scoped to six of the nine
+synced tables — `events`, `event_participations` and `monthly_progress` are
+filtered on the way in and never forwarded out. `core/app_role.dart` is the only
+place that decides, `flutter build` is the only thing that has to change, and
+`tools/verify-apk.ps1` reads the role back out of the built file so the wrong APK
+cannot reach the wrong phone unnoticed. **`ATTENDER.md` is the full account.**
 
 ## Sync, in one paragraph
 
-Both devices sign into the same Google account. The app makes a **Tandav Sync**
+Every device signs into the same Google account. The app makes a **Tandav Sync**
 folder and each device owns exactly one file in it, `tandav-<deviceId>.json`. A
-device writes its own file and reads the other's, so **neither waits for the
-other to be online** — one can sync at 9am and the other at 6pm and both end up
-correct. Merging is last-write-wins on `updated_at` with the higher device id
-breaking exact ties, soft-delete tombstones, and foreign keys remapped by UUID,
-all applied in a single transaction. Sync runs on app open, on resume, every 5
-minutes while the app is in the foreground, and on demand from Settings →
+device writes its own file and reads the others', so **nobody waits for anybody
+to be online** — one can sync at 9am and the next at 6pm and all end up correct.
+Merging is last-write-wins on `updated_at` with the higher device id breaking
+exact ties, soft-delete tombstones, and foreign keys remapped by UUID, all
+applied in one transaction per peer. **Up to three devices** share an account
+(two owners plus the attender); a fourth is refused by name rather than guessed
+at. What a device offers is filtered by what it has *delivered to each peer
+individually*, so a phone that joins late receives the studio's whole history on
+its first sync with nobody pressing anything. Sync runs on app open, on resume,
+every 5 minutes while the app is in the foreground, and on demand from Settings →
 Device & Sync. **A Bluetooth transport existed and was deleted on 2026-08-23**;
 Drive is the only carrier. Because each file is a **delta and not a backup**, a
-device that lost its data is rebuilt with **Send everything again** on the
+device that lost its data is rebuilt with **Send everything again** on a
 surviving one. Full detail, including why, is in `SYNC.md`.
 
 ## WhatsApp — deep links, not the Cloud API

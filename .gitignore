@@ -24,6 +24,11 @@ backend/uploads/
 app-release.apk
 *.apk
 
+# Finished, named APKs that ship.ps1 copies out of the Gradle output, plus their
+# .txt sidecars. Build products of a specific machine at a specific minute — the
+# repo describes how to build them, it does not carry them.
+dist/
+
 # Gradle and Flutter build output. 21 Gradle cache files were committed by
 # accident (checksums, .lock, .bin, .ser) — machine-local state that changes on
 # every build and is meaningless to anyone else.
