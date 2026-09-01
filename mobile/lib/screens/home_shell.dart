@@ -14,9 +14,12 @@ import 'batches/batches_screen.dart';
 import 'dashboard/dashboard_screen.dart';
 import 'events/events_screen.dart';
 import 'fees/fees_screen.dart';
+import 'fees/fee_settings_screen.dart';
 import 'reports/reports_screen.dart';
+import 'reports/export_screen.dart';
 import 'settings/account_screen.dart';
 import 'settings/device_sync_screen.dart';
+import 'settings/upi_settings_screen.dart';
 import 'students/students_screen.dart';
 
 /// The signed-in app: bottom navigation plus the overflow menu.
@@ -270,7 +273,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       context: context,
       backgroundColor: TandavColors.surface,
       builder: (ctx) => SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -325,6 +328,61 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                     );
                   },
                 ),
+              // Owner-only: pulling the studio's data into Excel/Sheets is an
+              // owner's job, so the attender build never offers it.
+              if (!isAttenderBuild)
+                ListTile(
+                  leading: const Icon(Icons.ios_share_rounded,
+                      color: TandavColors.gold),
+                  title: const Text('Export to Spreadsheet'),
+                  subtitle: const Text('Students, fees, batches, attendance',
+                      style: TextStyle(fontSize: 11.5)),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => const ExportScreen()),
+                    );
+                  },
+                ),
+              // Withheld from the attender build: this configures how revenue is
+              // calculated (late-fee increments), which is an owner decision.
+              if (!isAttenderBuild)
+                ListTile(
+                  leading: const Icon(Icons.tune_rounded,
+                      color: TandavColors.gold),
+                  title: const Text('Fee Settings'),
+                  subtitle: const Text('Late-fee increment for unpaid months',
+                      style: TextStyle(fontSize: 11.5)),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => const FeeSettingsScreen()),
+                    );
+                  },
+                ),
+              // UPI payment settings for the WhatsApp fee reminders — available
+              // to both builds, since attenders also send reminders and confirm
+              // student payments.
+              ListTile(
+                leading: const Icon(Icons.qr_code_2_rounded,
+                    color: TandavColors.gold),
+                title: const Text('UPI / Payments'),
+                subtitle: const Text(
+                    'UPI ID for fee pay links in reminders',
+                    style: TextStyle(fontSize: 11.5)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                        builder: (_) => const UpiSettingsScreen()),
+                  );
+                },
+              ),
               // Hidden rather than disabled in the iPhone build: a greyed-out
               // "Backup data" invites the customer to believe their data is
               // being backed up somewhere. Drive sync is not a backup, so the

@@ -21,7 +21,82 @@ class FeeRepository {
 
   static const _watermarkKey = 'fee_watermark_month';
 
+  /// `app_settings` key holding the fixed rupee amount added to the following
+  /// month's fee when a student has not paid the previous month's fee. The
+  /// studio can change it; it is stored as a decimal string.
+  static const lateFeePenaltyKey = 'late_fee_penalty';
+
+  /// Default late-fee penalty when none has been configured (₹ 100).
+  static const double defaultLateFeePenalty = 100;
+
   Future<Database> get _d => db.open();
+
+  /// Read the configured late-fee penalty for unpaid previous months.
+  Future<double> getLateFeePenalty() async {
+    final d = await _d;
+    final rows = await d.query('app_settings',
+        where: 'key = ?', whereArgs: [lateFeePenaltyKey], limit: 1);
+    if (rows.isEmpty) return defaultLateFeePenalty;
+    final v = double.tryParse(rows.first['value']?.toString() ?? '');
+    return v == null || v < 0 ? defaultLateFeePenalty : v;
+  }
+
+  /// Set the late-fee penalty (rounded to 2 decimals). Passing 0 disables the
+  /// increment entirely. The value is negative-clamped to 0.
+  Future<void> setLateFeePenalty(double amount) async {
+    final d = await _d;
+    await d.insert('app_settings', {
+      'key': lateFeePenaltyKey,
+      'value': DbFmt.round2(amount < 0 ? 0 : amount).toString(),
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// `app_settings` key holding the studio's UPI ID (VPA), e.g.
+  /// `tandav@okhdfcbank`. This is what a student scans/taps in the WhatsApp
+  /// reminder to pay the fee into the studio's account.
+  static const upiVpaKey = 'upi_vpa';
+
+  /// `app_settings` key holding the payee display name shown on the UPI payment
+  /// (normally the studio name, e.g. "Tandav Studio").
+  static const upiPayeeKey = 'upi_payee';
+
+  /// Read the studio's configured UPI ID, or null when none has been set.
+  Future<String?> getUpiVpa() async {
+    final d = await _d;
+    final rows = await d.query('app_settings',
+        where: 'key = ?', whereArgs: [upiVpaKey], limit: 1);
+    if (rows.isEmpty) return null;
+    final v = rows.first['value']?.toString().trim() ?? '';
+    return v.isEmpty ? null : v;
+  }
+
+  /// Store the studio's UPI ID. An empty value clears it.
+  Future<void> setUpiVpa(String vpa) async {
+    final d = await _d;
+    await d.insert('app_settings', {
+      'key': upiVpaKey,
+      'value': vpa.trim(),
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// Read the payee display name shown on UPI payments, or null when unset.
+  Future<String?> getUpiPayee() async {
+    final d = await _d;
+    final rows = await d.query('app_settings',
+        where: 'key = ?', whereArgs: [upiPayeeKey], limit: 1);
+    if (rows.isEmpty) return null;
+    final v = rows.first['value']?.toString().trim() ?? '';
+    return v.isEmpty ? null : v;
+  }
+
+  /// Store the payee display name. An empty value clears it.
+  Future<void> setUpiPayee(String payee) async {
+    final d = await _d;
+    await d.insert('app_settings', {
+      'key': upiPayeeKey,
+      'value': payee.trim(),
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
 
   static String feeStatus(double due, double paid) {
     if (due > 0 && paid >= due - 0.001) return 'paid';
@@ -80,8 +155,15 @@ class FeeRepository {
   /// Create DUE fee records for [month] for every active student with a
   /// non-zero fee who joined on or before that month. Returns the number of
   /// newly inserted rows (existing records are never duplicated).
+  ///
+  /// A [lateFeePenalty] is added onto the base monthly fee when the student
+  /// left the *previous* month's fee unpaid (status other than `paid`). The
+  /// increment only ever sits on a freshly generated record, so it is applied
+  /// once and never compounds on its own; if the owner has already booked the
+  /// previous month as paid, the next record reverts to the plain monthly fee.
   Future<int> _insertMonthFees(Transaction txn, DateTime month) async {
     final nextMonth = DbFmt.addMonths(month, 1);
+    final penalty = await _lateFeePenaltyIn(txn);
     final students = await txn.query('students',
         where: 'is_active = 1 AND monthly_fee > 0 AND join_date < ?',
         whereArgs: [DbFmt.date(nextMonth)]);
@@ -90,7 +172,7 @@ class FeeRepository {
       final inserted = await txn.insert('fees', {
         'student_id': s['id'],
         'month': DbFmt.month(month),
-        'amount_due': _fee(s['monthly_fee']),
+        'amount_due': await _amountDue(txn, s, month, penalty),
         'amount_paid': 0,
         'status': 'due',
         ...SyncStamp.now(db).columns(),
@@ -98,6 +180,35 @@ class FeeRepository {
       if (inserted != 0) created++;
     }
     return created;
+  }
+
+  /// The late-fee penalty resolved inside a transaction (single QUERY against
+  /// `app_settings`, shared by every student in [month]).
+  Future<double> _lateFeePenaltyIn(Transaction txn) async {
+    final rows = await txn.query('app_settings',
+        where: 'key = ?', whereArgs: [lateFeePenaltyKey], limit: 1);
+    if (rows.isEmpty) return defaultLateFeePenalty;
+    final v = double.tryParse(rows.first['value']?.toString() ?? '');
+    return v == null || v < 0 ? defaultLateFeePenalty : v;
+  }
+
+  /// The amount due for a single (student, month) fee record: the student's
+  /// base monthly fee, plus [penalty] when the immediately-preceding month's
+  /// record exists and was not fully paid.
+  Future<double> _amountDue(
+      Transaction txn, Map<String, Object?> s, DateTime month, double penalty) async {
+    var due = _fee(s['monthly_fee']);
+    if (penalty > 0) {
+      final previous = DbFmt.addMonths(month, -1);
+      final prevRows = await txn.query('fees',
+          where: 'student_id = ? AND month = ?',
+          whereArgs: [s['id'], DbFmt.month(previous)],
+          limit: 1);
+      if (prevRows.isNotEmpty && (prevRows.first['status'] as String?) != 'paid') {
+        due = DbFmt.round2(due + penalty);
+      }
+    }
+    return due;
   }
 
   Future<FeeListResponse> getFees({

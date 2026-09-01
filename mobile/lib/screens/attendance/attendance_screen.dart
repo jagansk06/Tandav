@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import '../../core/format.dart';
 import '../../core/services.dart';
 import '../../core/theme.dart';
+import '../../core/whatsapp.dart';
 import '../../models/attendance.dart';
 import '../../models/batch.dart';
 import '../../widgets/states.dart';
@@ -416,6 +417,7 @@ class _AttendanceDayEditorState extends State<AttendanceDayEditor> {
 
   Widget _row(AttendanceStudentRow r) {
     final status = _statuses[r.studentId] ?? 'unmarked';
+    final notify = status == 'absent' || status == 'late';
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(10),
@@ -442,6 +444,28 @@ class _AttendanceDayEditorState extends State<AttendanceDayEditor> {
                       style: const TextStyle(
                           fontSize: 11.5, color: TandavColors.textMuted),
                     ),
+                  if (notify)
+                    TextButton.icon(
+                      onPressed: _saving ? null : () => _notifyParent(r, status),
+                      icon: Icon(Icons.chat_outlined,
+                          size: 15, color: WhatsAppService.accent),
+                      label: Text(
+                        status == 'late'
+                            ? 'Notify guardian (late)'
+                            : 'Notify guardian (absent)',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: WhatsAppService.accent,
+                        ),
+                      ),
+                      style: TextButton.styleFrom(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(0, 0),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        alignment: Alignment.centerLeft,
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -454,6 +478,50 @@ class _AttendanceDayEditorState extends State<AttendanceDayEditor> {
         ),
       ),
     );
+  }
+
+  Future<void> _notifyParent(AttendanceStudentRow r, String status) async {
+    final api = context.read<TandavApi>();
+    try {
+      final student = await api.getStudent(r.studentId);
+      if (!mounted) return;
+      // The absence notice goes to the guardian (parent). The student record
+      // keeps an emergency contact; fall back to the student's own phone so
+      // there is always a believable destination.
+      final parentNumber =
+          (student.emergencyContactPhone?.isNotEmpty == true)
+              ? student.emergencyContactPhone!
+              : student.phone;
+      final message = WhatsAppService.absentMessage(
+        studentName: student.fullName,
+        date: DateTime.tryParse(widget.day.date) ?? DateTime.now(),
+        late: status == 'late',
+      );
+      final result =
+          await WhatsAppService.openChat(number: parentNumber, message: message);
+      if (!mounted) return;
+      switch (result) {
+        case WhatsAppOpenResult.invalidNumber:
+          Alert.show(
+            context,
+            'No valid guardian phone number for WhatsApp.',
+            isError: true,
+          );
+        case WhatsAppOpenResult.notInstalled:
+          Alert.show(
+            context,
+            'Unable to open WhatsApp. Please make sure WhatsApp is installed.',
+            isError: true,
+          );
+        case WhatsAppOpenResult.launched:
+          break;
+      }
+    } on Exception catch (e) {
+      if (mounted) {
+        Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
+            isError: true);
+      }
+    }
   }
 
   Widget _statusButton(

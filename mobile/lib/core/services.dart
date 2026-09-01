@@ -12,6 +12,7 @@ import '../repositories/auth_repository.dart';
 import '../repositories/batch_repository.dart';
 import '../repositories/dashboard_repository.dart';
 import '../repositories/event_repository.dart';
+import '../repositories/export_repository.dart';
 import '../repositories/fee_repository.dart';
 import '../repositories/progress_repository.dart';
 import '../repositories/student_repository.dart';
@@ -45,6 +46,7 @@ class TandavApi {
   late final EventRepository events = EventRepository(db);
   late final ProgressRepository progress = ProgressRepository(db);
   late final DashboardRepository dashboard = DashboardRepository(db, fees);
+  late final ExportRepository export = ExportRepository(db);
 
   // ---- Sync ----
   late final SyncState syncState = SyncState(db);
@@ -169,6 +171,19 @@ class TandavApi {
   Future<List<Map<String, dynamic>>> paymentHistory(int studentId) =>
       fees.paymentHistory(studentId);
 
+  /// The configurable fixed rupee amount added to a month's fee when the
+  /// student did not pay the previous month. See [FeeRepository].
+  Future<double> getLateFeePenalty() => fees.getLateFeePenalty();
+
+  Future<void> setLateFeePenalty(double amount) =>
+      fees.setLateFeePenalty(amount);
+
+  // ---- UPI payments ----
+  Future<String?> getUpiVpa() => fees.getUpiVpa();
+  Future<void> setUpiVpa(String vpa) => fees.setUpiVpa(vpa);
+  Future<String?> getUpiPayee() => fees.getUpiPayee();
+  Future<void> setUpiPayee(String payee) => fees.setUpiPayee(payee);
+
   // ---- Events ----
   Future<EventListResponse> getEvents({String? q, bool? upcomingOnly, bool? pastOnly}) =>
       events.getEvents(q: q, upcomingOnly: upcomingOnly, pastOnly: pastOnly);
@@ -231,6 +246,21 @@ class TandavApi {
   // ---- Reports ----
   Future<MonthlyReport> getMonthlyReport(String month) =>
       dashboard.getMonthlyReport(month);
+
+  // ---- CSV export ----
+  /// CSV of every active/archived student with contact and batch details.
+  Future<String> exportStudentsCsv() => export.exportStudents();
+
+  /// CSV of every batch with its default fee and student headcount.
+  Future<String> exportBatchesCsv() => export.exportBatches();
+
+  /// CSV of the monthly fee register (optionally one month).
+  Future<String> exportMonthlyFeesCsv({String? month}) =>
+      export.exportMonthlyFees(month: month);
+
+  /// CSV of the monthly attendance summary (optionally one month / batch).
+  Future<String> exportAttendanceCsv({String? month, int? batchId}) =>
+      export.exportAttendance(month: month, batchId: batchId);
 
   // ---- Backup / restore ----
   // Android only. `appFiles.supportsBackups` is false in the iPhone PWA and

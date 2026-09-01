@@ -47,6 +47,10 @@ dependencies:
   crypto: ^3.0.6
   url_launcher: ^6.3.0
   uuid: ^4.5.1
+  # Free spreadsheet export. CSV files generated locally and handed to the
+  # system share sheet (Android) or browser download (iPhone PWA) so the owner
+  # can open them in Excel / Google Sheets with no server or subscription.
+  share_plus: ^11.0.0
   # Google Drive sync mailbox. The two master devices sign into the SAME
   # Google account; each writes one small JSON file and reads the other's.
   # Only the narrow `drive.file` scope is requested — the app can see nothing

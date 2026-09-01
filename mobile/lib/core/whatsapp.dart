@@ -65,19 +65,48 @@ class WhatsAppService {
       'Regards,\nTandav Studio';
 
   /// Reminder message shown while a fee is DUE (or partially paid).
+  ///
+  /// When [upiLink] is provided (a `upi://pay` deep link built for this
+  /// student's fee), a short "Pay now" line is appended so the student can tap
+  /// or scan straight to the payment from their own WhatsApp.
   static String reminderMessage({
     required String studentName,
     required String monthLabel,
     required double amountDue,
+    String? upiLink,
+  }) {
+    final paymentLine = (upiLink != null && upiLink.isNotEmpty)
+        ? '\n\nTap to pay now via UPI: $upiLink'
+        : '';
+    return 'Namaste $studentName, 🙏\n\n'
+        'This is a gentle reminder from Tandav Studio regarding the '
+        'monthly dance class fee for $monthLabel.\n\n'
+        'Amount Due: ${_rupee(amountDue)}\n'
+        'Status: Pending\n\n'
+        'We kindly request you to complete the fee payment at your convenience.'
+        '$paymentLine\n\n'
+        'Thank you for your continued association with Tandav Studio. 🙏\n\n'
+        'Regards,\nTandav Studio';
+  }
+
+  /// Absence notice sent to a student's guardian when the student was marked
+  /// absent (or late) on a class day. A short, matter-of-fact message — the
+  /// whole point is that the parent finds out promptly.
+  static String absentMessage({
+    required String studentName,
+    required DateTime date,
+    bool late = false,
   }) =>
-      'Namaste $studentName, 🙏\n\n'
-      'This is a gentle reminder from Tandav Studio regarding the '
-      'monthly dance class fee for $monthLabel.\n\n'
-      'Amount Due: ${_rupee(amountDue)}\n'
-      'Status: Pending\n\n'
-      'We kindly request you to complete the fee payment at your convenience.\n\n'
-      'Thank you for your continued association with Tandav Studio. 🙏\n\n'
+      'Namaste, 🙏\n\n'
+      'This is to inform you that '
+      '${studentName.isEmpty ? 'your ward' : studentName} was '
+      '${late ? 'late' : 'absent'} from today\'s dance class at Tandav Studio '
+      '(${_dateLabel(date)}).\n\n'
+      'Please let us know if there is anything we should be aware of.\n\n'
       'Regards,\nTandav Studio';
+
+  static String _dateLabel(DateTime d) =>
+      '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
 
   /// Open WhatsApp with a pre-filled message for [number].
   ///
@@ -153,4 +182,44 @@ class WhatsAppService {
   /// the message reads `₹1,000`.
   static String _rupee(num value) =>
       Fmt.money(value, exact: value % 1 != 0).replaceFirst('\u20B9 ', '\u20B9');
+
+  /// Normalize an Indian UPI ID (VPA) to a clean, link-safe form. Accepts the
+  /// usual spellings — `name@bank`, ` name@bank `, `upi://pay?...` pasted by
+  /// mistake. Returns null when it is clearly not a VPA (no `@` with a non
+  /// empty handle and non empty issuer).
+  static String? normalizeVpa(String raw) {
+    var v = raw.trim();
+    // A pasted deep link is unwound back to its `pa=` parameter.
+    final match = RegExp('[?&]pa=([^&]+)').firstMatch(v);
+    if (match != null) v = Uri.decodeComponent(match.group(1)!).trim();
+    final at = v.indexOf('@');
+    if (at <= 0 || at == v.length - 1) return null;
+    return v;
+  }
+
+  /// Build a `upi://pay` deep link that pre-fills a payment to the studio for
+  /// this fee. Returns null when no UPI ID is configured. The link is what is
+  /// embedded in the WhatsApp reminder; tapping it in WhatsApp on the student's
+  /// phone opens their UPI app with the amount and a note identifying the
+  /// student and month already filled in.
+  static String? upiPayLink({
+    required String vpa,
+    String? payee,
+    required double amount,
+    required String note,
+  }) {
+    final normalized = normalizeVpa(vpa);
+    if (normalized == null) return null;
+    final params = <String, String>{
+      'pa': normalized,
+      if (payee != null && payee.isNotEmpty) 'pn': payee,
+      'am': amount.toStringAsFixed(2),
+      'cu': 'INR',
+      'tn': note,
+    };
+    final q = params.entries
+        .map((e) => '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}')
+        .join('&');
+    return 'upi://pay?$q';
+  }
 }
