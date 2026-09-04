@@ -30,7 +30,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
   late Future<FeeListResponse> _feesFuture;
   late Future<List<Map<String, dynamic>>> _paymentsFuture;
 
-  String _month = '${DateTime.now().year.toString()}-${DateTime.now().month.toString().padLeft(2, '0')}-01';
+  final String _month = '${DateTime.now().year.toString()}-${DateTime.now().month.toString().padLeft(2, '0')}-01';
   int? _busyFeeId;
 
   @override
@@ -67,6 +67,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
       Alert.show(context, appFiles.unavailableMessage, isError: true);
       return;
     }
+    final api = context.read<TandavApi>();
     final picker = ImagePicker();
     final image = await picker.pickImage(
       source: ImageSource.gallery,
@@ -76,7 +77,6 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
     );
     if (image == null) return;
     try {
-      final api = context.read<TandavApi>();
       await api.uploadPhoto(widget.studentId, image.path, 'photo.jpg');
       if (!mounted) return;
       Alert.show(context, 'Photo updated');
@@ -660,7 +660,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
         leading: CircleAvatar(
           backgroundColor: color.withValues(alpha: 0.15),
           child: Text(
-            '${score.toStringAsFixed(0)}',
+            score.toStringAsFixed(0),
             style: TextStyle(
               color: color,
               fontWeight: FontWeight.w900,
@@ -694,6 +694,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
     try {
       await api.createFee(
           widget.studentId, result['month'] as String, result['amount'] as String);
+      if (!mounted) return;
       Alert.show(context, 'Fee record created');
       _reloadAll();
     } on Exception catch (e) {

@@ -536,7 +536,7 @@ class CloudSyncManager {
       }
       readIds.add(peerId);
       final at = incoming.createdAt;
-      if (at != null && (newestBundleAt == null || at.isAfter(newestBundleAt))) {
+      if (newestBundleAt == null || at.isAfter(newestBundleAt)) {
         newestBundleAt = at;
       }
       if (incoming.isEmpty) continue;

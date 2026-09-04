@@ -26,15 +26,18 @@ class _MonthlyAttendanceScreenState extends State<MonthlyAttendanceScreen> {
   @override
   void initState() {
     super.initState();
+    _batchesFuture =
+        context.read<TandavApi>().getBatches().then((r) => r.items);
+    _rowsFuture =
+        context.read<TandavApi>().getMonthlyAttendance(_iso, batchId: _batchId);
     _load();
   }
 
   Future<void> _load() async {
     try {
-      final res = await context.read<TandavApi>().getBatches();
-      if (mounted) setState(() => _batches = res.items);
+      final res = await _batchesFuture;
+      if (mounted) setState(() => _batches = res);
     } catch (_) {}
-    _reload();
   }
 
   String get _iso =>

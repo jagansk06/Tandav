@@ -32,9 +32,8 @@ import 'app_role.dart';
 /// offline: no network, no server, no laptop required.
 class TandavApi {
   final TandavDatabase db;
-  TandavApi({TandavDatabase? database, SyncMailbox? mailbox})
-      : db = database ?? TandavDatabase.instance,
-        _mailbox = mailbox;
+  TandavApi({TandavDatabase? database, this._mailbox})
+      : db = database ?? TandavDatabase.instance;
 
   final SyncMailbox? _mailbox;
 

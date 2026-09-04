@@ -261,6 +261,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       ),
     );
     if (confirmed == true) {
+      if (!mounted) return;
       final auth = context.read<AuthState>();
       await auth.logout();
     }
