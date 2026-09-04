@@ -20,7 +20,7 @@ class AttendanceRepository {
         where: 'attendance_date = ? AND deleted_at IS NULL',
         whereArgs: [date]);
 
-    final studentsWhere = <String>['s.is_active = 1', 's.deleted_at IS NULL'];
+    final studentsWhere = <String>['s.is_active = 1'];
     final studentsArgs = <Object?>[];
     if (batchId != null) {
       studentsWhere.add('s.batch_id = ?');
@@ -29,7 +29,7 @@ class AttendanceRepository {
     final students = await d.rawQuery('''
       SELECT s.*, b.name AS batch_name
       FROM students s
-      LEFT JOIN batches b ON b.id = s.batch_id AND b.deleted_at IS NULL
+      LEFT JOIN batches b ON b.id = s.batch_id
       WHERE ${studentsWhere.join(' AND ')}
       ORDER BY s.first_name COLLATE NOCASE
     ''', studentsArgs);
@@ -38,9 +38,7 @@ class AttendanceRepository {
     String? batchName;
     if (batchId != null) {
       final b = await d.query('batches',
-          where: 'id = ? AND deleted_at IS NULL',
-          whereArgs: [batchId],
-          limit: 1);
+          where: 'id = ?', whereArgs: [batchId], limit: 1);
       if (b.isEmpty) throw RepoException('Batch not found');
       batchName = b.first['name'] as String;
     } else {
@@ -72,13 +70,7 @@ class AttendanceRepository {
         notes: mark?['notes'] as String?,
       ));
     }
-    // Group by batch while keeping the alphabetical order inside each batch
-    // (Dart's sort is not stable, so the name is part of the comparison).
-    records.sort((a, b) {
-      final byBatch = (a.batchName ?? '').compareTo(b.batchName ?? '');
-      if (byBatch != 0) return byBatch;
-      return a.studentName.toLowerCase().compareTo(b.studentName.toLowerCase());
-    });
+    records.sort((a, b) => ((a.batchName ?? '')).compareTo(b.batchName ?? ''));
     final total = records.length;
     return AttendanceDay(
       date: date,
@@ -104,9 +96,7 @@ class AttendanceRepository {
     final d = await _d;
     await d.transaction((txn) async {
       final batch = await txn.query('batches',
-          where: 'id = ? AND deleted_at IS NULL',
-          whereArgs: [batchId],
-          limit: 1);
+          where: 'id = ?', whereArgs: [batchId], limit: 1);
       if (batch.isEmpty) throw RepoException('Batch not found');
 
       final seen = <int>{};
@@ -116,9 +106,7 @@ class AttendanceRepository {
           throw RepoException('Duplicate student_id $studentId');
         }
         final student = await txn.query('students',
-            where: 'id = ? AND deleted_at IS NULL',
-            whereArgs: [studentId],
-            limit: 1);
+            where: 'id = ?', whereArgs: [studentId], limit: 1);
         if (student.isEmpty) {
           throw RepoException('Student $studentId does not exist');
         }
@@ -126,11 +114,6 @@ class AttendanceRepository {
         if (!const {'present', 'absent', 'late'}.contains(status)) {
           throw RepoException('Invalid attendance status "$status"');
         }
-        // Deliberately NOT filtered on deleted_at: `attendance` is UNIQUE
-        // (student_id, attendance_date), so a previously deleted mark has to be
-        // found and revived here. Inserting a second row would fail, and
-        // updating without clearing deleted_at would save a mark that no screen
-        // can see.
         final existing = await txn.query('attendance',
             where: 'student_id = ? AND attendance_date = ?',
             whereArgs: [studentId, date],
@@ -149,7 +132,6 @@ class AttendanceRepository {
             'status': status,
             'batch_id': batchId,
             'notes': r['notes'] ?? existing.first['notes'],
-            'deleted_at': null,
             ...SyncStamp.now(db).touchColumns(),
           }, where: 'id = ?', whereArgs: [existing.first['id']]);
         }
@@ -163,9 +145,7 @@ class AttendanceRepository {
     final d = await _d;
     await d.transaction((txn) async {
       final rows = await txn.query('attendance',
-          where: 'id = ? AND deleted_at IS NULL',
-          whereArgs: [attendanceId],
-          limit: 1);
+          where: 'id = ?', whereArgs: [attendanceId], limit: 1);
       if (rows.isEmpty) throw RepoException('Attendance record not found');
       if (!const {'present', 'absent', 'late'}.contains(status)) {
         throw RepoException('Invalid attendance status "$status"');
@@ -183,9 +163,7 @@ class AttendanceRepository {
     final d = await _d;
     await d.transaction((txn) async {
       final rows = await txn.query('attendance',
-          where: 'id = ? AND deleted_at IS NULL',
-          whereArgs: [attendanceId],
-          limit: 1);
+          where: 'id = ?', whereArgs: [attendanceId], limit: 1);
       if (rows.isEmpty) throw RepoException('Attendance record not found');
       final date = rows.first['attendance_date'] as String;
       await txn.update('attendance', SyncStamp.now(db).tombstoneColumns(),
@@ -201,29 +179,22 @@ class AttendanceRepository {
     int? batchId,
   }) async {
     final d = await _d;
-    final monthIso = DbFmt.monthStart(month);
+    final monthIso = _monthIso(month);
     await d.transaction((txn) async {
       await _recomputeMonth(txn, monthIso);
     });
-    final conditions = <String>[
-      'ma.month = ?',
-      'ma.deleted_at IS NULL',
-      's.deleted_at IS NULL',
-    ];
+    final conditions = <String>['ma.month = ?'];
     final args = <Object?>[monthIso];
     if (batchId != null) {
       conditions.add('s.batch_id = ?');
-      // Appended, not inserted: the placeholders are bound in the order the
-      // conditions appear, so inserting at the front would swap month and batch
-      // and the batch filter would never match anything.
-      args.add(batchId);
+      args.insert(0, batchId);
     }
     final rows = await d.rawQuery('''
       SELECT ma.*, s.first_name, s.last_name, s.batch_id,
              b.name AS batch_name
       FROM monthly_attendance ma
       JOIN students s ON s.id = ma.student_id
-      LEFT JOIN batches b ON b.id = s.batch_id AND b.deleted_at IS NULL
+      LEFT JOIN batches b ON b.id = s.batch_id
       WHERE ${conditions.join(' AND ')}
       ORDER BY s.first_name COLLATE NOCASE
     ''', args);
@@ -252,18 +223,11 @@ class AttendanceRepository {
     final start = DbFmt.month(dateObj);
     final end = DbFmt.date(DbFmt.addMonths(dateObj, 1));
 
-    // Students with marks in the month UNION students that already have an
-    // aggregate for it. The second half matters after a deletion: without it a
-    // student whose last mark for the month was removed would keep the old
-    // totals forever, because nothing would visit their row again.
     final studentRows = await txn.rawQuery('''
-      SELECT student_id FROM attendance
+      SELECT DISTINCT student_id FROM attendance
       WHERE deleted_at IS NULL
         AND attendance_date >= ? AND attendance_date < ?
-      UNION
-      SELECT student_id FROM monthly_attendance
-      WHERE deleted_at IS NULL AND month = ?
-    ''', [start, end, start]);
+    ''', [start, end]);
 
     for (final sr in studentRows) {
       final studentId = sr['student_id'] as int;
@@ -285,22 +249,11 @@ class AttendanceRepository {
       final total = marks.length;
       final pct =
           total == 0 ? 0.0 : ((presents + lates) / total * 100).clamp(0, 100).toDouble();
-      // No deleted_at filter: `monthly_attendance` is UNIQUE
-      // (student_id, month), so a tombstoned aggregate must be found and
-      // revived rather than inserted alongside.
       final existing = await txn.query('monthly_attendance',
           where: 'student_id = ? AND month = ?',
           whereArgs: [studentId, start],
           limit: 1);
-      final stamp = SyncStamp.now(db);
-      if (total == 0) {
-        // Every mark for the month is gone: retire the aggregate instead of
-        // leaving a "0 classes" row in the monthly summary.
-        if (existing.isNotEmpty && existing.first['deleted_at'] == null) {
-          await txn.update('monthly_attendance', stamp.tombstoneColumns(),
-              where: 'id = ?', whereArgs: [existing.first['id']]);
-        }
-      } else if (existing.isEmpty) {
+      if (existing.isEmpty) {
         await txn.insert('monthly_attendance', {
           'student_id': studentId,
           'month': start,
@@ -309,7 +262,7 @@ class AttendanceRepository {
           'absents': absents,
           'lates': lates,
           'percentage': pct,
-          ...stamp.columns(),
+          ...SyncStamp.now(db).columns(),
         }, conflictAlgorithm: ConflictAlgorithm.ignore);
       } else {
         await txn.update('monthly_attendance', {
@@ -318,19 +271,45 @@ class AttendanceRepository {
           'absents': absents,
           'lates': lates,
           'percentage': pct,
-          'deleted_at': null,
-          ...stamp.touchColumns(),
+          ...SyncStamp.now(db).touchColumns(),
         }, where: 'id = ?', whereArgs: [existing.first['id']]);
       }
       // Sync attendance percentage into that month's progress record if any.
-      // `updated_at` moves with it, otherwise the peer would keep the stale
-      // percentage after the next merge.
+      //
+      // On the attender's build `monthly_progress` is never synced in and has no
+      // screen that writes it, so this matches zero rows and does nothing. It is
+      // left unguarded on purpose: an UPDATE cannot create a row, so it cannot
+      // put an owner-only record on that phone, and a role check here would be a
+      // second place for the table scope to be stated and get out of step with
+      // [syncTables].
       await txn.rawUpdate('''
-        UPDATE monthly_progress SET attendance_percentage = ?,
-               updated_at = ?, device_id = ?
-        WHERE student_id = ? AND month = ? AND deleted_at IS NULL
-      ''', [pct, stamp.updatedAt, stamp.deviceId, studentId, start]);
+        UPDATE monthly_progress
+        SET attendance_percentage = ?,
+            updated_at = datetime('now'),
+            device_id = ?
+        WHERE student_id = ? AND month = ?
+      ''', [pct, db.deviceId, studentId, start]);
     }
+  }
+
+  String _monthIso(String month) =>
+      month.replaceFirst(RegExp(r'-\d{2}$'), '-01');
+
+  /// Daily attendance records for a specific student in a given month.
+  Future<List<Map<String, dynamic>>> getStudentDailyAttendance(
+    int studentId,
+    String month,
+  ) async {
+    final d = await _d;
+    final start = _monthIso(month);
+    final end = DbFmt.date(DbFmt.addMonths(DateTime.parse(start), 1));
+    return d.rawQuery('''
+      SELECT attendance_date, status, notes
+      FROM attendance
+      WHERE student_id = ? AND deleted_at IS NULL
+        AND attendance_date >= ? AND attendance_date < ?
+      ORDER BY attendance_date ASC
+    ''', [studentId, start, end]);
   }
 
   String _names(Map<String, Object?> row) {

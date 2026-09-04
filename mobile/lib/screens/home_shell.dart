@@ -1,20 +1,40 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../core/app_role.dart';
 import '../core/auth_state.dart';
 import '../core/format.dart';
 import '../core/services.dart';
 import '../core/theme.dart';
-import '../platform/tandav_platform.dart';
+import '../platform/app_files.dart';
 import 'attendance/attendance_screen.dart';
 import 'batches/batches_screen.dart';
 import 'dashboard/dashboard_screen.dart';
 import 'events/events_screen.dart';
 import 'fees/fees_screen.dart';
+import 'fees/fee_settings_screen.dart';
 import 'reports/reports_screen.dart';
+import 'reports/export_screen.dart';
+import 'settings/account_screen.dart';
 import 'settings/device_sync_screen.dart';
+import 'settings/upi_settings_screen.dart';
 import 'students/students_screen.dart';
 
+/// The signed-in app: bottom navigation plus the overflow menu.
+///
+/// Which tabs exist is decided by [appRole] at **compile time**. On the
+/// attender's build there are two — Attendance and Fees — and the other screens
+/// are not merely hidden, they are absent from the widget tree. That distinction
+/// matters because [IndexedStack] builds *every* child eagerly: a
+/// hidden-but-constructed `EventsScreen` would still run its queries against
+/// tables the attender's database does not contain. Leaving them out of the list
+/// is what stops them running.
+///
+/// Hiding tabs is not the security boundary — see [syncTables] for the part that
+/// is. This is the ergonomic half: the attender opens the app on the screen he
+/// needs and never has to be told to ignore the rest.
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key});
 
@@ -25,9 +45,8 @@ class HomeShell extends StatefulWidget {
 class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _index = 0;
   int _dashboardKey = 0;
-  int _attendanceTick = 0;
 
-  static const _titles = [
+  static const _ownerTitles = [
     'Dashboard',
     'Students',
     'Batches',
@@ -36,14 +55,50 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     'Events',
   ];
 
+  static const _attenderTitles = ['Attendance', 'Students', 'Batches', 'Fees'];
+
+  static const _titles = isAttenderBuild ? _attenderTitles : _ownerTitles;
+
+  /// How often the app syncs while it is simply sitting open.
+  ///
+  /// This closes the one case that had no trigger at all. Sync otherwise runs on
+  /// app-open and on resume, so a studio that leaves Tandav in the foreground
+  /// all day would never upload what it typed and never see what the other
+  /// phone typed — which is precisely the two-locations scenario the whole sync
+  /// design exists for.
+  ///
+  /// Five minutes trades promptness against waking the radio for nothing. The
+  /// manager's `autoSync` is silent and throttled, so a tick with no internet,
+  /// no connected account, or a sync already in flight costs nothing.
+  static const _foregroundSyncInterval = Duration(minutes: 5);
+  Timer? _syncTimer;
+
+  void _startPeriodicSync() {
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(_foregroundSyncInterval, (_) {
+      if (!mounted) return;
+      context.read<TandavApi>().cloudSync.autoSync();
+    });
+  }
+
+  void _stopPeriodicSync() {
+    _syncTimer?.cancel();
+    _syncTimer = null;
+  }
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Pull anything the other device left in Drive while this app was closed.
+    // Silent by design — no spinner, no error if there is no internet.
+    context.read<TandavApi>().cloudSync.autoSync();
+    _startPeriodicSync();
   }
 
   @override
   void dispose() {
+    _stopPeriodicSync();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -53,17 +108,29 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       // A new month may have started while the app was backgrounded —
       // generate any missing monthly fee records locally.
-      context.read<TandavApi>().ensureMonthlyFees().catchError((_) => 0);
+      final api = context.read<TandavApi>();
+      api.ensureMonthlyFees().catchError((_) => 0);
+      // …and pick up whatever the other master changed in the meantime.
+      api.cloudSync.autoSync();
+      _startPeriodicSync();
+    } else {
+      // Nothing useful happens off-screen, and a timer that survives into the
+      // background only drains the battery.
+      _stopPeriodicSync();
     }
   }
 
   Future<void> _backup() async {
     if (!mounted) return;
     final api = context.read<TandavApi>();
+    if (!appFiles.supportsBackups) {
+      Alert.show(context, appFiles.unavailableMessage, isError: true);
+      return;
+    }
     try {
-      final backup = await api.createBackup();
+      final entry = await api.createBackup();
       if (!mounted) return;
-      Alert.show(context, 'Backup saved: ${backup.name}');
+      Alert.show(context, 'Backup saved: ${entry.name}');
     } on Exception catch (e) {
       if (mounted) {
         Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
@@ -75,7 +142,11 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   Future<void> _restore() async {
     if (!mounted) return;
     final api = context.read<TandavApi>();
-    final List<BackupRef> backups;
+    if (!appFiles.supportsBackups) {
+      Alert.show(context, appFiles.unavailableMessage, isError: true);
+      return;
+    }
+    final List<BackupEntry> backups;
     try {
       backups = await api.listBackups();
     } on Exception {
@@ -87,7 +158,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       Alert.show(context, 'No backups found yet', isError: true);
       return;
     }
-    final selected = await showModalBottomSheet<BackupRef>(
+    final selected = await showModalBottomSheet<BackupEntry>(
       context: context,
       backgroundColor: TandavColors.surface,
       builder: (ctx) => SafeArea(
@@ -128,7 +199,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       builder: (ctx) => AlertDialog(
         backgroundColor: TandavColors.surface,
         title: const Text('Restore data?'),
-        content: Text('This replaces all current data with the backup\n'
+        content: Text(
+            'This replaces all current data with the backup\n'
             '${selected.name}. This cannot be undone.'),
         actions: [
           TextButton(
@@ -148,6 +220,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       if (!ok) throw const FormatException('Restore failed');
       if (!mounted) return;
       Alert.show(context, 'Data restored');
+      // Awaited because the restore may have reintroduced the factory password,
+      // in which case this re-raises the setup gate and drops the session.
       await context.read<AuthState>().notifyDatabaseRestored();
     } on Exception catch (e) {
       if (mounted) {
@@ -186,21 +260,20 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         ],
       ),
     );
-    if (confirmed != true) return;
-    if (!mounted) return;
-    final auth = context.read<AuthState>();
-    await auth.logout();
+    if (confirmed == true) {
+      final auth = context.read<AuthState>();
+      await auth.logout();
+    }
   }
 
   Future<void> _menu() async {
     if (!mounted) return;
     final auth = context.read<AuthState>();
-    final canBackup = context.read<TandavApi>().supportsLocalBackup;
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: TandavColors.surface,
       builder: (ctx) => SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -238,22 +311,90 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                 ],
               ),
               const Divider(height: 28),
+              // Reports lead with the month's collections and revenue, so they
+              // are an owner's view rather than a shared one. The attender needs
+              // to record what is due and paid; he does not need the total.
+              if (!isAttenderBuild)
+                ListTile(
+                  leading: const Icon(Icons.bar_chart_rounded,
+                      color: TandavColors.gold),
+                  title: const Text('Monthly Reports'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => const ReportsScreen()),
+                    );
+                  },
+                ),
+              // Owner-only: pulling the studio's data into Excel/Sheets is an
+              // owner's job, so the attender build never offers it.
+              if (!isAttenderBuild)
+                ListTile(
+                  leading: const Icon(Icons.ios_share_rounded,
+                      color: TandavColors.gold),
+                  title: const Text('Export to Spreadsheet'),
+                  subtitle: const Text('Students, fees, batches, attendance',
+                      style: TextStyle(fontSize: 11.5)),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => const ExportScreen()),
+                    );
+                  },
+                ),
+              // Withheld from the attender build: this configures how revenue is
+              // calculated (late-fee increments), which is an owner decision.
+              if (!isAttenderBuild)
+                ListTile(
+                  leading: const Icon(Icons.tune_rounded,
+                      color: TandavColors.gold),
+                  title: const Text('Fee Settings'),
+                  subtitle: const Text('Late-fee increment for unpaid months',
+                      style: TextStyle(fontSize: 11.5)),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => const FeeSettingsScreen()),
+                    );
+                  },
+                ),
+              // UPI payment settings for the WhatsApp fee reminders — available
+              // to both builds, since attenders also send reminders and confirm
+              // student payments.
               ListTile(
-                leading: const Icon(Icons.bar_chart_rounded,
+                leading: const Icon(Icons.qr_code_2_rounded,
                     color: TandavColors.gold),
-                title: const Text('Monthly Reports'),
+                title: const Text('UPI / Payments'),
+                subtitle: const Text(
+                    'UPI ID for fee pay links in reminders',
+                    style: TextStyle(fontSize: 11.5)),
                 onTap: () {
                   Navigator.pop(ctx);
                   Navigator.push(
                     context,
                     MaterialPageRoute(
-                        builder: (_) => const ReportsScreen()),
+                        builder: (_) => const UpiSettingsScreen()),
                   );
                 },
               ),
-              // A web page has no database file to copy, so on iPhone/Safari
-              // Google Drive Sync is the off-device copy instead.
-              if (canBackup) ...[
+              // Hidden rather than disabled in the iPhone build: a greyed-out
+              // "Backup data" invites the customer to believe their data is
+              // being backed up somewhere. Drive sync is not a backup, so the
+              // honest thing is to not offer the menu item at all.
+              //
+              // Withheld from the attender build for two independent reasons. A
+              // backup is the whole `.db` file, so it carries the password hash
+              // and the account recovery code in plaintext — a copy of it on a
+              // staff phone is a copy of the studio's credentials. And Restore
+              // *replaces everything*, which on this device would overwrite a
+              // day of attendance with whatever that file happens to hold.
+              if (appFiles.supportsBackups && !isAttenderBuild) ...[
                 ListTile(
                   leading: const Icon(Icons.backup_outlined,
                       color: TandavColors.gold),
@@ -274,9 +415,23 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                 ),
               ],
               ListTile(
-                leading: const Icon(Icons.cloud_sync_outlined,
+                leading: const Icon(Icons.shield_outlined,
                     color: TandavColors.gold),
-                title: const Text('Google Drive Sync'),
+                title: const Text('Account'),
+                subtitle: const Text('Password and recovery code',
+                    style: TextStyle(fontSize: 11.5)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const AccountScreen()),
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.devices_rounded,
+                    color: TandavColors.gold),
+                title: const Text('Device & Sync'),
                 onTap: () {
                   Navigator.pop(ctx);
                   Navigator.push(
@@ -326,6 +481,30 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
               ),
             ),
             const SizedBox(width: 10),
+            if (roleBadge != null) ...[
+              // Both builds are the same package with the same icon, so on a
+              // phone in someone's hand they are indistinguishable. This label
+              // is how "which app am I looking at?" gets answered during a
+              // support call, without anyone opening a settings screen.
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                decoration: BoxDecoration(
+                  border: Border.all(color: TandavColors.gold, width: 1),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  roleBadge!,
+                  style: const TextStyle(
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.1,
+                    color: TandavColors.gold,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+            ],
             Text(_titles[_index]),
           ],
         ),
@@ -338,59 +517,92 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       ),
       body: IndexedStack(
         index: _index,
-        children: [
-          // Rebuilt on every visit to Home so fee collection totals and
-          // today's attendance reflect the latest SQLite state immediately.
-          DashboardScreen(key: ValueKey('dash-$_dashboardKey')),
-          const StudentsScreen(),
-          const BatchesScreen(),
-          AttendanceScreen(refreshTick: _attendanceTick),
-          const FeesScreen(),
-          const EventsScreen(),
-        ],
+        // Kept in the same order as _titles and the nav items below — three
+        // parallel lists indexed by _index. Separate lists rather than one table
+        // of records because the Dashboard needs a fresh key on every visit and
+        // so cannot be const.
+        children: isAttenderBuild
+            ? const [AttendanceScreen(), StudentsScreen(), BatchesScreen(), FeesScreen()]
+            : [
+                // Rebuilt on every visit to Home so fee collection totals and
+                // today's attendance reflect the latest SQLite state
+                // immediately.
+                DashboardScreen(key: ValueKey('dash-$_dashboardKey')),
+                const StudentsScreen(),
+                const BatchesScreen(),
+                const AttendanceScreen(),
+                const FeesScreen(),
+                const EventsScreen(),
+              ],
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _index,
         onTap: (i) => setState(() {
-          if (i == 0 && i != _index) _dashboardKey++;
-          if (i == 3 && i != _index) _attendanceTick++;
+          // Index 0 is the Dashboard only on the owner build; on the attender's
+          // it is Attendance, and there is no dashboard to re-key.
+          if (!isAttenderBuild && i == 0 && i != _index) _dashboardKey++;
           _index = i;
         }),
         selectedFontSize: _navLabelSize,
         unselectedFontSize: _navLabelSize,
-        items: const [
-          BottomNavigationBarItem(
-            icon: Icon(Icons.dashboard_outlined),
-            activeIcon: Icon(Icons.dashboard_rounded),
-            label: 'Home',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.groups_outlined),
-            activeIcon: Icon(Icons.groups_rounded),
-            label: 'Students',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.grid_view_outlined),
-            activeIcon: Icon(Icons.grid_view_rounded),
-            label: 'Batches',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.fact_check_outlined),
-            activeIcon: Icon(Icons.fact_check_rounded),
-            label: 'Attendance',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.account_balance_wallet_outlined),
-            activeIcon: Icon(Icons.account_balance_wallet_rounded),
-            label: 'Fees',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.event_outlined),
-            activeIcon: Icon(Icons.event_rounded),
-            label: 'Events',
-          ),
-        ],
+        items: isAttenderBuild ? _attenderNavItems : _ownerNavItems,
       ),
     );
   }
+
+  static const _attenderNavItems = [
+    BottomNavigationBarItem(
+      icon: Icon(Icons.fact_check_outlined),
+      activeIcon: Icon(Icons.fact_check_rounded),
+      label: 'Attendance',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.groups_outlined),
+      activeIcon: Icon(Icons.groups_rounded),
+      label: 'Students',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.grid_view_outlined),
+      activeIcon: Icon(Icons.grid_view_rounded),
+      label: 'Batches',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.account_balance_wallet_outlined),
+      activeIcon: Icon(Icons.account_balance_wallet_rounded),
+      label: 'Fees',
+    ),
+  ];
+
+  static const _ownerNavItems = [
+    BottomNavigationBarItem(
+      icon: Icon(Icons.dashboard_outlined),
+      activeIcon: Icon(Icons.dashboard_rounded),
+      label: 'Home',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.groups_outlined),
+      activeIcon: Icon(Icons.groups_rounded),
+      label: 'Students',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.grid_view_outlined),
+      activeIcon: Icon(Icons.grid_view_rounded),
+      label: 'Batches',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.fact_check_outlined),
+      activeIcon: Icon(Icons.fact_check_rounded),
+      label: 'Attendance',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.account_balance_wallet_outlined),
+      activeIcon: Icon(Icons.account_balance_wallet_rounded),
+      label: 'Fees',
+    ),
+    BottomNavigationBarItem(
+      icon: Icon(Icons.event_outlined),
+      activeIcon: Icon(Icons.event_rounded),
+      label: 'Events',
+    ),
+  ];
 }

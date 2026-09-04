@@ -1,6 +1,14 @@
 # --- Secrets ---
 backend/.env
 
+# Release signing. The keystore itself lives OUTSIDE this repo
+# (D:\Projects\tandav-signing\) so that no git command can ever reach it, but
+# key.properties holds its password and must never be committed.
+# Also ignored by mobile/android/.gitignore; belt and braces.
+key.properties
+*.jks
+*.keystore
+
 # --- Python / backend ---
 backend/.venv/
 .venv/
@@ -15,6 +23,27 @@ backend/uploads/
 # --- Build artifacts ---
 app-release.apk
 *.apk
+
+# Finished, named APKs that ship.ps1 copies out of the Gradle output, plus their
+# .txt sidecars. Build products of a specific machine at a specific minute — the
+# repo describes how to build them, it does not carry them.
+dist/
+
+# Gradle and Flutter build output. 21 Gradle cache files were committed by
+# accident (checksums, .lock, .bin, .ser) — machine-local state that changes on
+# every build and is meaningless to anyone else.
+build/
+.gradle/
+mobile/.dart_tool/
+mobile/android/.gradle/
+mobile/android/build/
+# `mobile/packages/*/android/{.gradle,build}/` was listed here for the vendored
+# ble_peripheral plugin. That whole directory went with the Bluetooth sync path
+# on 2026-08-23; the generic `build/` and `.gradle/` rules above cover any
+# future path dependency anyway.
+
+# Device log captured by ship.ps1 — can contain account details.
+device-log.txt
 
 # --- Flutter / mobile (extra, on top of mobile/.gitignore) ---
 mobile/flutter_*.log

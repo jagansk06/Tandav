@@ -5,14 +5,23 @@ import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'package:tandav_mobile/core/app_role.dart';
 import 'package:tandav_mobile/database/tandav_database.dart';
-import 'package:tandav_mobile/sync/drive/sync_payload.dart';
 import 'package:tandav_mobile/sync/sync_codec.dart';
 import 'package:tandav_mobile/sync/sync_engine.dart';
 import 'package:tandav_mobile/sync/sync_meta.dart';
 import 'package:tandav_mobile/sync/sync_state.dart';
 
-/// Two-device sync simulation. The TandavDatabase singleton is re-opened
+/// The peer these tests claim delivery to.
+///
+/// A sent mark is a claim about one named device, so `markSent` needs somebody
+/// to name. The engine never validates the id against anything — it is only a
+/// key segment — so a fixed constant stands in for "the other phone" and keeps
+/// the marks comparable across a `device()` switch, which a real device id
+/// could not do because it is generated per database file.
+const testPeer = 'TANDAV-PEER';
+
+/// Multi-device sync simulation. The TandavDatabase singleton is re-opened
 /// against a different SQLite file per device — switching the file is
 /// equivalent to moving to the other phone. The engine/state are built fresh
 /// each time the file is switched.
@@ -39,52 +48,42 @@ void main() {
     }
   });
 
-  Future<void> device(String name) async {
+  /// Switch to `name`'s database file and build a fresh engine over it.
+  ///
+  /// [tables] scopes that engine the way the build role does in the real app —
+  /// pass `syncTablesFor(AppRole.attendance)` to get the attender's APK.
+  /// Omitted, it follows [syncTables], which under `flutter test` is the full
+  /// set because no `TANDAV_ROLE` is defined.
+  Future<void> device(String name, {List<String>? tables}) async {
     await TandavDatabase.instance.close();
     final path = p.join(tempDir.path, '$name-$run.db');
     final db = TandavDatabase.instance;
     db.configureForTest(factory: databaseFactoryFfi, overridePath: path);
     await db.open();
     currentState = SyncState(db);
-    currentEngine = SyncEngine(db, currentState);
+    currentEngine = SyncEngine(db, currentState, tables: tables);
   }
 
   String me() => TandavDatabase.instance.deviceId;
 
   Future<Database> open() => TandavDatabase.instance.open();
 
-  Future<SyncDelta> outbound() =>
-      open().then((d) => d.transaction((t) => currentEngine.computeOutbound(t)));
-
-  /// What Google Drive sync publishes: every row this device currently owns.
-  Future<SyncDelta> ownedSnapshot() => open().then((d) =>
-      d.transaction((t) => currentEngine.computeOutbound(t, ownedBy: me())));
-
-  /// Serialise an owned snapshot exactly as it would be written to
-  /// `Tandav/sync/devices/TANDAV-XXXX.json`.
-  String publish(SyncDelta delta, String deviceId) =>
-      SyncPayload.toJsonString(SyncPayload.encodeShard(
-        deviceId: deviceId,
-        delta: delta,
-        uploadedAt: DateTime.now().toUtc().toIso8601String(),
-      ));
-
-  /// Read shard files back and merge them, as [DriveSyncManager] does.
-  Future<SyncApplyResult> mergeShards(
-    List<String> shardJson,
-    String peerDeviceId,
-  ) async {
-    final combined =
-        SyncPayload.combine(shardJson.map(SyncPayload.decode).toList());
-    final d = await open();
-    return d.transaction((t) => currentEngine.applyIncoming(t, combined,
-        peerDeviceId: peerDeviceId));
-  }
+  Future<SyncDelta> outbound({Set<String> peers = const {testPeer}}) =>
+      open().then((d) =>
+          d.transaction((t) => currentEngine.computeOutbound(t, peers: peers)));
 
   Future<SyncApplyResult> applyTo(SyncDelta delta, String peerDeviceId) =>
       open().then((d) => d.transaction((t) => currentEngine.applyIncoming(
           t, delta.tables,
           peerDeviceId: peerDeviceId)));
+
+  /// Stand-in for a transport confirming delivery. The real carriers call this
+  /// after a successful Drive write / the peer's `syncDone`, and suppression of
+  /// repeat sends depends entirely on it.
+  Future<void> markSent(SyncDelta delta,
+          {Set<String> peers = const {testPeer}}) =>
+      open().then((d) =>
+          d.transaction((t) => currentEngine.markDeltaSent(t, delta, peers: peers)));
 
   Future<int> seedStudent(String name, {int? batchId}) async {
     final d = await open();
@@ -118,6 +117,22 @@ void main() {
       'monthly_fee': 0,
       'is_active': 1,
       'notes': null,
+      ...SyncStamp.now(TandavDatabase.instance).columns(),
+    });
+  }
+
+  /// A row from a table the attender's build has no business holding, used to
+  /// prove the scope filter works in both directions.
+  Future<int> seedEvent(String name, {int? batchId}) async {
+    final d = await open();
+    return d.insert('events', {
+      'name': name,
+      'description': null,
+      'event_type': 'annual_day',
+      'event_date': '2026-12-20',
+      'location': null,
+      'batch_id': batchId,
+      'is_active': 1,
       ...SyncStamp.now(TandavDatabase.instance).columns(),
     });
   }
@@ -158,7 +173,7 @@ void main() {
         0;
   }
 
-  test('records flow both ways, FKs remap, and watermarks suppress repeats',
+  test('records flow both ways, FKs remap, and confirmed sends suppress repeats',
     () async {
     await device('a');
     final aId = me();
@@ -168,6 +183,7 @@ void main() {
     final aDelta = await outbound();
     expect(aDelta.tables['batches']!.length, 1);
     expect(aDelta.tables['students']!.length, 1);
+    await markSent(aDelta);
 
     await device('b');
     final bId = me();
@@ -189,24 +205,127 @@ void main() {
     // B creates a second student, syncs back to A.
     await seedStudent('Meera');
     final bDelta = await outbound();
+    await markSent(bDelta);
     await device('a');
     final appliedA = await applyTo(bDelta, bId);
     expect(appliedA.totalApplied, greaterThan(0));
     expect(await findStudent('Meera'), isNotNull);
 
-    // A's next delta must NOT re-send Meera — the watermark advanced. The
-    // batch row MAY be re-sent: the watermark only covers data received from
-    // the peer, so our own rows in tables the peer never sent us are
-    // retransmitted (the peer skips them as unchanged echoes).
+    // A's batch row is not re-sent: A delivered it and marked it so.
+    //
+    // Meera IS offered back once. That is the deliberate price of filtering
+    // outbound by "what we have delivered" rather than "what we have received":
+    // A has never *sent* Meera, so A offers her. Sending one redundant row is
+    // harmless — B skips it as an unchanged echo — whereas the reverse mistake
+    // silently loses edits forever, which is the bug this design replaced.
     final aDelta2 = await outbound();
-    expect(aDelta2.rowCount, 1);
-    expect(aDelta2.tables['students'] ?? const [], isEmpty);
-    expect((aDelta2.tables['batches'] ?? const []).length, 1);
+    expect(aDelta2.tables['batches'] ?? const [], isEmpty);
+    expect((aDelta2.tables['students'] ?? const []).length, 1);
 
-    // B is not bothered by the repeated batch row.
     await device('b');
     final appliedB2 = await applyTo(aDelta2, aId);
-    expect(appliedB2.totalApplied, 0);
+    expect(appliedB2.totalApplied, 0, reason: 'B already has Meera');
+
+    // The echo terminates — this is the property that actually matters, because
+    // a re-send that never stopped would be an infinite loop between the two
+    // phones.
+    await device('a');
+    await markSent(aDelta2);
+    expect((await outbound()).rowCount, 0);
+  });
+
+  test('a peer that holds nothing forces a full send for everyone', () async {
+    // The three-device case that a single `sent.<table>` mark got wrong. Two
+    // owner phones sync for weeks; then the attender's phone joins. Because one
+    // file serves every reader, the bundle has to satisfy whoever is furthest
+    // behind — otherwise the newcomer reads a nearly-empty delta, receives none
+    // of the studio's history, and both sides report a clean sync.
+    const owner = 'TANDAV-OWNER2';
+    const newcomer = 'TANDAV-ATTEND';
+
+    await device('a');
+    final batchId = await seedBatch('Morning');
+    await seedStudent('Ravi', batchId: batchId);
+
+    final first = await outbound(peers: const {owner});
+    expect(first.rowCount, 2);
+    await markSent(first, peers: const {owner});
+
+    // Caught up with the one peer we knew about.
+    expect((await outbound(peers: const {owner})).rowCount, 0);
+
+    // A second peer appears with no mark of its own, so the floor drops back to
+    // "everything" even though the first peer needs none of it.
+    final rejoin = await outbound(peers: const {owner, newcomer});
+    expect(rejoin.tables['batches']!.length, 1);
+    expect(rejoin.tables['students']!.length, 1);
+
+    // Delivery is recorded for both, so the next sync is quiet again.
+    await markSent(rejoin, peers: const {owner, newcomer});
+    expect((await outbound(peers: const {owner, newcomer})).rowCount, 0);
+  });
+
+  test('nothing is claimed delivered while no peer is known', () async {
+    // The hole in the two-device version: the first phone, used for a week
+    // before the second one existed, marked its rows delivered to nobody and
+    // then overwrote its own file with an empty delta. The second phone arrived
+    // to an empty mailbox and a first phone insisting it had sent everything.
+    await device('a');
+    await seedBatch('Morning');
+    await seedStudent('Ravi');
+
+    final alone = await outbound(peers: const {});
+    expect(alone.rowCount, 2, reason: 'no peers means send everything');
+    await markSent(alone, peers: const {});
+
+    // No mark was written at all — not for a peer, not for the legacy
+    // peer-less key — so the data is still on offer the moment somebody does
+    // appear.
+    expect(await countWhere('sync_state', "key LIKE 'sent.%'"), 0);
+    expect((await outbound(peers: const {})).rowCount, 2);
+    expect((await outbound(peers: const {testPeer})).rowCount, 2);
+  });
+
+  test('the attender scope neither stores nor sends the owner-only tables',
+      () async {
+    // What makes the attender's APK a data boundary rather than a hidden menu.
+    // The owner's bundle carries events; the attender's engine must drop them on
+    // the way in and never carry them on the way out.
+    final attenderTables = syncTablesFor(AppRole.attendance);
+    expect(attenderTables, isNot(contains('events')));
+    expect(attenderTables, isNot(contains('event_participations')));
+    expect(attenderTables, isNot(contains('monthly_progress')));
+    // …while keeping everything the two allowed screens read.
+    expect(attenderTables, containsAll(<String>['batches', 'students',
+        'attendance', 'monthly_attendance', 'fees', 'fee_payments']));
+
+    await device('owner');
+    final ownerId = me();
+    final batchId = await seedBatch('Morning');
+    await seedStudent('Ravi', batchId: batchId);
+    await seedEvent('Annual Day', batchId: batchId);
+    final ownerDelta = await outbound();
+    expect(ownerDelta.tables['events']!.length, 1,
+        reason: 'the owner build does send events');
+
+    await device('attender', tables: attenderTables);
+    final applied = await applyTo(ownerDelta, ownerId);
+    expect(applied.applied['students'], 1);
+    expect(applied.applied['batches'], 1);
+    expect(applied.applied.containsKey('events'), isFalse);
+    expect(await countWhere('events', '1 = 1'), 0,
+        reason: 'the event never reached the attender phone');
+    // Skipping is not deleting: the rows the attender does hold are intact, and
+    // the owner's events are untouched on the owner's phone.
+    expect(await findStudent('Ravi'), isNotNull);
+
+    // The send half. Seeded straight into SQLite because nothing in this build
+    // can create an event — the point is that even a row that arrived some other
+    // way (a restored file, a hand-edited database) is not forwarded.
+    await seedEvent('Should never leave', batchId: null);
+    final attenderDelta = await outbound();
+    expect(attenderDelta.tables.containsKey('events'), isFalse);
+    expect(attenderDelta.tables.keys, everyElement(isIn(attenderTables)));
   });
 
   test('last-write-wins by updated_at', () async {
@@ -316,292 +435,12 @@ void main() {
     expect(await countWhere('batches', 'deleted_at IS NULL'), 1);
   });
 
-  // ---------------------------------------------------------------------
-  // Google Drive sync. These exercise the real transport path — owned
-  // snapshot -> JSON shard file -> decode -> combine -> merge — without
-  // needing a network or a Google account.
-  // ---------------------------------------------------------------------
-
-  test('Drive shards round-trip through JSON and merge both ways', () async {
-    await device('a');
-    final aId = me();
-    final batchId = await seedBatch('Morning');
-    await seedStudent('Ravi', batchId: batchId);
-    final aShard = publish(await ownedSnapshot(), aId);
-
-    // The file really is JSON, tagged with its writer.
-    final aParsed = SyncPayload.decode(aShard);
-    expect(aParsed.deviceId, aId);
-    expect(aParsed.tables['batches']!.length, 1);
-    expect(aParsed.tables['students']!.length, 1);
-
-    await device('b');
-    final bId = me();
-    final applied = await mergeShards([aShard], aId);
-    expect(applied.totalApplied, 2);
-
-    // Foreign keys survived the JSON hop: local ids differ per device, so the
-    // batch link must have been rebuilt from the uuid.
-    final d = await open();
-    final joined = await d.rawQuery('''
-      SELECT s.first_name, b.name AS batch_name
-      FROM students s LEFT JOIN batches b ON b.id = s.batch_id
-      WHERE s.deleted_at IS NULL
-    ''');
-    expect(joined.first['batch_name'], 'Morning');
-
-    // Merging the same shard again is a no-op — no duplicates.
-    final again = await mergeShards([aShard], aId);
-    expect(again.totalApplied, 0);
-    expect((await allStudents()).length, 1);
-
-    // B edits and publishes; A merges and adopts B's newer value.
-    final bRow = await findStudent('Ravi');
-    await renameStudent(bRow!['id'] as int, 'Ravi Kumar');
-    final bShard = publish(await ownedSnapshot(), bId);
-
-    await device('a');
-    await mergeShards([bShard], bId);
-    expect(await findStudent('Ravi Kumar'), isNotNull);
-    expect(await findStudent('Ravi'), isNull);
-    expect((await allStudents()).length, 1);
-  });
-
-  test('a shard carrying only the child still merges (parent stays with peer)',
-      () async {
-    // Regression: a shard holds only the rows its device owns, so when the
-    // other device edits just the student the batch is absent from the payload
-    // even though it is sitting in our database. Resolving the parent from the
-    // payload alone classed the student as an orphan and skipped it, and
-    // because orphans hold the watermark back it was skipped again on every
-    // later sync — the edit was silently lost and reported as "1 already
-    // current". The parent must be resolved by sync_uuid from the database.
-    await device('a');
-    final aId = me();
-    final batchId = await seedBatch('Morning');
-    await seedStudent('Ravi', batchId: batchId);
-    final aShard = publish(await ownedSnapshot(), aId);
-
-    await device('b');
-    final bId = me();
-    await mergeShards([aShard], aId);
-    await renameStudent((await findStudent('Ravi'))!['id'] as int, 'Ravi Kumar');
-
-    // Establish the precondition the bug depended on: B owns only the student.
-    final bShard = publish(await ownedSnapshot(), bId);
-    final bTables = SyncPayload.decode(bShard).tables;
-    expect(bTables['students']!.length, 1);
-    expect(bTables['batches'] ?? const [], isEmpty,
-        reason: 'the batch is still owned by A, so B must not publish it');
-
-    await device('a');
-    final applied = await mergeShards([bShard], bId);
-    expect(applied.orphansSkipped['students'] ?? 0, 0,
-        reason: 'the parent batch is already local, so this is not an orphan');
-    expect(applied.totalApplied, 1);
-    expect(await findStudent('Ravi Kumar'), isNotNull);
-    expect(await findStudent('Ravi'), isNull);
-
-    // The foreign key must still resolve to the right batch after the remap.
-    final d = await open();
-    final joined = await d.rawQuery('''
-      SELECT b.name AS batch_name
-      FROM students s LEFT JOIN batches b ON b.id = s.batch_id
-      WHERE s.first_name = 'Ravi Kumar'
-    ''');
-    expect(joined.first['batch_name'], 'Morning');
-
-    // A genuinely unknown parent must still be treated as an orphan, so the
-    // fallback cannot paper over a real gap: the row waits for its parent
-    // instead of being inserted with a dangling or null link.
-    final orphanShard = SyncPayload.toJsonString(SyncPayload.encodeShard(
-      deviceId: bId,
-      delta: SyncDelta()
-        ..tables['students'] = [
-          {
-            '_table': 'students',
-            '_fk': {'batches': 'uuid-that-does-not-exist'},
-            'first_name': 'Nowhere',
-            'last_name': '',
-            'batch_id': 4242,
-            'sync_uuid': 'uuid-orphan-1',
-            'device_id': bId,
-            'updated_at': '2099-01-01T00:00:00.000Z',
-            'deleted_at': null,
-          }
-        ],
-      uploadedAt: DateTime.now().toUtc().toIso8601String(),
-    ));
-    final orphaned = await mergeShards([orphanShard], bId);
-    expect(orphaned.orphansSkipped['students'], 1);
-    expect(await findStudent('Nowhere'), isNull);
-  });
-
-  test('owned snapshot keeps publishing our rows after the watermark moves',
-      () async {
-    // This is why Drive sync publishes an owned snapshot instead of a
-    // watermark delta: our shard file is overwritten on every upload, so it
-    // must always carry everything we own. A delta would drop rows a device
-    // that stayed offline for several syncs had not yet read.
-    await device('a');
-    final aId = me();
-    await seedStudent('Ravi');
-    final aShard = publish(await ownedSnapshot(), aId);
-
-    await device('b');
-    final bId = me();
-    await mergeShards([aShard], aId);
-    await seedStudent('Meera');
-    final bShard = publish(await ownedSnapshot(), bId);
-
-    await device('a');
-    await mergeShards([bShard], bId); // advances A's students watermark
-
-    // A watermark delta would now omit Ravi...
-    final delta = await outbound();
-    expect(delta.tables['students'] ?? const [], isEmpty);
-
-    // ...but the owned snapshot still carries it, so a third sync still works.
-    final snapshot = await ownedSnapshot();
-    final names = (snapshot.tables['students'] ?? const [])
-        .map((r) => r['first_name'])
-        .toList();
-    expect(names, contains('Ravi'));
-    expect(names, isNot(contains('Meera')),
-        reason: 'Meera is owned by B, so B publishes her — not A');
-  });
-
-  test('a row leaves our shard once the other device edits it', () async {
-    await device('a');
-    final aId = me();
-    await seedStudent('Shared');
-    final aShard = publish(await ownedSnapshot(), aId);
-
-    await device('b');
-    final bId = me();
-    await mergeShards([aShard], aId);
-    // Before B touches it the row belongs to A, so B must not publish it.
-    expect((await ownedSnapshot()).tables['students'] ?? const [], isEmpty);
-
-    await renameStudent((await findStudent('Shared'))!['id'] as int, 'Mine now');
-    final bShard = publish(await ownedSnapshot(), bId);
-    expect(SyncPayload.decode(bShard).tables['students']!.length, 1);
-
-    await device('a');
-    await mergeShards([bShard], bId);
-    // Ownership moved to B, so A stops publishing it. Every row therefore
-    // lives in exactly one shard and the union stays complete.
-    expect((await ownedSnapshot()).tables['students'] ?? const [], isEmpty);
-    expect((await allStudents()).length, 1);
-  });
-
-  test('tombstones travel through a Drive shard', () async {
-    await device('a');
-    final aId = me();
-    final id = await seedStudent('Doomed');
-    final liveShard = publish(await ownedSnapshot(), aId);
-
-    await device('b');
-    await mergeShards([liveShard], aId);
-    expect(await countWhere('students', 'deleted_at IS NULL'), 1);
-
-    await device('a');
-    await tombstoneStudent(id);
-    final deletedShard = publish(await ownedSnapshot(), aId);
-
-    await device('b');
-    await mergeShards([deletedShard], aId);
-    expect(await countWhere('students', 'deleted_at IS NULL'), 0);
-    expect(await countWhere('students', 'deleted_at IS NOT NULL'), 1);
-  });
-
-  test('combine keeps the newest copy when a row appears in two shards',
-      () async {
-    // A stale shard from the previous owner and a fresh one from the new owner
-    // both describe the same record; the newer must win regardless of order.
-    Map<String, Object?> row(String name, String updatedAt, String device) => {
-          'first_name': name,
-          'sync_uuid': 'uuid-1',
-          'device_id': device,
-          'updated_at': updatedAt,
-          'deleted_at': null,
-        };
-
-    final stale = ParsedPayload(
-      deviceId: 'TANDAV-A001',
-      uploadedAt: '',
-      tables: {
-        'students': [row('Old', '2026-08-01T10:00:00.000Z', 'TANDAV-A001')],
-      },
-    );
-    final fresh = ParsedPayload(
-      deviceId: 'TANDAV-B002',
-      uploadedAt: '',
-      tables: {
-        'students': [row('New', '2026-08-02T10:00:00.000Z', 'TANDAV-B002')],
-      },
-    );
-
-    for (final order in [
-      [stale, fresh],
-      [fresh, stale],
-    ]) {
-      final merged = SyncPayload.combine(order);
-      expect(merged['students']!.length, 1);
-      expect(merged['students']!.first['first_name'], 'New');
-    }
-
-    // Exact timestamp tie: the higher device id wins on both devices.
-    final tieA = ParsedPayload(deviceId: 'TANDAV-A001', uploadedAt: '', tables: {
-      'students': [row('FromA', '2026-08-03T10:00:00.000Z', 'TANDAV-A001')],
-    });
-    final tieB = ParsedPayload(deviceId: 'TANDAV-B002', uploadedAt: '', tables: {
-      'students': [row('FromB', '2026-08-03T10:00:00.000Z', 'TANDAV-B002')],
-    });
-    expect(SyncPayload.combine([tieA, tieB])['students']!.first['first_name'],
-        'FromB');
-    expect(SyncPayload.combine([tieB, tieA])['students']!.first['first_name'],
-        'FromB');
-  });
-
-  test('shards never carry credentials or device-local file paths', () async {
-    await device('a');
-    final aId = me();
-    final id = await seedStudent('Photographed');
-    final d = await open();
-    await d.update('students', {'photo_url': '/data/user/0/photos/9.jpg'},
-        where: 'id = ?', whereArgs: [id]);
-
-    final shard = publish(await ownedSnapshot(), aId);
-
-    // A device-local absolute path is meaningless (and mildly private) on the
-    // other device, so it is stripped. Being *absent* rather than null also
-    // means merging leaves each device's own photo path untouched.
-    expect(shard.contains('photo_url'), isFalse);
-    expect(shard.contains('/data/user/0/photos'), isFalse);
-
-    // The users table holds password hashes and is not a syncable table at
-    // all, so no credential can reach Drive by construction.
-    expect(SyncCodec.applyOrder, isNot(contains('users')));
-    for (final table in SyncCodec.applyOrder) {
-      for (final column in SyncCodec.columnsFor(table)) {
-        expect(
-          RegExp('password|secret|token|credential|private_key',
-                  caseSensitive: false)
-              .hasMatch(column),
-          isFalse,
-          reason: '$table.$column looks like a credential',
-        );
-      }
-    }
-  });
-
-  test('a newer sync file format is refused with a clear message', () {
-    expect(
-      () => SyncPayload.decode('{"formatVersion": 99, "tables": {}}'),
-      throwsA(isA<FormatException>()),
-    );
-  });
+  // A test covering FrameCodec / FrameAccumulator / envelope / pairingCode /
+  // authToken was removed here along with `lib/sync/protocol.dart`. Those were
+  // Bluetooth wire framing and the BLE pairing handshake; nothing in the app
+  // uses them now that Drive is the only transport. The one piece of that file
+  // still needed — `syncProtocolVersion` — moved to `sync_bundle.dart` and is
+  // covered by the bundle decode tests in `cloud_sync_test.dart`.
 
   test('SyncCodec round trips payloads with FKs', () {
     final row = <String, Object?>{

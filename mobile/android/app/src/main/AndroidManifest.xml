@@ -1,8 +1,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Internet is used for one thing only: synchronizing with the user's own
-         Google Drive when they tap Sync. Every other feature works offline, so
-         no other permission is requested. Bluetooth is no longer used at all. -->
+    <!-- Google Drive sync mailbox: the two masters are usually in different
+         places, so changes travel through one small file in a shared Google
+         account. The app talks to Google only — there is no Tandav server.
+
+         A Bluetooth LE transport used to live here and needed five permissions
+         plus <uses-feature android:name="android.hardware.bluetooth_le"
+         android:required="true" />. That feature tag also silently restricted
+         which devices could install the app at all, so removing the Bluetooth
+         path widened hardware support as a side effect. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <application
         android:label="Tandav"
         android:name="${applicationName}"
@@ -51,6 +58,12 @@
         <intent>
             <action android:name="android.intent.action.VIEW"/>
             <data android:scheme="whatsapp"/>
+        </intent>
+        <!-- Lets url_launcher resolve upi://pay deep links so the "Tap to
+             pay" button can open the student's UPI app directly. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="upi"/>
         </intent>
     </queries>
 </manifest>

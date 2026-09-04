@@ -1,0 +1,48 @@
+# Line endings
+# ------------
+# The repo was committed with LF but the working tree drifted to CRLF, which
+# made 175 untouched files show up as modified and buried the real changes.
+# Pinning the normalized (in-repo) form to LF stops that from recurring.
+#
+# `text=auto` lets git decide which files are text; `eol=lf` then fixes what
+# lands in a commit. Windows editors, Flutter, Gradle and PowerShell all handle
+# LF fine, so there is no reason to store CRLF.
+* text=auto eol=lf
+
+# Windows-only scripts that some tools genuinely expect with CRLF.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binaries — never touch these, and never try to diff them as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.ttf  binary
+*.otf  binary
+*.woff  binary
+*.woff2 binary
+*.pdf  binary
+*.apk  binary
+*.jks  binary
+*.keystore binary
+*.so   binary
+*.jar  binary
+*.bin  binary
+*.ser  binary
+
+# The SQLite engine. `text=auto` would almost certainly classify it as binary on
+# its own, but "almost certainly" is not good enough here: a single mangled byte
+# in sqlite3.wasm does not fail the build, it hangs the web app on the splash
+# screen with a WebAssembly LinkError, which is a whole day to diagnose.
+*.wasm binary
+
+# Generated code: keep it out of diff noise and language stats.
+# (A `mobile/packages/ble_peripheral/**` vendored rule sat here until the
+# Bluetooth sync path was deleted on 2026-08-23.)
+*.g.dart   linguist-generated
+*.g.kt     linguist-generated
+*.g.swift  linguist-generated
+*.g.cpp    linguist-generated

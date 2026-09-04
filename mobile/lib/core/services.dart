@@ -1,7 +1,3 @@
-import 'dart:typed_data';
-
-import 'package:flutter/foundation.dart';
-
 import '../database/tandav_database.dart';
 import '../models/attendance.dart';
 import '../models/batch.dart';
@@ -10,18 +6,22 @@ import '../models/event.dart';
 import '../models/fee.dart';
 import '../models/progress.dart';
 import '../models/student.dart';
-import '../platform/tandav_platform.dart';
+import '../platform/app_files.dart' show BackupEntry;
 import '../repositories/attendance_repository.dart';
 import '../repositories/auth_repository.dart';
 import '../repositories/batch_repository.dart';
 import '../repositories/dashboard_repository.dart';
 import '../repositories/event_repository.dart';
+import '../repositories/export_repository.dart';
 import '../repositories/fee_repository.dart';
 import '../repositories/progress_repository.dart';
 import '../repositories/student_repository.dart';
-import '../sync/drive/drive_sync_manager.dart';
+import '../sync/cloud_sync.dart';
+import '../sync/drive_mailbox.dart';
 import '../sync/sync_engine.dart';
+import '../sync/sync_mailbox.dart';
 import '../sync/sync_state.dart';
+import 'app_role.dart';
 
 /// Tandav local data service.
 ///
@@ -32,7 +32,11 @@ import '../sync/sync_state.dart';
 /// offline: no network, no server, no laptop required.
 class TandavApi {
   final TandavDatabase db;
-  TandavApi({TandavDatabase? database}) : db = database ?? TandavDatabase.instance;
+  TandavApi({TandavDatabase? database, SyncMailbox? mailbox})
+      : db = database ?? TandavDatabase.instance,
+        _mailbox = mailbox;
+
+  final SyncMailbox? _mailbox;
 
   late final AuthRepository auth = AuthRepository(db);
   late final BatchRepository batches = BatchRepository(db);
@@ -42,41 +46,34 @@ class TandavApi {
   late final EventRepository events = EventRepository(db);
   late final ProgressRepository progress = ProgressRepository(db);
   late final DashboardRepository dashboard = DashboardRepository(db, fees);
+  late final ExportRepository export = ExportRepository(db);
 
   // ---- Sync ----
   late final SyncState syncState = SyncState(db);
-  late final SyncEngine syncEngine = SyncEngine(db, syncState);
 
-  /// Google Drive synchronization. Works identically on Android and in the
-  /// browser; the platform-specific part is only how the Google access token is
-  /// obtained. Nothing here is required for normal use — Tandav is fully
-  /// functional offline and only touches the network when the user syncs.
-  late final DriveSyncManager sync = DriveSyncManager(
+  /// The merge engine, scoped to the tables **this build** is allowed to hold.
+  ///
+  /// [syncTables] is passed explicitly even though the engine defaults to it,
+  /// because this is the one line in the app where the attender build's data
+  /// boundary is actually established. An implicit default here would make the
+  /// most security-relevant decision in the codebase invisible at its call site.
+  late final SyncEngine syncEngine =
+      SyncEngine(db, syncState, tables: syncTables);
+
+  /// Where the studio's devices leave files for each other. Built lazily so
+  /// tests can inject a fake and never construct a Google client.
+  late final SyncMailbox mailbox = _mailbox ?? DriveMailbox();
+
+  /// The one and only sync path: a shared Google Drive account acting as a
+  /// store-and-forward mailbox. A Bluetooth transport used to sit alongside
+  /// this; it was removed because the masters are in different places, so it
+  /// could never carry the everyday case.
+  late final CloudSyncManager cloudSync = CloudSyncManager(
     db: db,
     state: syncState,
     engine: syncEngine,
-  )..onDataChanged = bumpRevision;
-
-  /// Incremented whenever business data changes in a way that other screens
-  /// may already be displaying — a local create/update/delete, a Drive sync
-  /// that applied remote rows, or a database restore.
-  ///
-  /// Screens that cache query results (for example the Attendance batch
-  /// dropdown) listen to this and reload, so a batch created on the Batches
-  /// tab or arriving from the other device shows up without restarting the
-  /// app. Deliberately *not* bumped by high-frequency writes such as marking
-  /// attendance, which would fight with the screen doing the writing.
-  final ValueNotifier<int> revision = ValueNotifier<int>(0);
-
-  /// Announce that shared business data changed. Safe to call from anywhere.
-  void bumpRevision() => revision.value++;
-
-  /// Run a mutation, then announce the change once it has committed.
-  Future<T> _mutating<T>(Future<T> op) async {
-    final result = await op;
-    bumpRevision();
-    return result;
-  }
+    mailbox: mailbox,
+  );
 
   /// Generate missing monthly fee records for the current month (and any
   /// months missed while the app was closed). Idempotent; call at startup
@@ -89,13 +86,11 @@ class TandavApi {
 
   Future<Batch> getBatch(int id) => batches.getBatch(id);
 
-  Future<Batch> createBatch(Map<String, dynamic> payload) =>
-      _mutating(batches.createBatch(payload));
+  Future<Batch> createBatch(Map<String, dynamic> payload) => batches.createBatch(payload);
 
-  Future<Batch> updateBatch(int id, Map<String, dynamic> payload) =>
-      _mutating(batches.updateBatch(id, payload));
+  Future<Batch> updateBatch(int id, Map<String, dynamic> payload) => batches.updateBatch(id, payload);
 
-  Future<void> deleteBatch(int id) => _mutating(batches.deleteBatch(id));
+  Future<void> deleteBatch(int id) => batches.deleteBatch(id);
 
   // ---- Students ----
   Future<StudentListResponse> getStudents({
@@ -115,18 +110,20 @@ class TandavApi {
     // and every month since (existing records are never duplicated).
     final join = DateTime.tryParse(payload['join_date'] ?? '');
     await fees.ensureMonthlyFees(DateTime.now(), anchor: join ?? DateTime.now());
-    bumpRevision();
     return s;
   }
 
-  Future<Student> updateStudent(int id, Map<String, dynamic> payload) =>
-      _mutating(students.updateStudent(id, payload));
+  Future<Student> updateStudent(int id, Map<String, dynamic> payload) => students.updateStudent(id, payload);
 
-  Future<void> deleteStudent(int id) => _mutating(students.deleteStudent(id));
+  Future<void> deleteStudent(int id) => students.deleteStudent(id);
 
-  /// Store a picked photo for a student and return its local handle.
-  Future<String> uploadPhoto(int studentId, Uint8List bytes, String filename) =>
-      students.savePhoto(studentId, bytes, filename);
+  /// Save a picked photo into app documents and return its local path.
+  ///
+  /// `sourcePath` rather than a `File` so this signature survives the web
+  /// build, where `dart:io` does not exist. Android only — guard on
+  /// `appFiles.supportsPhotos`.
+  Future<String> uploadPhoto(int studentId, String sourcePath, String filename) =>
+      students.savePhoto(studentId, sourcePath, filename);
 
   // ---- Attendance ----
   Future<AttendanceDay> getAttendanceDay(String date, {int? batchId}) =>
@@ -145,6 +142,12 @@ class TandavApi {
     int? batchId,
   }) =>
       attendance.getMonthlyAttendance(month, batchId: batchId);
+
+  Future<List<Map<String, dynamic>>> getStudentDailyAttendance(
+    int studentId,
+    String month,
+  ) =>
+      attendance.getStudentDailyAttendance(studentId, month);
 
   // ---- Fees ----
   Future<FeeListResponse> getFees({String? month, int? studentId, int? batchId, String? status, String? q}) =>
@@ -173,6 +176,19 @@ class TandavApi {
   /// Payment-history ledger for a student (used on the profile screen).
   Future<List<Map<String, dynamic>>> paymentHistory(int studentId) =>
       fees.paymentHistory(studentId);
+
+  /// The configurable fixed rupee amount added to a month's fee when the
+  /// student did not pay the previous month. See [FeeRepository].
+  Future<double> getLateFeePenalty() => fees.getLateFeePenalty();
+
+  Future<void> setLateFeePenalty(double amount) =>
+      fees.setLateFeePenalty(amount);
+
+  // ---- UPI payments ----
+  Future<String?> getUpiVpa() => fees.getUpiVpa();
+  Future<void> setUpiVpa(String vpa) => fees.setUpiVpa(vpa);
+  Future<String?> getUpiPayee() => fees.getUpiPayee();
+  Future<void> setUpiPayee(String payee) => fees.setUpiPayee(payee);
 
   // ---- Events ----
   Future<EventListResponse> getEvents({String? q, bool? upcomingOnly, bool? pastOnly}) =>
@@ -237,16 +253,28 @@ class TandavApi {
   Future<MonthlyReport> getMonthlyReport(String month) =>
       dashboard.getMonthlyReport(month);
 
+  // ---- CSV export ----
+  /// CSV of every active/archived student with contact and batch details.
+  Future<String> exportStudentsCsv() => export.exportStudents();
+
+  /// CSV of every batch with its default fee and student headcount.
+  Future<String> exportBatchesCsv() => export.exportBatches();
+
+  /// CSV of the monthly fee register (optionally one month).
+  Future<String> exportMonthlyFeesCsv({String? month}) =>
+      export.exportMonthlyFees(month: month);
+
+  /// CSV of the monthly attendance summary (optionally one month / batch).
+  Future<String> exportAttendanceCsv({String? month, int? batchId}) =>
+      export.exportAttendance(month: month, batchId: batchId);
+
   // ---- Backup / restore ----
+  // Android only. `appFiles.supportsBackups` is false in the iPhone PWA and
+  // these throw there; the menu hides them rather than calling.
+  Future<BackupEntry> createBackup() => db.createBackup();
 
-  /// False in the browser, where there is no database file to copy — the
-  /// Backup and Restore actions are hidden there instead of failing.
-  bool get supportsLocalBackup => db.supportsLocalBackup;
+  Future<List<BackupEntry>> listBackups() => db.listBackups();
 
-  Future<BackupRef> createBackup() => db.createBackup();
-
-  Future<List<BackupRef>> listBackups() => db.listBackups();
-
-  Future<bool> restoreFromBackup(BackupRef backup) =>
-      _mutating(db.restoreFromBackup(backup));
+  Future<bool> restoreFromBackup(BackupEntry backup) =>
+      db.restoreFromBackup(backup);
 }

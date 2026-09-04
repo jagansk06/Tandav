@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/services.dart';
 import '../../core/theme.dart';
 import '../../models/batch.dart';
+import '../../sync/cloud_sync.dart';
 import '../../widgets/states.dart';
 import 'batch_detail_screen.dart';
 import 'batch_form_screen.dart';
@@ -17,11 +20,29 @@ class BatchesScreen extends StatefulWidget {
 
 class _BatchesScreenState extends State<BatchesScreen> {
   late Future<BatchListResponse> _future;
+  StreamSubscription<CloudSyncStatus>? _syncSub;
 
   @override
   void initState() {
     super.initState();
     _future = _load();
+    _syncSub = context
+        .read<TandavApi>()
+        .cloudSync
+        .status
+        .listen((s) => _onSyncStatus(s));
+  }
+
+  void _onSyncStatus(CloudSyncStatus s) {
+    if (s.phase == CloudSyncPhase.complete && mounted) {
+      _reload();
+    }
+  }
+
+  @override
+  void dispose() {
+    _syncSub?.cancel();
+    super.dispose();
   }
 
   Future<BatchListResponse> _load() =>

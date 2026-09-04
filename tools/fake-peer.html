@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<!--
+  fake-peer.html
+  ==============
+  Pretends to be a second Tandav device, so the DOWNLOAD + MERGE half of Drive
+  sync can be proven on a real phone without owning two phones.
+
+  Why this is worth doing: the upload half is proven (the phone wrote a bundle
+  and we can read it). The download half — fetch, decode, remap foreign keys,
+  merge, tombstone — has only ever run against FakeMailbox in unit tests. That
+  is the code that writes into a paying studio's database, so "the tests pass"
+  is not the same as "it works".
+
+  This writes a real, valid bundle into the Tandav Sync folder under a made-up
+  device id. The phone treats it as its partner, because the shared account IS
+  the trust boundary — cloud_sync.dart adopts the first peer it sees, with no
+  pairing code.
+
+  HOW TO RUN
+    1. The phone must have synced at least once, so the Tandav Sync folder
+       exists. This tool will not create it.
+    2. cd D:\Projects\Tandav\tools  &&  python -m http.server 8080
+    3. Open http://localhost:8080/fake-peer.html and sign in with the SAME
+       Google account the phone uses.
+    4. Send a batch, then press Sync now on the phone.
+
+  AFTERWARDS, in this order:
+    - "Remove the fake device" here, to delete the planted file.
+    - "Forget the other device" on the phone (Settings -> Device & Sync), or the
+      phone stays paired with TANDAV-WEB1 and will refuse the real second phone.
+
+  Delete this file once two real devices are syncing.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tandav — fake second device</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin:0; padding:32px; background:#faf9f7; color:#1a1a1a;
+         font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:880px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; letter-spacing:-0.01em; }
+  .sub { color:#6b6b6b; margin:0 0 24px; }
+  fieldset { border:1px solid #e0ddd8; border-radius:10px; padding:18px 20px;
+             margin:0 0 20px; background:#fff; }
+  legend { padding:0 8px; font-weight:600; font-size:13px; color:#6b6b6b;
+           text-transform:uppercase; letter-spacing:0.06em; }
+  input[type=text] { width:100%; padding:10px 12px; box-sizing:border-box;
+                     font:13px ui-monospace,Consolas,monospace;
+                     border:1px solid #d5d2cc; border-radius:7px; background:#fff; }
+  label.f { display:block; font-size:12px; color:#6b6b6b; margin:0 0 6px;
+            text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
+  button { padding:10px 16px; font-size:14px; font-weight:600; border-radius:7px;
+           border:1px solid #1a1a1a; background:#1a1a1a; color:#fff; cursor:pointer;
+           margin:12px 8px 0 0; }
+  button.sec { background:#fff; color:#1a1a1a; }
+  button.danger { background:#fff; color:#7f1d1d; border-color:#c98b8b; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .note { padding:14px 16px; border-radius:9px; margin:0 0 20px; font-size:13.5px;
+          background:#fdf6e3; border:1px solid #e8d9a0; color:#713f12; }
+  .note strong { font-weight:700; }
+  .msg { padding:14px 16px; border-radius:9px; margin:16px 0 0; font-weight:600;
+         display:none; font-size:14px; }
+  .good { background:#e8f5ec; border:1px solid #a8d5b8; color:#14532d; }
+  .bad  { background:#fdecec; border:1px solid #f0b4b4; color:#7f1d1d; }
+  .msg small { display:block; font-weight:400; margin-top:7px; line-height:1.5; }
+  table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid #eeece8; }
+  th { color:#6b6b6b; font-weight:600; font-size:11px; text-transform:uppercase;
+       letter-spacing:0.05em; }
+  td.mono, code { font-family:ui-monospace,Consolas,monospace; }
+  pre { background:#f4f2ef; border:1px solid #e5e2dd; border-radius:8px;
+        padding:12px; overflow:auto; font-size:12px; margin:14px 0 0;
+        max-height:340px; }
+  .muted { color:#6b6b6b; font-size:13px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+  .row > div { flex:1 1 240px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Fake second device</h1>
+  <p class="sub">Plants a real sync bundle in Drive as
+     <code id="idEcho">TANDAV-WEB1</code>, to prove the phone can
+     <strong>receive and merge</strong> — not just send.</p>
+
+  <div class="note">
+    <strong>Clean up when you are done, in this order:</strong> press
+    <em>Remove the fake device</em> below, then <em>Forget the other device</em>
+    on the phone under Settings → Device &amp; Sync. The phone remembers its
+    partner by exact id, so if you skip the second step it will keep waiting for
+    <code id="idEcho2">TANDAV-WEB1</code> and refuse the real second phone.
+  </div>
+
+  <fieldset>
+    <legend>Web OAuth client ID</legend>
+    <input type="text" id="cid" spellcheck="false"
+           placeholder="1234567890-abcdefg.apps.googleusercontent.com">
+    <div class="muted" style="margin-top:8px">
+      Same one the visibility test used. Needs
+      <code>http://localhost:8080</code> as an authorized JavaScript origin.
+    </div>
+    <button id="signin">Sign in with Google</button>
+  </fieldset>
+
+  <fieldset id="actions" style="display:none">
+    <legend>Tests</legend>
+
+    <div class="row">
+      <div>
+        <label class="f" for="batch">Batch name to send to the phone</label>
+        <input type="text" id="batch" value="Sent From Browser">
+      </div>
+    </div>
+    <button id="send">Send this batch to the phone</button>
+    <button id="peek" class="sec">Read the phone's bundle</button>
+    <button id="cleanup" class="danger">Remove the fake device</button>
+
+    <div id="msg" class="msg"></div>
+    <div id="out"></div>
+  </fieldset>
+
+  <pre id="log">Waiting…</pre>
+</div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+// The bundle's deviceId and the file name must agree, or cloud_sync.dart
+// rejects the file outright ("written by X but is named for Y"). Derive both
+// from one constant so they cannot drift apart.
+const FAKE_ID   = 'TANDAV-WEB1';
+const FILE_NAME = 'tandav-' + FAKE_ID + '.json';
+const FOLDER    = 'Tandav Sync';
+const SCOPE     = 'https://www.googleapis.com/auth/drive.file';
+const FOLDER_MIME = 'application/vnd.google-apps.folder';
+
+let token = null;
+let folderId = null;
+
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent =
+  new Date().toLocaleTimeString() + '  ' + m + '\n' + $('log').textContent; };
+
+function say(kind, html) {
+  const m = $('msg');
+  m.className = 'msg ' + kind;
+  m.innerHTML = html;
+  m.style.display = 'block';
+}
+
+$('idEcho').textContent = FAKE_ID;
+$('idEcho2').textContent = FAKE_ID;
+
+try { $('cid').value = localStorage.getItem('tandav_web_client_id') || ''; } catch (e) {}
+
+$('signin').onclick = () => {
+  const cid = $('cid').value.trim();
+  if (!cid) { alert('Paste the Web client ID first.'); return; }
+  try { localStorage.setItem('tandav_web_client_id', cid); } catch (e) {}
+  if (!window.google || !google.accounts) {
+    log('ERROR: Google Identity Services did not load. Are you on '
+        + 'http://localhost:8080 and online?');
+    return;
+  }
+  google.accounts.oauth2.initTokenClient({
+    client_id: cid,
+    scope: SCOPE,
+    callback: r => {
+      if (r.error) { log('Auth failed: ' + r.error); return; }
+      token = r.access_token;
+      log('Signed in.');
+      $('actions').style.display = 'block';
+    }
+  }).requestAccessToken();
+};
+
+// `path` is relative to the Drive v3 endpoint, or a full URL — uploads live
+// under /upload/drive/v3/, a different prefix entirely.
+async function drive(path, opts = {}) {
+  const url = path.startsWith('https://')
+    ? path
+    : 'https://www.googleapis.com/drive/v3/' + path;
+  const r = await fetch(url, {
+    ...opts,
+    headers: { Authorization: 'Bearer ' + token, ...(opts.headers || {}) }
+  });
+  if (r.status === 204) return {};
+  const text = await r.text();
+  let body = {};
+  try { body = text ? JSON.parse(text) : {}; } catch (e) { body = { raw: text }; }
+  if (!r.ok) throw new Error((body.error && body.error.message) || r.status);
+  return body;
+}
+
+const q = s => 'q=' + encodeURIComponent(s);
+
+/// Locate the sync folder. Deliberately does NOT create it: if it is missing,
+/// the phone has never synced, and planting a bundle would prove nothing.
+async function folder() {
+  if (folderId) return folderId;
+  const d = await drive('files?' + q(
+    "name = '" + FOLDER + "' and mimeType = '" + FOLDER_MIME +
+    "' and trashed = false") + '&fields=files(id,name)&pageSize=10');
+  const hit = (d.files || [])[0];
+  if (!hit) {
+    throw new Error('No "' + FOLDER + '" folder is visible to this client. '
+      + 'Sync on the phone first, and check you signed in with the same '
+      + 'Google account.');
+  }
+  folderId = hit.id;
+  log('Found ' + FOLDER + ' (id ' + folderId + ').');
+  return folderId;
+}
+
+async function listFolder() {
+  const id = await folder();
+  const d = await drive('files?' + q("'" + id + "' in parents and trashed = false")
+    + '&fields=files(id,name,modifiedTime,size)&pageSize=50');
+  return d.files || [];
+}
+
+/// A bundle in exactly the shape sync_bundle.dart writes and expects.
+///
+/// `batches` is used on purpose: it is the only synced table with no foreign
+/// keys, so a failure here can only be download/decode/merge, never FK remap.
+/// Column list and order follow SyncSchema.all['batches'].
+function buildBundle(batchName) {
+  const nowIso = new Date().toISOString();   // same format as Dart's
+                                             // DateTime.now().toUtc().toIso8601String()
+  return {
+    tandav: 1,                 // SyncBundle.formatVersion
+    protocol: 1,               // syncProtocolVersion — a mismatch is rejected
+    deviceId: FAKE_ID,
+    createdAt: nowIso,
+    rows: 1,
+    tables: {
+      batches: [{
+        name: batchName,
+        dance_style: 'Bharatanatyam',
+        level: 'Beginner',
+        schedule: 'Mon & Wed, 6pm',
+        monthly_fee: 1500,
+        is_active: 1,
+        notes: 'Planted by tools/fake-peer.html to test download + merge.',
+        created_at: nowIso,
+        updated_at: nowIso,
+        sync_uuid: 'sync-' + Date.now() + '-1',
+        device_id: FAKE_ID,
+        deleted_at: null
+      }]
+    }
+  };
+}
+
+async function findFake() {
+  const files = await listFolder();
+  return files.find(f => f.name === FILE_NAME) || null;
+}
+
+$('send').onclick = async () => {
+  try {
+    const name = $('batch').value.trim();
+    if (!name) { alert('Give the batch a name.'); return; }
+    const bundle = buildBundle(name);
+    const json = JSON.stringify(bundle);
+
+    const existing = await findFake();
+    if (existing) {
+      // Overwrite in place, exactly as the app does, so the folder never holds
+      // two files for one device.
+      await drive('https://www.googleapis.com/upload/drive/v3/files/'
+        + existing.id + '?uploadType=media&fields=id,name', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: json
+      });
+      log('Updated ' + FILE_NAME + ' in place.');
+    } else {
+      const id = await folder();
+      const meta = { name: FILE_NAME, parents: [id], mimeType: 'application/json' };
+      const body =
+        '--x\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
+        JSON.stringify(meta) +
+        '\r\n--x\r\nContent-Type: application/json\r\n\r\n' + json +
+        '\r\n--x--';
+      await drive('https://www.googleapis.com/upload/drive/v3/files'
+        + '?uploadType=multipart&fields=id,name', {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/related; boundary=x' },
+        body
+      });
+      log('Created ' + FILE_NAME + ' inside ' + FOLDER + '.');
+    }
+
+    $('out').innerHTML = '';
+    say('good',
+      'Sent a batch named “' + name + '” as ' + FAKE_ID + '.' +
+      '<small>Now on the phone: <strong>Settings → Device &amp; Sync → Sync ' +
+      'now</strong>. Expect a message like “Sync complete — 1 changes received ' +
+      'from ' + FAKE_ID + '”, and the batch to appear in the Batches list. If ' +
+      'it says the account has more than two devices, a stale ' +
+      '<code>tandav-*.json</code> is still in the folder — press <em>Read the ' +
+      'phone\'s bundle</em> to see what is there.</small>');
+  } catch (e) {
+    log('Send failed: ' + e.message);
+    say('bad', 'Could not send.<small>' + e.message + '</small>');
+  }
+};
+
+$('peek').onclick = async () => {
+  try {
+    const files = await listFolder();
+    log(files.length + ' file(s) in ' + FOLDER + '.');
+    const rows = files.map(f =>
+      '<tr><td class="mono">' + f.name + '</td><td>' +
+      (f.size || '?') + ' B</td><td>' + (f.modifiedTime || '') + '</td></tr>'
+    ).join('') || '<tr><td colspan="3" class="muted">empty</td></tr>';
+
+    // The phone's own bundle: a tandav-*.json that is not the one we plant.
+    const phone = files.find(f => /^tandav-.*\.json$/.test(f.name)
+                                  && f.name !== FILE_NAME);
+    let detail = '';
+    if (phone) {
+      const raw = await drive('files/' + phone.id + '?alt=media');
+      const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const counts = Object.entries(parsed.tables || {})
+        .map(([t, r]) => t + ': ' + r.length).join(', ') || 'no rows';
+      detail = '<p class="muted" style="margin-top:16px">'
+        + '<strong>' + phone.name + '</strong> — from '
+        + (parsed.deviceId || '?') + ', written ' + (parsed.createdAt || '?')
+        + '<br>' + counts + '</p><pre>'
+        + text.replace(/[&<]/g, c => (c === '&' ? '&amp;' : '&lt;'))
+        + '</pre>';
+    } else {
+      detail = '<p class="muted" style="margin-top:16px">No bundle from the '
+        + 'phone yet — press Sync now on it.</p>';
+    }
+
+    $('out').innerHTML =
+      '<table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>'
+      + rows + '</table>' + detail;
+    $('msg').style.display = 'none';
+  } catch (e) {
+    log('Read failed: ' + e.message);
+    say('bad', 'Could not read the folder.<small>' + e.message + '</small>');
+  }
+};
+
+$('cleanup').onclick = async () => {
+  try {
+    const existing = await findFake();
+    if (!existing) {
+      say('good', 'Nothing to remove — ' + FILE_NAME + ' is not there.');
+      return;
+    }
+    await drive('files/' + existing.id, { method: 'DELETE' });
+    log('Deleted ' + FILE_NAME + '.');
+    say('good', 'Removed ' + FILE_NAME + '.' +
+      '<small>Now open <strong>Settings → Device &amp; Sync</strong> on the ' +
+      'phone and tap <strong>Forget the other device</strong>, or it will keep ' +
+      'waiting for ' + FAKE_ID + ' and refuse the real second phone. The ' +
+      'batch it already merged stays — delete it in the app if you do not ' +
+      'want it.</small>');
+  } catch (e) {
+    log('Cleanup failed: ' + e.message);
+    say('bad', 'Could not delete.<small>' + e.message + '</small>');
+  }
+};
+
+log('Ready. Paste the Web client ID and sign in.');
+</script>
+</body>
+</html>

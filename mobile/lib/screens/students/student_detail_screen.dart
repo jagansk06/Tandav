@@ -9,7 +9,7 @@ import '../../models/attendance.dart';
 import '../../models/fee.dart';
 import '../../models/progress.dart';
 import '../../models/student.dart';
-import '../../platform/tandav_platform.dart';
+import '../../platform/app_files.dart';
 import '../../widgets/states.dart';
 import '../fees/fee_payment_sheet.dart';
 import '../progress/progress_screen.dart';
@@ -30,7 +30,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
   late Future<FeeListResponse> _feesFuture;
   late Future<List<Map<String, dynamic>>> _paymentsFuture;
 
-  final String _month = '${DateTime.now().year.toString()}-${DateTime.now().month.toString().padLeft(2, '0')}-01';
+  String _month = '${DateTime.now().year.toString()}-${DateTime.now().month.toString().padLeft(2, '0')}-01';
   int? _busyFeeId;
 
   @override
@@ -60,6 +60,13 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
   }
 
   Future<void> _pickAndUploadPhoto() async {
+    // Photos are stored as a file path in a *synced* table, so they only work
+    // where there is a file system. The iPhone build says so rather than
+    // saving a path that will never resolve.
+    if (!appFiles.supportsPhotos) {
+      Alert.show(context, appFiles.unavailableMessage, isError: true);
+      return;
+    }
     final picker = ImagePicker();
     final image = await picker.pickImage(
       source: ImageSource.gallery,
@@ -69,12 +76,8 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
     );
     if (image == null) return;
     try {
-      // Bytes rather than a file path: the same call works in the Android app
-      // and in the browser, where the picked image has no filesystem path.
-      final bytes = await image.readAsBytes();
-      if (!mounted) return;
       final api = context.read<TandavApi>();
-      await api.uploadPhoto(widget.studentId, bytes, image.name);
+      await api.uploadPhoto(widget.studentId, image.path, 'photo.jpg');
       if (!mounted) return;
       Alert.show(context, 'Photo updated');
       _reloadAll();
@@ -391,9 +394,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
   }
 
   Widget _header(Student student) {
-    // Resolved by the platform: a file on Android, inline bytes in the browser,
-    // and null when there is nothing to show (then the initial is used).
-    final photo = tandavPlatform.photoImage(student.photoUrl);
+    final photoUrl = student.photoUrl;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -406,7 +407,11 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
                   CircleAvatar(
                     radius: 34,
                     backgroundColor: TandavColors.surfaceLight,
-                    foregroundImage: photo,
+                    // Null whenever the path does not resolve here — a photo
+                    // taken on the other phone, or any photo at all in the
+                    // iPhone build — which falls through to the initial below.
+                    foregroundImage:
+                        photoUrl == null ? null : appFiles.imageAt(photoUrl),
                     child: Text(
                       student.firstName.isNotEmpty
                           ? student.firstName[0].toUpperCase()
@@ -655,7 +660,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
         leading: CircleAvatar(
           backgroundColor: color.withValues(alpha: 0.15),
           child: Text(
-            score.toStringAsFixed(0),
+            '${score.toStringAsFixed(0)}',
             style: TextStyle(
               color: color,
               fontWeight: FontWeight.w900,
@@ -689,7 +694,6 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
     try {
       await api.createFee(
           widget.studentId, result['month'] as String, result['amount'] as String);
-      if (!mounted) return;
       Alert.show(context, 'Fee record created');
       _reloadAll();
     } on Exception catch (e) {

@@ -1,12 +1,13 @@
 {
-    "name": "Tandav Studio",
+    "name": "Tandav Dance Studio",
     "short_name": "Tandav",
+    "description": "Students, attendance, fees and batches for a dance studio. Works with no internet; syncs with the other device on its own.",
     "start_url": ".",
+    "scope": ".",
     "display": "standalone",
+    "orientation": "portrait-primary",
     "background_color": "#0B0B0E",
     "theme_color": "#0B0B0E",
-    "description": "Tandav Dance Studio — students, batches, attendance and fees. Works offline; syncs through Google Drive.",
-    "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
         {

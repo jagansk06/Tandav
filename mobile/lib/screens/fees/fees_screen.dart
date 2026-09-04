@@ -1,12 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
+import '../../core/app_role.dart';
 import '../../core/format.dart';
 import '../../core/services.dart';
 import '../../core/theme.dart';
 import '../../core/whatsapp.dart';
 import '../../models/batch.dart';
 import '../../models/fee.dart';
+import '../../sync/cloud_sync.dart';
 import '../../widgets/states.dart';
 import '../attendance/monthly_attendance_screen.dart';
 import 'fee_payment_sheet.dart';
@@ -30,16 +35,29 @@ class _FeesScreenState extends State<FeesScreen> {
   int? _busyFeeId;
   late Future<FeeListResponse> _feesFuture;
   late Future<FeeSummary> _summaryFuture;
+  StreamSubscription<CloudSyncStatus>? _syncSub;
 
   @override
   void initState() {
     super.initState();
     _loadBatches();
+    _syncSub = context
+        .read<TandavApi>()
+        .cloudSync
+        .status
+        .listen((s) => _onSyncStatus(s));
+  }
+
+  void _onSyncStatus(CloudSyncStatus s) {
+    if (s.phase == CloudSyncPhase.complete && mounted) {
+      _loadBatches();
+    }
   }
 
   @override
   void dispose() {
     _searchCtrl.dispose();
+    _syncSub?.cancel();
     super.dispose();
   }
 
@@ -110,12 +128,30 @@ class _FeesScreenState extends State<FeesScreen> {
   /// action is completely separate from the database status update — the fee
   /// record is never touched here, so the admin can send (or re-send) the
   /// message later without changing the status.
+  ///
+  /// For an unpaid fee with a studio UPI ID configured, the reminder embeds a
+  /// tap-to-pay `upi://pay` link so the student can settle from their own
+  /// phone. Because a local app gets no payment callback, the admin is then
+  /// asked whether the payment went through — choosing "yes" marks the fee paid
+  /// rather than trusting the UPI app blindly.
   Future<void> _sendWhatsApp(Fee f) async {
     final api = context.read<TandavApi>();
     setState(() => _busyFeeId = f.id);
     try {
       final student = await api.getStudent(f.studentId);
       final isPaid = f.status == 'paid';
+      String? upiLink;
+      if (!isPaid) {
+        final vpa = await api.getUpiVpa();
+        if (vpa != null) {
+          upiLink = WhatsAppService.upiPayLink(
+            vpa: vpa,
+            payee: await api.getUpiPayee(),
+            amount: f.outstanding,
+            note: '${student.fullName} · fee ${Fmt.monthLabel(f.month)}',
+          );
+        }
+      }
       final message = isPaid
           ? WhatsAppService.receiptMessage(
               studentName: student.fullName,
@@ -126,6 +162,7 @@ class _FeesScreenState extends State<FeesScreen> {
               studentName: student.fullName,
               monthLabel: Fmt.monthLabel(f.month),
               amountDue: f.outstanding,
+              upiLink: upiLink,
             );
       final result =
           await WhatsAppService.openChat(number: student.phone, message: message);
@@ -146,6 +183,41 @@ class _FeesScreenState extends State<FeesScreen> {
         case WhatsAppOpenResult.launched:
           break;
       }
+      // For an unpaid fee sent with a UPI pay link, offer to mark the fee paid
+      // once the student confirms. Never offered for receipts or when the fee
+      // is already paid.
+      if (!isPaid && upiLink != null) {
+        await _confirmUpiPayment(f, student.fullName, api, upiLink);
+      }
+    } on Exception catch (e) {
+      if (mounted) {
+        Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
+            isError: true);
+      }
+    } finally {
+      if (mounted) setState(() => _busyFeeId = null);
+    }
+  }
+
+  /// Ask the owner whether the student paid after the UPI reminder went out.
+  /// Marking it paid here updates the fee record to `paid` (the check-mark on
+  /// the student's fee details), optionally followed by a WhatsApp receipt.
+  Future<void> _confirmUpiPayment(
+      Fee f, String studentName, TandavApi api, String upiLink) async {
+    final mark = await showModalBottomSheet<bool>(
+      context: context,
+      backgroundColor: TandavColors.surface,
+      isScrollControlled: true,
+      builder: (_) =>
+          _UpiFlowSheet(fee: f, studentName: studentName, upiLink: upiLink),
+    );
+    if (!mounted || mark == null || !mark) return;
+    setState(() => _busyFeeId = f.id);
+    try {
+      await api.markFeePaid(f.id);
+      if (!mounted) return;
+      Alert.show(context, '${f.studentName} — fee marked PAID');
+      _reload();
     } on Exception catch (e) {
       if (mounted) {
         Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
@@ -315,34 +387,45 @@ class _FeesScreenState extends State<FeesScreen> {
         padding: const EdgeInsets.all(14),
         child: Column(
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: _sum('Expected',
-                      Fmt.money(double.tryParse(s.totalDue) ?? 0)),
-                ),
-                Expanded(
-                  child:
-                      _sum('Collected', Fmt.money(double.tryParse(s.totalPaid) ?? 0)),
-                ),
-                Expanded(
-                  child: _sum('Pending',
-                      Fmt.money(double.tryParse(s.outstanding) ?? 0),
-                      color: TandavColors.danger),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: LinearProgressIndicator(
-                value: (pct / 100).clamp(0, 1),
-                minHeight: 8,
-                backgroundColor: TandavColors.surfaceBorder,
-                valueColor: const AlwaysStoppedAnimation(TandavColors.gold),
+            // The month's expected, collected and outstanding money — the
+            // studio's takings in three numbers. Withheld from the attender
+            // build for the same reason the Dashboard and Monthly Reports are:
+            // his job is recording what each student owes and has paid, one
+            // student at a time, and the register below gives him exactly that.
+            // The totals are the owners' business.
+            //
+            // The counts row survives on both builds. "5 due" is how he knows
+            // there is still work in this month; it says nothing about revenue.
+            if (!isAttenderBuild) ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: _sum('Expected',
+                        Fmt.money(double.tryParse(s.totalDue) ?? 0)),
+                  ),
+                  Expanded(
+                    child:
+                        _sum('Collected', Fmt.money(double.tryParse(s.totalPaid) ?? 0)),
+                  ),
+                  Expanded(
+                    child: _sum('Pending',
+                        Fmt.money(double.tryParse(s.outstanding) ?? 0),
+                        color: TandavColors.danger),
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(height: 6),
+              const SizedBox(height: 8),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: (pct / 100).clamp(0, 1),
+                  minHeight: 8,
+                  backgroundColor: TandavColors.surfaceBorder,
+                  valueColor: const AlwaysStoppedAnimation(TandavColors.gold),
+                ),
+              ),
+              const SizedBox(height: 6),
+            ],
             Row(
               children: [
                 Text(
@@ -352,14 +435,15 @@ class _FeesScreenState extends State<FeesScreen> {
                       fontSize: 12, color: TandavColors.textSecondary),
                 ),
                 const Spacer(),
-                Text(
-                  '${pct.toStringAsFixed(1)}% collected',
-                  style: const TextStyle(
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w800,
-                    color: TandavColors.gold,
+                if (!isAttenderBuild)
+                  Text(
+                    '${pct.toStringAsFixed(1)}% collected',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w800,
+                      color: TandavColors.gold,
+                    ),
                   ),
-                ),
               ],
             ),
           ],
@@ -500,5 +584,136 @@ class _FeesScreenState extends State<FeesScreen> {
       builder: (_) => FeePaymentSheet(fee: f),
     );
     _reload();
+  }
+}
+
+/// Bottom sheet shown right after a reminder with a UPI pay link is sent. It
+/// asks the owner to confirm whether the student actually paid, because the
+/// app can't hear back from the UPI app. A "Tap to pay" button re-opens the
+/// pay link (useful when WhatsApp itself didn't open the student's UPI app).
+/// "Mark as paid" pops true (which marks the fee paid in the student's fee
+/// details); "Not paid yet" pops false.
+class _UpiFlowSheet extends StatelessWidget {
+  final Fee fee;
+  final String studentName;
+  final String upiLink;
+  const _UpiFlowSheet({
+    required this.fee,
+    required this.studentName,
+    required this.upiLink,
+  });
+
+  Future<void> _openPayLink(BuildContext context) async {
+    try {
+      final ok = await launchUrl(
+        Uri.parse(upiLink),
+        mode: LaunchMode.externalApplication,
+        webOnlyWindowName: '_self',
+      );
+      if (!ok && context.mounted) {
+        Alert.show(context, 'No UPI app found on this device',
+            isError: true);
+      }
+    } on Exception {
+      if (context.mounted) {
+        Alert.show(context, 'Could not open the payment link',
+            isError: true);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.qr_code_2_rounded,
+                    color: TandavColors.gold, size: 30),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'UPI payment sent to $studentName',
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w900,
+                          color: TandavColors.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        '${Fmt.money(fee.outstanding)} due · '
+                        '${Fmt.monthLabel(fee.month)}',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          color: TandavColors.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'The reminder opened WhatsApp with a tap-to-pay UPI link for the '
+              'student. Did they complete the payment?',
+              style: TextStyle(
+                color: TandavColors.textSecondary,
+                fontSize: 13,
+                height: 1.45,
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => _openPayLink(context),
+                icon: const Icon(Icons.payments_outlined),
+                label: const Text('Tap to pay'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: TandavColors.gold,
+                  side: const BorderSide(color: TandavColors.gold),
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => Navigator.pop(context, false),
+                    icon: const Icon(Icons.close_rounded, size: 18),
+                    label: const Text('Not paid yet'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: TandavColors.textSecondary,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: GoldButton(
+                    label: 'Mark as paid',
+                    icon: Icons.check_rounded,
+                    onPressed: () => Navigator.pop(context, true),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

@@ -6,130 +6,74 @@ import 'package:provider/provider.dart';
 import '../../core/format.dart';
 import '../../core/services.dart';
 import '../../core/theme.dart';
+import '../../core/whatsapp.dart';
 import '../../models/attendance.dart';
 import '../../models/batch.dart';
+import '../../sync/cloud_sync.dart';
 import '../../widgets/states.dart';
 
 class AttendanceScreen extends StatefulWidget {
-  /// Bumped by [HomeShell] each time the Attendance tab is (re)entered so the
-  /// batch dropdown and roster pick up batches/students created on other tabs.
-  final int refreshTick;
-  const AttendanceScreen({super.key, this.refreshTick = 0});
+  const AttendanceScreen({super.key});
 
   @override
   State<AttendanceScreen> createState() => _AttendanceScreenState();
 }
 
 class _AttendanceScreenState extends State<AttendanceScreen> {
-  /// The batch list is held as plain state rather than a `Future` handed to a
-  /// `FutureBuilder`: a reassigned future briefly rebuilds with no data, and
-  /// any load error used to leave the previous (stale) list on screen.
+  late Future<List<Batch>> _batchesFuture;
   List<Batch> _batches = [];
-  bool _batchesLoading = true;
-  String? _batchesError;
-
   int? _selectedBatchId;
   DateTime _date = DateTime.now();
 
   late Future<AttendanceDay> _dayFuture;
   Map<int, String> _liveStatuses = {};
   int _resetToken = 0;
-
-  TandavApi? _api;
+  StreamSubscription<CloudSyncStatus>? _syncSub;
 
   @override
   void initState() {
     super.initState();
-    _dayFuture = Future.value(_emptyDay);
-    _api = context.read<TandavApi>();
-    // Reload whenever business data changes anywhere in the app — a batch
-    // created on the Batches tab, a student reassigned, or rows arriving from
-    // the other device via a Google Drive sync. Without this the dropdown only
-    // refreshed when the Attendance tab was re-entered, so newly created and
-    // freshly synced batches were missing from it.
-    _api!.revision.addListener(_onDataChanged);
     _loadBatches();
+    _syncSub = context
+        .read<TandavApi>()
+        .cloudSync
+        .status
+        .listen((s) => _onSyncStatus(s));
   }
 
-  @override
-  void dispose() {
-    _api?.revision.removeListener(_onDataChanged);
-    super.dispose();
-  }
-
-  void _onDataChanged() {
-    if (mounted) _loadBatches();
-  }
-
-  @override
-  void didUpdateWidget(AttendanceScreen oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // Re-entering the tab (tick changed) reloads batches + roster too, so the
-    // screen is correct even if a write bypassed the revision notifier.
-    if (oldWidget.refreshTick != widget.refreshTick) {
+  void _onSyncStatus(CloudSyncStatus s) {
+    if (s.phase == CloudSyncPhase.complete && mounted) {
       _loadBatches();
     }
   }
 
-  static const AttendanceDay _emptyDay = AttendanceDay(
-      date: '',
-      batchId: 0,
-      batchName: '',
-      total: 0,
-      present: 0,
-      absent: 0,
-      late: 0,
-      unmarked: 0,
-      percentage: 0,
-      records: []);
+  @override
+  void dispose() {
+    _syncSub?.cancel();
+    super.dispose();
+  }
 
-  /// Load every batch registered in Tandav. Uses the shared batch data (no
-  /// separate attendance-only batch list) so Attendance always agrees with the
-  /// Batches tab.
   Future<void> _loadBatches() async {
-    final api = _api;
-    if (api == null) return;
+    _batchesFuture =
+        context.read<TandavApi>().getBatches().then((r) => r.items);
     try {
-      final res = (await api.getBatches()).items;
+      final res = await _batchesFuture;
       if (!mounted) return;
-      final ids = res.map((b) => b.id).toSet();
       setState(() {
         _batches = res;
-        _batchesLoading = false;
-        _batchesError = null;
-        // Preserve the current selection if it still exists; otherwise fall
-        // back to the first batch (or none if there are no batches).
-        if (_selectedBatchId == null || !ids.contains(_selectedBatchId)) {
-          _selectedBatchId = res.isNotEmpty ? res.first.id : null;
-        }
+        _selectedBatchId = _batches.isNotEmpty ? _batches.first.id : null;
       });
-      // Refetch the roster as well: the trigger for a reload is always either
-      // first load, re-entering the tab, or an external data change (a new
-      // student, a reassignment, a Drive sync), any of which can change who
-      // belongs in this batch. Marking attendance deliberately does not bump
-      // the revision notifier, so this cannot clobber an in-progress edit.
       _reloadDay();
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _batchesLoading = false;
-        _batchesError = e.toString().replaceFirst('Exception: ', '');
-      });
-    }
+    } catch (_) {}
   }
 
   String get _iso =>
       '${_date.year.toString().padLeft(4, '0')}-${_date.month.toString().padLeft(2, '0')}-${_date.day.toString().padLeft(2, '0')}';
 
   void _reloadDay() {
-    if (_selectedBatchId == null) {
-      setState(() {
-        _dayFuture = Future.value(_emptyDay);
-      });
-      return;
-    }
     setState(() {
-      _dayFuture = (_api ?? context.read<TandavApi>())
+      _dayFuture = context
+          .read<TandavApi>()
           .getAttendanceDay(_iso, batchId: _selectedBatchId);
     });
   }
@@ -176,36 +120,40 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
           child: Row(
             children: [
               Expanded(
-                child: DropdownButtonFormField<int?>(
-                  // `_batches` is the single source of truth, so the list can
-                  // never momentarily render empty while a future resolves.
-                  initialValue: _batches.any((b) => b.id == _selectedBatchId)
-                      ? _selectedBatchId
-                      : null,
-                  isExpanded: true,
-                  decoration: InputDecoration(
-                    labelText: 'Batch',
-                    prefixIcon: const Icon(Icons.grid_view_outlined),
-                    contentPadding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                    hintText: _batchesLoading
-                        ? 'Loading batches…'
-                        : (_batches.isEmpty ? 'No batches yet' : 'Select batch'),
-                  ),
-                  items: _batches
-                      .map((b) => DropdownMenuItem<int?>(
-                            value: b.id,
-                            child: Text(b.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis),
-                          ))
-                      .toList(),
-                  onChanged: (v) {
-                    setState(() {
-                      _selectedBatchId = v;
-                      _liveStatuses = {};
-                    });
-                    _reloadDay();
+                child: FutureBuilder<List<Batch>>(
+                  future: _batchesFuture,
+                  builder: (context, snapshot) {
+                    final batches = snapshot.data ?? [];
+                    return DropdownButtonFormField<int?>(
+                      initialValue: _selectedBatchId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Batch',
+                        prefixIcon: Icon(Icons.grid_view_outlined),
+                        contentPadding:
+                            EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                      ),
+                      items: [
+                        const DropdownMenuItem<int?>(
+                          value: null,
+                          child: Text('All batches'),
+                        ),
+                        ...batches
+                            .map((b) => DropdownMenuItem<int?>(
+                                  value: b.id,
+                                  child: Text(b.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis),
+                                )),
+                      ],
+                      onChanged: (v) {
+                        setState(() {
+                          _selectedBatchId = v;
+                          _liveStatuses = {};
+                        });
+                        _reloadDay();
+                      },
+                    );
                   },
                 ),
               ),
@@ -222,32 +170,12 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
           child: FutureBuilder<AttendanceDay>(
             future: _dayFuture,
             builder: (context, snapshot) {
-              // Distinguish the three reasons no roster is showing, instead of
-              // always claiming "No batches yet" (which was misleading while
-              // batches were still loading or had failed to load).
-              if (_batchesLoading) {
-                return const LoadingView(message: 'Loading batches…');
-              }
-              if (_batchesError != null) {
-                return ErrorView(
-                  message: _batchesError!,
-                  onRetry: _loadBatches,
-                );
-              }
-              if (_batches.isEmpty) {
+              if (_selectedBatchId == null && _batches.isEmpty) {
                 return const EmptyView(
                   icon: Icons.fact_check_outlined,
                   title: 'No batches yet',
                   subtitle:
                       'Create a batch first, then mark attendance for its students.',
-                );
-              }
-              if (_selectedBatchId == null) {
-                return const EmptyView(
-                  icon: Icons.grid_view_outlined,
-                  title: 'Select a batch',
-                  subtitle:
-                      'Choose a batch above to mark attendance for its students.',
                 );
               }
               if (snapshot.connectionState != ConnectionState.done) {
@@ -353,14 +281,33 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   Future<void> _quickMarkAll(AttendanceDay day, String status) async {
     try {
       final api = context.read<TandavApi>();
-      final records = day.records
-          .map((r) => {'student_id': r.studentId, 'status': status})
-          .toList();
-      await api.saveAttendanceDay(
-        date: day.date,
-        batchId: _selectedBatchId!,
-        records: records,
-      );
+      if (_selectedBatchId != null) {
+        final records = day.records
+            .map((r) => {'student_id': r.studentId, 'status': status})
+            .toList();
+        await api.saveAttendanceDay(
+          date: day.date,
+          batchId: _selectedBatchId!,
+          records: records,
+        );
+      } else {
+        final byBatch = <int, List<Map<String, dynamic>>>{};
+        for (final r in day.records) {
+          final bid = r.batchId;
+          if (bid == null) continue;
+          byBatch.putIfAbsent(bid, () => []).add({
+            'student_id': r.studentId,
+            'status': status,
+          });
+        }
+        for (final entry in byBatch.entries) {
+          await api.saveAttendanceDay(
+            date: day.date,
+            batchId: entry.key,
+            records: entry.value,
+          );
+        }
+      }
       setState(() {
         _resetToken++;
         _liveStatuses = {};
@@ -442,11 +389,31 @@ class _AttendanceDayEditorState extends State<AttendanceDayEditor> {
           if (_notes[r.studentId] != null) 'notes': _notes[r.studentId],
         };
       }).whereType<Map<String, dynamic>>().toList();
-      await api.saveAttendanceDay(
-        date: widget.day.date,
-        batchId: widget.day.batchId,
-        records: records,
-      );
+      if (widget.day.batchId != 0) {
+        await api.saveAttendanceDay(
+          date: widget.day.date,
+          batchId: widget.day.batchId,
+          records: records,
+        );
+      } else {
+        final byBatch = <int, List<Map<String, dynamic>>>{};
+        for (final r in records) {
+          final studentId = r['student_id'] as int;
+          final row = widget.day.records
+              .where((rec) => rec.studentId == studentId)
+              .firstOrNull;
+          final bid = row?.batchId;
+          if (bid == null) continue;
+          byBatch.putIfAbsent(bid, () => []).add(r);
+        }
+        for (final entry in byBatch.entries) {
+          await api.saveAttendanceDay(
+            date: widget.day.date,
+            batchId: entry.key,
+            records: entry.value,
+          );
+        }
+      }
       widget.onSaved();
     } on Exception catch (e) {
       if (mounted) {
@@ -504,6 +471,7 @@ class _AttendanceDayEditorState extends State<AttendanceDayEditor> {
 
   Widget _row(AttendanceStudentRow r) {
     final status = _statuses[r.studentId] ?? 'unmarked';
+    final notify = status == 'absent' || status == 'late';
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(10),
@@ -530,6 +498,28 @@ class _AttendanceDayEditorState extends State<AttendanceDayEditor> {
                       style: const TextStyle(
                           fontSize: 11.5, color: TandavColors.textMuted),
                     ),
+                  if (notify)
+                    TextButton.icon(
+                      onPressed: _saving ? null : () => _notifyParent(r, status),
+                      icon: Icon(Icons.chat_outlined,
+                          size: 15, color: WhatsAppService.accent),
+                      label: Text(
+                        status == 'late'
+                            ? 'Notify guardian (late)'
+                            : 'Notify guardian (absent)',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: WhatsAppService.accent,
+                        ),
+                      ),
+                      style: TextButton.styleFrom(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(0, 0),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        alignment: Alignment.centerLeft,
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -542,6 +532,50 @@ class _AttendanceDayEditorState extends State<AttendanceDayEditor> {
         ),
       ),
     );
+  }
+
+  Future<void> _notifyParent(AttendanceStudentRow r, String status) async {
+    final api = context.read<TandavApi>();
+    try {
+      final student = await api.getStudent(r.studentId);
+      if (!mounted) return;
+      // The absence notice goes to the guardian (parent). The student record
+      // keeps an emergency contact; fall back to the student's own phone so
+      // there is always a believable destination.
+      final parentNumber =
+          (student.emergencyContactPhone?.isNotEmpty == true)
+              ? student.emergencyContactPhone!
+              : student.phone;
+      final message = WhatsAppService.absentMessage(
+        studentName: student.fullName,
+        date: DateTime.tryParse(widget.day.date) ?? DateTime.now(),
+        late: status == 'late',
+      );
+      final result =
+          await WhatsAppService.openChat(number: parentNumber, message: message);
+      if (!mounted) return;
+      switch (result) {
+        case WhatsAppOpenResult.invalidNumber:
+          Alert.show(
+            context,
+            'No valid guardian phone number for WhatsApp.',
+            isError: true,
+          );
+        case WhatsAppOpenResult.notInstalled:
+          Alert.show(
+            context,
+            'Unable to open WhatsApp. Please make sure WhatsApp is installed.',
+            isError: true,
+          );
+        case WhatsAppOpenResult.launched:
+          break;
+      }
+    } on Exception catch (e) {
+      if (mounted) {
+        Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
+            isError: true);
+      }
+    }
   }
 
   Widget _statusButton(
