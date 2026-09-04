@@ -24,16 +24,19 @@ class DashboardRepository {
     // Ensure fee records exist for the target month (idempotent).
     await fees.ensureMonthlyFees(today, anchor: DateTime.parse(target));
 
-    final totalStudents = Sqflite.firstIntValue(
-            await d.rawQuery('SELECT COUNT(*) FROM students')) ??
+    final totalStudents = Sqflite.firstIntValue(await d.rawQuery(
+            'SELECT COUNT(*) FROM students WHERE deleted_at IS NULL')) ??
         0;
     final activeStudents = Sqflite.firstIntValue(
-            await d.rawQuery('SELECT COUNT(*) FROM students WHERE is_active = 1')) ??
+            await d.rawQuery(
+                'SELECT COUNT(*) FROM students WHERE is_active = 1 AND deleted_at IS NULL')) ??
         0;
-    final totalBatches =
-        Sqflite.firstIntValue(await d.rawQuery('SELECT COUNT(*) FROM batches')) ?? 0;
+    final totalBatches = Sqflite.firstIntValue(await d.rawQuery(
+            'SELECT COUNT(*) FROM batches WHERE deleted_at IS NULL')) ??
+        0;
     final activeBatches = Sqflite.firstIntValue(
-            await d.rawQuery('SELECT COUNT(*) FROM batches WHERE is_active = 1')) ??
+            await d.rawQuery(
+                'SELECT COUNT(*) FROM batches WHERE is_active = 1 AND deleted_at IS NULL')) ??
         0;
     final totalEvents =
         Sqflite.firstIntValue(await d.rawQuery('SELECT COUNT(*) FROM events')) ?? 0;
@@ -114,6 +117,7 @@ class DashboardRepository {
       SELECT s.*, b.name AS batch_name
       FROM students s
       LEFT JOIN batches b ON b.id = s.batch_id
+      WHERE s.deleted_at IS NULL
       ORDER BY s.id DESC
       LIMIT 5
     ''');
@@ -171,10 +175,11 @@ class DashboardRepository {
   ) async {
     final totalStudents = batchId == null
         ? (Sqflite.firstIntValue(await d.rawQuery(
-                'SELECT COUNT(*) FROM students WHERE batch_id IS NULL')) ??
+                'SELECT COUNT(*) FROM students WHERE batch_id IS NULL AND deleted_at IS NULL')) ??
             0)
         : (Sqflite.firstIntValue(await d.rawQuery(
-                'SELECT COUNT(*) FROM students WHERE batch_id = ?', [batchId])) ??
+                'SELECT COUNT(*) FROM students WHERE batch_id = ? AND deleted_at IS NULL',
+                [batchId])) ??
             0);
 
     final args = <Object?>[monthIso, nextMonth];

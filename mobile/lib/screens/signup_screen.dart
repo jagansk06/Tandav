@@ -24,8 +24,7 @@ class SignupScreen extends StatefulWidget {
 
 class _SignupScreenState extends State<SignupScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _fullName = TextEditingController();
-  final _username = TextEditingController(text: 'admin');
+  final _username = TextEditingController();
   final _password = TextEditingController();
   final _confirm = TextEditingController();
   bool _obscure = true;
@@ -38,7 +37,6 @@ class _SignupScreenState extends State<SignupScreen> {
 
   @override
   void dispose() {
-    _fullName.dispose();
     _username.dispose();
     _password.dispose();
     _confirm.dispose();
@@ -52,7 +50,7 @@ class _SignupScreenState extends State<SignupScreen> {
     try {
       final code = await auth.completeSetup(
         username: _username.text,
-        fullName: _fullName.text,
+        fullName: _username.text.trim(),
         password: _password.text,
       );
       if (!mounted) return;
@@ -133,25 +131,13 @@ class _SignupScreenState extends State<SignupScreen> {
           ),
           const SizedBox(height: 28),
           TextFormField(
-            controller: _fullName,
-            textCapitalization: TextCapitalization.words,
-            textInputAction: TextInputAction.next,
-            decoration: const InputDecoration(
-              labelText: 'Your name',
-              prefixIcon: Icon(Icons.badge_outlined),
-            ),
-            validator: (v) =>
-                (v == null || v.trim().isEmpty) ? 'Your name is required' : null,
-          ),
-          const SizedBox(height: 14),
-          TextFormField(
             controller: _username,
             autocorrect: false,
             textInputAction: TextInputAction.next,
             decoration: const InputDecoration(
               labelText: 'Username',
-              helperText: 'What you type to sign in',
-              prefixIcon: Icon(Icons.person_outline_rounded),
+              helperText: 'This is shown on your dashboard and used to sign in',
+              prefixIcon: Icon(Icons.badge_outlined),
             ),
             validator: (v) => (v == null || v.trim().isEmpty)
                 ? 'Username is required'

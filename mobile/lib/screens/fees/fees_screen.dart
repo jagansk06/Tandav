@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/app_role.dart';
 import '../../core/format.dart';
@@ -8,6 +11,7 @@ import '../../core/theme.dart';
 import '../../core/whatsapp.dart';
 import '../../models/batch.dart';
 import '../../models/fee.dart';
+import '../../sync/cloud_sync.dart';
 import '../../widgets/states.dart';
 import '../attendance/monthly_attendance_screen.dart';
 import 'fee_payment_sheet.dart';
@@ -31,16 +35,29 @@ class _FeesScreenState extends State<FeesScreen> {
   int? _busyFeeId;
   late Future<FeeListResponse> _feesFuture;
   late Future<FeeSummary> _summaryFuture;
+  StreamSubscription<CloudSyncStatus>? _syncSub;
 
   @override
   void initState() {
     super.initState();
     _loadBatches();
+    _syncSub = context
+        .read<TandavApi>()
+        .cloudSync
+        .status
+        .listen((s) => _onSyncStatus(s));
+  }
+
+  void _onSyncStatus(CloudSyncStatus s) {
+    if (s.phase == CloudSyncPhase.complete && mounted) {
+      _loadBatches();
+    }
   }
 
   @override
   void dispose() {
     _searchCtrl.dispose();
+    _syncSub?.cancel();
     super.dispose();
   }
 
@@ -170,7 +187,7 @@ class _FeesScreenState extends State<FeesScreen> {
       // once the student confirms. Never offered for receipts or when the fee
       // is already paid.
       if (!isPaid && upiLink != null) {
-        await _confirmUpiPayment(f, student.fullName, api);
+        await _confirmUpiPayment(f, student.fullName, api, upiLink);
       }
     } on Exception catch (e) {
       if (mounted) {
@@ -186,12 +203,13 @@ class _FeesScreenState extends State<FeesScreen> {
   /// Marking it paid here updates the fee record to `paid` (the check-mark on
   /// the student's fee details), optionally followed by a WhatsApp receipt.
   Future<void> _confirmUpiPayment(
-      Fee f, String studentName, TandavApi api) async {
+      Fee f, String studentName, TandavApi api, String upiLink) async {
     final mark = await showModalBottomSheet<bool>(
       context: context,
       backgroundColor: TandavColors.surface,
       isScrollControlled: true,
-      builder: (_) => _UpiFlowSheet(fee: f, studentName: studentName),
+      builder: (_) =>
+          _UpiFlowSheet(fee: f, studentName: studentName, upiLink: upiLink),
     );
     if (!mounted || mark == null || !mark) return;
     setState(() => _busyFeeId = f.id);
@@ -571,12 +589,38 @@ class _FeesScreenState extends State<FeesScreen> {
 
 /// Bottom sheet shown right after a reminder with a UPI pay link is sent. It
 /// asks the owner to confirm whether the student actually paid, because the
-/// app can't hear back from the UPI app. "Mark as paid" pops true (which marks
-/// the fee paid in the student's fee details); "Not paid yet" pops false.
+/// app can't hear back from the UPI app. A "Tap to pay" button re-opens the
+/// pay link (useful when WhatsApp itself didn't open the student's UPI app).
+/// "Mark as paid" pops true (which marks the fee paid in the student's fee
+/// details); "Not paid yet" pops false.
 class _UpiFlowSheet extends StatelessWidget {
   final Fee fee;
   final String studentName;
-  const _UpiFlowSheet({required this.fee, required this.studentName});
+  final String upiLink;
+  const _UpiFlowSheet({
+    required this.fee,
+    required this.studentName,
+    required this.upiLink,
+  });
+
+  Future<void> _openPayLink(BuildContext context) async {
+    try {
+      final ok = await launchUrl(
+        Uri.parse(upiLink),
+        mode: LaunchMode.externalApplication,
+        webOnlyWindowName: '_self',
+      );
+      if (!ok && context.mounted) {
+        Alert.show(context, 'No UPI app found on this device',
+            isError: true);
+      }
+    } on Exception {
+      if (context.mounted) {
+        Alert.show(context, 'Could not open the payment link',
+            isError: true);
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -626,6 +670,21 @@ class _UpiFlowSheet extends StatelessWidget {
                 color: TandavColors.textSecondary,
                 fontSize: 13,
                 height: 1.45,
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => _openPayLink(context),
+                icon: const Icon(Icons.payments_outlined),
+                label: const Text('Tap to pay'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: TandavColors.gold,
+                  side: const BorderSide(color: TandavColors.gold),
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                ),
               ),
             ),
             const SizedBox(height: 18),

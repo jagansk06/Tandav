@@ -59,5 +59,11 @@
             <action android:name="android.intent.action.VIEW"/>
             <data android:scheme="whatsapp"/>
         </intent>
+        <!-- Lets url_launcher resolve upi://pay deep links so the "Tap to
+             pay" button can open the student's UPI app directly. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="upi"/>
+        </intent>
     </queries>
 </manifest>

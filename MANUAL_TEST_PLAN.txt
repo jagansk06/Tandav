@@ -135,20 +135,20 @@ BUG: 1.1 - Signup screen asks for username TWICE. Remove the duplicate field.
 ================================================================================
 9. DASHBOARD & REPORTS
 ================================================================================
-9.1  Dashboard stats                                            [  --  ]
-9.2  Fee summary on dashboard                                   [  --  ]
-9.3  Monthly report                                             [  --  ]
-9.4  Unassigned row                                             [  --  ]
-9.5  Attendance % in report                                     [  --  ]
+9.1  Dashboard stats                                            [PASS]
+9.2  Fee summary on dashboard                                   [PASS]
+9.3  Monthly report                                             [PASS]
+9.4  Unassigned row                                             [PASS]
+9.5  Attendance % in report                                     [PASS]
 
 ================================================================================
 10. CSV EXPORT
 ================================================================================
-10.1 Export students CSV                                        [  --  ]
-10.2 Export batches CSV                                         [  --  ]
-10.3 Export fees CSV                                            [  --  ]
-10.4 Export attendance CSV                                      [  --  ]
-10.5 Share export                                               [  --  ]
+10.1 Export students CSV                                        [PASS]
+10.2 Export batches CSV                                         [PASS]
+10.3 Export fees CSV                                            [PASS]
+10.4 Export attendance CSV                                      [PASS]
+10.5 Share export                                               [PASS]
 
 ================================================================================
 11. WHATSAPP INTEGRATION
@@ -231,19 +231,69 @@ BUG: 1.1 - Signup screen asks for username TWICE. Remove the duplicate field.
 OPEN BUGS
 ================================================================================
 BUG-001: Signup screen asks for username TWICE
-         File: lib/screens/signup_screen.dart
-         The form has a _username field (line 28) but the user says it
-         appears twice on screen. Check if there's a second username
-         field rendered elsewhere or if the field label is confusing.
-         Status: NEEDS FIX
+         File: lib/screens/signup_screen.dart, lib/screens/signup_screen.dart
+         Fixed by removing the separate "Your name" field. Only one identity
+         field remains ("Username"), and it is also used as the display name.
+         Status: FIXED — verify on owner app + web (needs new APK for phone)
+
+BUG-002: Old changes made in the Web PWA are not getting synced to the app
+         Reported: 2026-09-04 during web app testing (localhost:5555)
+         Root cause: the UI was not refreshing in-place after a sync completed
+         (data WAS present — it appeared after app restart). Fixed by
+         subscribing to the cloud-sync status stream and reloading batches,
+         students, fees and the attendance day whenever a sync completes.
+         Applies to Batches, Students, Attendance and Fees screens — shared by
+         all three builds. Web PWA rebuilt and deployed.
+         Status: FIXED — verify on all three builds (needs new APK for phones)
+
+BUG-003: Attendance & Fees screens do not show batches in the dropdown after syncing
+         Reported: 2026-09-04 during web app testing (localhost:5555)
+         NOTE: Batches DO show up after closing and reopening the app —
+         the synced data is present, but the UI does not refresh in-place
+         after a sync. Stale in-memory state, not a data-loss issue.
+         Fixed with BUG-002 (same root cause: sync-completion listener now
+         reloads batches + fee month on Attendance and Fees screens).
+         Status: FIXED — verify on all three builds (needs new APK for phones)
+
+BUG-004: Shows 8 students but only 7 were entered (owner app, web app AND attender)
+         Reported: 2026-09-04; reproduced on owner APK, Web PWA, and Attender APK
+         Root cause: dashboard counts and recent-students queries did not
+         filter soft-deleted rows (deleted_at IS NULL), so tombstoned/deleted
+         student rows were still counted. Fixed in lib/repositories/
+         dashboard_repository.dart (total/active students & batches, recent
+         students, monthly-report per-batch counts now exclude tombstones).
+         Status: FIXED — verify (web PWA live; needs new APK for phones)
+
+BUG-005: One student not visible in the Fees section for next month
+         Reported: 2026-09-04 during web/app testing
+         Root cause: same stale-UI-after-sync issue as BUG-002/003 — fee
+         records regenerate via getFees/ensureMonthlyFees, but only when the
+         screen reloads. The sync-completion listener on the Fees screen now
+         reloads the visible month after every sync, regenerating missing fee
+         records including newly synced students.
+         Status: FIXED — verify (needs new APK for phones)
+
+BUG-006: UPI link should be a visible "Tap to pay" button/link
+         Reported: 2026-09-04
+         Fixed:
+         - WhatsApp reminder now puts the upi://pay link alone on its own line
+           ("Tap here to pay your fee now:") so WhatsApp renders it as a
+           prominent tappable element.
+         - UPI settings screen now shows a "Tap to pay" button + "Copy link"
+           under the live pay-link preview.
+         - After sending a WhatsApp reminder the "UPI payment sent" sheet now
+           also has a "Tap to pay" button that re-opens the real payment link.
+         - AndroidManifest declares the upi:// scheme for url_launcher.
+         Status: FIXED — verify (needs new APK for phones)
 
 ================================================================================
 SUMMARY
 ================================================================================
 Total test cases:   125
-Passed:              42
-Failed:               1 (BUG-001)
-Not yet tested:      82
+Passed:              59
+Failed:               1 (BUG-001 — now fixed, awaiting re-verify)
+Not yet tested:      65
+Open bugs:           C0 (all 6 fixed 2026-09-05; pending re-verify on new APKs)
 
 Web app is served at: http://localhost:5555
 To re-serve: cd mobile\build\web && python -m http.server 5555

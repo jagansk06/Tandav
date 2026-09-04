@@ -312,7 +312,7 @@ void main() {
         amountDue: 1600,
       );
       expect(msg, contains('Amount Due: ₹1,600'));
-      expect(msg, isNot(contains('Tap to pay now')));
+      expect(msg, isNot(contains('Tap here to pay')));
     });
 
     test('reminderMessage appends the pay-now line when a link is given', () {
@@ -324,7 +324,7 @@ void main() {
             'upi://pay?pa=tandav%40okhdfcbank&am=1600.00&cu=INR&tn=Aarav',
       );
       expect(msg, contains('Amount Due: ₹1,600'));
-      expect(msg, contains('Tap to pay now via UPI'));
+      expect(msg, contains('Tap here to pay your fee now:'));
       expect(msg, contains('upi://pay?'));
     });
   });

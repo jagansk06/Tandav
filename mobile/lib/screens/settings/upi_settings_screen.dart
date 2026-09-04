@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/format.dart';
 import '../../core/services.dart';
@@ -206,18 +208,69 @@ class _LiveLinkCard extends StatelessWidget {
         children: [
           const SectionHeader(title: 'Pay link preview'),
           const SizedBox(height: 8),
-          Text(
-            link ??
-                'No UPI ID saved yet — reminders will not include a pay link '
-                    'until one is added above and saved.',
-            style: const TextStyle(
-              color: TandavColors.textSecondary,
-              fontSize: 12.5,
-              height: 1.5,
+          if (link == null)
+            const Text(
+              'No UPI ID saved yet — reminders will not include a pay link '
+              'until one is added above and saved.',
+              style: TextStyle(
+                color: TandavColors.textSecondary,
+                fontSize: 12.5,
+                height: 1.5,
+              ),
+            )
+          else ...[
+            const Text(
+              'This is the link a parent can tap to jump straight to the '
+              'payment screen for the same amount.',
+              style: TextStyle(
+                color: TandavColors.textSecondary,
+                fontSize: 12.5,
+                height: 1.5,
+              ),
             ),
-          ),
+            const SizedBox(height: 14),
+            GoldButton(
+              label: 'Tap to pay',
+              icon: Icons.payments_outlined,
+              expanded: true,
+              onPressed: () => _launch(context, link),
+            ),
+            const SizedBox(height: 6),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: link));
+                  if (context.mounted) {
+                    Alert.show(context, 'Payment link copied');
+                  }
+                },
+                icon: const Icon(Icons.copy_rounded, size: 17),
+                label: const Text('Copy link'),
+              ),
+            ),
+          ],
         ],
       ),
     );
+  }
+
+  Future<void> _launch(BuildContext context, String link) async {
+    try {
+      final ok = await launchUrl(
+        Uri.parse(link),
+        mode: LaunchMode.externalApplication,
+        webOnlyWindowName: '_self',
+      );
+      if (!ok && context.mounted) {
+        Alert.show(context, 'No UPI app found on this device',
+            isError: true);
+      }
+    } on Exception {
+      if (context.mounted) {
+        Alert.show(context, 'Could not open the payment link',
+            isError: true);
+      }
+    }
   }
 }

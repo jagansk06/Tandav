@@ -7,6 +7,7 @@ import '../../core/services.dart';
 import '../../core/theme.dart';
 import '../../models/batch.dart';
 import '../../models/student.dart';
+import '../../sync/cloud_sync.dart';
 import '../../widgets/states.dart';
 import 'student_detail_screen.dart';
 import 'student_form_screen.dart';
@@ -27,17 +28,31 @@ class _StudentsScreenState extends State<StudentsScreen> {
   List<Batch> _batches = [];
 
   late Future<StudentListResponse> _future;
+  StreamSubscription<CloudSyncStatus>? _syncSub;
 
   @override
   void initState() {
     super.initState();
     _future = _load();
     _loadBatches();
+    _syncSub = context
+        .read<TandavApi>()
+        .cloudSync
+        .status
+        .listen((s) => _onSyncStatus(s));
+  }
+
+  void _onSyncStatus(CloudSyncStatus s) {
+    if (s.phase == CloudSyncPhase.complete && mounted) {
+      _reload();
+      _loadBatches();
+    }
   }
 
   @override
   void dispose() {
     _debounce?.cancel();
+    _syncSub?.cancel();
     _search.dispose();
     super.dispose();
   }

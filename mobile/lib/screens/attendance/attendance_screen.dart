@@ -9,6 +9,7 @@ import '../../core/theme.dart';
 import '../../core/whatsapp.dart';
 import '../../models/attendance.dart';
 import '../../models/batch.dart';
+import '../../sync/cloud_sync.dart';
 import '../../widgets/states.dart';
 
 class AttendanceScreen extends StatefulWidget {
@@ -27,11 +28,29 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   late Future<AttendanceDay> _dayFuture;
   Map<int, String> _liveStatuses = {};
   int _resetToken = 0;
+  StreamSubscription<CloudSyncStatus>? _syncSub;
 
   @override
   void initState() {
     super.initState();
     _loadBatches();
+    _syncSub = context
+        .read<TandavApi>()
+        .cloudSync
+        .status
+        .listen((s) => _onSyncStatus(s));
+  }
+
+  void _onSyncStatus(CloudSyncStatus s) {
+    if (s.phase == CloudSyncPhase.complete && mounted) {
+      _loadBatches();
+    }
+  }
+
+  @override
+  void dispose() {
+    _syncSub?.cancel();
+    super.dispose();
   }
 
   Future<void> _loadBatches() async {

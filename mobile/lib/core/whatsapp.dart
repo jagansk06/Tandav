@@ -67,8 +67,10 @@ class WhatsAppService {
   /// Reminder message shown while a fee is DUE (or partially paid).
   ///
   /// When [upiLink] is provided (a `upi://pay` deep link built for this
-  /// student's fee), a short "Pay now" line is appended so the student can tap
-  /// or scan straight to the payment from their own WhatsApp.
+  /// student's fee), a short "Tap to pay" line is appended so the student can
+  /// tap or scan straight to the payment from their own WhatsApp. The deep link
+  /// is left alone on its own line — WhatsApp renders a bare link as a single
+  /// tappable bubble, which is what reads as "tap to pay" to the parent.
   static String reminderMessage({
     required String studentName,
     required String monthLabel,
@@ -76,7 +78,7 @@ class WhatsAppService {
     String? upiLink,
   }) {
     final paymentLine = (upiLink != null && upiLink.isNotEmpty)
-        ? '\n\nTap to pay now via UPI: $upiLink'
+        ? '\n\nTap here to pay your fee now:\n$upiLink'
         : '';
     return 'Namaste $studentName, 🙏\n\n'
         'This is a gentle reminder from Tandav Studio regarding the '
