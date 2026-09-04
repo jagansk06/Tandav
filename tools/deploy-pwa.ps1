@@ -142,10 +142,16 @@ if (-not (Test-Path (Join-Path $BuildDir 'main.dart.js'))) {
 # Cheap proof the flags actually took effect, because a build made with the
 # defaults produces a directory that looks identical at a glance.
 $bootstrap = Get-Content (Join-Path $BuildDir 'flutter_bootstrap.js') -Raw
-if ($bootstrap -match 'serviceWorkerVersion') {
-    Die ("This build registers Flutter's own service worker, so it was NOT " +
-         "built with --pwa-strategy=none. Two workers fighting over one scope " +
-         "is exactly the bug that flag prevents.")
+$tombstone = Join-Path $BuildDir 'flutter_service_worker.js'
+# With --pwa-strategy=none newer Flutter leaves an EMPTY flutter_service_worker.js
+# tombstone behind (0 bytes) instead of not writing it at all. An empty file is
+# not a registration - it just marks "we deliberately built without a worker".
+# Only a NON-empty worker file means Flutter actually registered one.
+$hasRealWorker = (Test-Path $tombstone) -and ((Get-Item $tombstone).Length -gt 0)
+if ($hasRealWorker) {
+    Die ("flutter_service_worker.js has content, so this build HAD a service " +
+         "worker registered. It was not built as expected. Two workers fighting " +
+         "over one scope is exactly the bug we prevent.")
 }
 if (-not (Test-Path (Join-Path $BuildDir 'canvaskit\canvaskit.wasm'))) {
     Die ("canvaskit is missing from the build, so it would be fetched from " +
@@ -176,7 +182,9 @@ $doomed = @()
 $doomed += Get-ChildItem $BuildDir -Recurse -File -Filter '*.symbols'
 $doomed += Get-ChildItem (Join-Path $BuildDir 'canvaskit') -File |
            Where-Object { $_.Name -like 'skwasm*' -or $_.Name -like 'wimp*' }
-foreach ($f in $doomed) { Remove-Item $f.FullName -Force }
+foreach ($f in $doomed) {
+    if (Test-Path $f.FullName) { Remove-Item $f.FullName -Force }
+}
 
 $wp = Join-Path $BuildDir 'canvaskit\webparagraph'
 if (Test-Path $wp) { Remove-Item $wp -Recurse -Force }

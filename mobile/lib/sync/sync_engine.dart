@@ -329,6 +329,21 @@ class SyncEngine {
     // foreign keys can be resolved.
     final uuidMap = <String, Map<String, int>>{};
 
+    // Pre-populate uuidMap from the local database so child rows whose parent
+    // was sent in a *previous* sync (and is not in the current bundle) can
+    // still resolve their foreign keys. Without this, the FK lookup falls
+    // through to null and the child is silently orphaned.
+    for (final table in tables) {
+      final tableUuids = uuidMap.putIfAbsent(table, () => {});
+      final rows = await txn.query(table,
+          columns: ['id', 'sync_uuid'], where: "sync_uuid != ''");
+      for (final r in rows) {
+        final id = r['id'] as int;
+        final uuid = r['sync_uuid'] as String;
+        tableUuids[uuid] = id;
+      }
+    }
+
     for (final table in tables) {
       final rows = incoming[table];
       if (rows == null || rows.isEmpty) continue;

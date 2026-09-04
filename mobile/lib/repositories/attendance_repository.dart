@@ -283,14 +283,34 @@ class AttendanceRepository {
       // second place for the table scope to be stated and get out of step with
       // [syncTables].
       await txn.rawUpdate('''
-        UPDATE monthly_progress SET attendance_percentage = ?
+        UPDATE monthly_progress
+        SET attendance_percentage = ?,
+            updated_at = datetime('now'),
+            device_id = ?
         WHERE student_id = ? AND month = ?
-      ''', [pct, studentId, start]);
+      ''', [pct, db.deviceId, studentId, start]);
     }
   }
 
   String _monthIso(String month) =>
       month.replaceFirst(RegExp(r'-\d{2}$'), '-01');
+
+  /// Daily attendance records for a specific student in a given month.
+  Future<List<Map<String, dynamic>>> getStudentDailyAttendance(
+    int studentId,
+    String month,
+  ) async {
+    final d = await _d;
+    final start = _monthIso(month);
+    final end = DbFmt.date(DbFmt.addMonths(DateTime.parse(start), 1));
+    return d.rawQuery('''
+      SELECT attendance_date, status, notes
+      FROM attendance
+      WHERE student_id = ? AND deleted_at IS NULL
+        AND attendance_date >= ? AND attendance_date < ?
+      ORDER BY attendance_date ASC
+    ''', [studentId, start, end]);
+  }
 
   String _names(Map<String, Object?> row) {
     final first = (row['first_name'] as String?) ?? '';

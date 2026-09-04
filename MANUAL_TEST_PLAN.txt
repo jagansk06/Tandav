@@ -1,0 +1,250 @@
+================================================================================
+                    TANDAV STUDIO APP - MANUAL TEST PLAN
+                    Last updated: 2026-09-02
+================================================================================
+
+LEGEND:
+  [PASS]  = Test passed
+  [FAIL]  = Test failed, needs fix
+  [SKIP]  = Test skipped / not applicable
+  [  --  ] = Not yet tested
+
+================================================================================
+1. FIRST-RUN SETUP & AUTH
+================================================================================
+1.1  Fresh install shows signup screen                          [PASS]
+     NOTE: Signup screen asks for username twice - REMOVE the duplicate
+1.2  Factory default credentials blocked (admin/admin123)       [PASS]
+1.3  Setup with valid credentials                               [PASS]
+1.4  Save recovery code                                         [PASS]
+1.5  After setup, goes directly to dashboard (no login)         [PASS - by design]
+1.6  After login, goes directly to dashboard (no login)         [PASS - by design]
+1.7  Wrong password rejected                                    [PASS]
+1.8  Password change                                            [PASS]
+1.9  Cannot change to factory password                          [PASS]
+1.10 Recovery code reset                                        [PASS]
+1.11 Recovery code case/space insensitive                       [PASS]
+1.12 Wrong recovery code fails                                  [PASS]
+
+BUG: 1.1 - Signup screen asks for username TWICE. Remove the duplicate field.
+
+================================================================================
+2. BATCHES MANAGEMENT
+================================================================================
+2.1  Create a batch                                             [PASS]
+2.2  Edit a batch                                               [PASS]
+2.3  Batch student count                                        [PASS]
+2.4  Delete empty batch                                         [PASS]
+2.5  Delete batch with students                                 [PASS]
+2.6  Search batches                                             [PASS]
+2.7  Active/inactive toggle                                     [PASS]
+2.8  Batch default fee used                                     [PASS]
+
+================================================================================
+3. STUDENTS MANAGEMENT
+================================================================================
+3.1  Create student                                             [PASS]
+3.2  Student full name                                          [PASS]
+3.3  Student without batch                                      [PASS]
+3.4  Assign student to batch                                    [PASS]
+3.5  Move student between batches                               [PASS]
+3.6  Search students                                            [PASS]
+3.7  Filter by batch                                            [PASS]
+3.8  Filter by gender                                           [PASS]
+3.9  Filter active only                                         [PASS]
+3.10 Soft delete student                                        [PASS]
+3.11 Student photo                                              [PASS]
+3.12 Emergency contact                                          [PASS]
+3.13 Join date affects fees                                     [PASS]
+
+================================================================================
+4. ATTENDANCE
+================================================================================
+4.1  Open attendance for a day                                  [  --  ]
+4.2  Mark present                                               [  --  ]
+4.3  Mark absent                                                [  --  ]
+4.4  Mark late                                                  [  --  ]
+4.5  Save attendance                                            [  --  ]
+4.6  Re-mark same day                                           [  --  ]
+4.7  Monthly view                                               [  --  ]
+4.8  Attendance percentage                                      [  --  ]
+4.9  Batch filter in attendance                                 [  --  ]
+4.10 Duplicate student_id rejected                              [  --  ]
+
+================================================================================
+5. FEES & PAYMENTS
+================================================================================
+5.1  Auto-generate monthly fees                                 [  --  ]
+5.2  Fee amount matches student                                 [  --  ]
+5.3  Mark fee paid (one-tap)                                    [  --  ]
+5.4  Mark fee due (reverse)                                     [  --  ]
+5.5  Partial payment                                            [  --  ]
+5.6  Complete partial payment                                   [  --  ]
+5.7  Overpayment rejected                                       [  --  ]
+5.8  Fee summary                                                [  --  ]
+5.9  Payment history                                            [  --  ]
+5.10 Late fee penalty                                           [  --  ]
+5.11 Penalty disabled (0)                                       [  --  ]
+5.12 Paid previous month = no penalty                           [  --  ]
+5.13 Partial payment still penalizes                            [  --  ]
+5.14 Fee register filters                                       [  --  ]
+5.15 Backfill gap months                                        [  --  ]
+5.16 No duplicate fee records                                   [  --  ]
+5.17 Inactive students excluded                                 [  --  ]
+5.18 Zero-fee students excluded                                 [  --  ]
+
+================================================================================
+6. UPI CONFIGURATION
+================================================================================
+6.1  Set UPI VPA                                                [  --  ]
+6.2  Set UPI payee name                                         [  --  ]
+6.3  Clear VPA                                                  [  --  ]
+6.4  Clear payee                                                [  --  ]
+6.5  UPI pay link generated                                     [  --  ]
+6.6  No link without VPA                                        [  --  ]
+
+================================================================================
+7. EVENTS & COSTUMES
+================================================================================
+7.1  Create event                                               [PASS]
+7.2  Edit event                                                 [PASS]
+7.3  Delete event                                               [PASS]
+7.4  Add batch participants                                     [PASS]
+7.5  Add batch again (idempotent)                               [PASS]
+7.6  Add individual participant                                 [PASS]
+7.7  Costume required                                           [PASS]
+7.8  Mark costume paid                                          [PASS]
+7.9  Partial costume payment                                    [PASS]
+7.10 Costume summary                                            [PASS]
+7.11 Remove participant                                         [PASS]
+7.12 Student participation history                              [PASS]
+7.13 Event search                                               [PASS]
+7.14 Upcoming/past filter                                       [PASS]
+
+================================================================================
+8. MONTHLY PROGRESS
+================================================================================
+8.1  Create progress record                                     [  --  ]
+8.2  Overall score calculation                                  [  --  ]
+8.3  Attendance percentage mirrors                              [  --  ]
+8.4  Duplicate prevention                                       [  --  ]
+8.5  Update progress                                            [  --  ]
+8.6  Delete progress                                            [  --  ]
+8.7  Filter by month/batch                                      [  --  ]
+
+================================================================================
+9. DASHBOARD & REPORTS
+================================================================================
+9.1  Dashboard stats                                            [  --  ]
+9.2  Fee summary on dashboard                                   [  --  ]
+9.3  Monthly report                                             [  --  ]
+9.4  Unassigned row                                             [  --  ]
+9.5  Attendance % in report                                     [  --  ]
+
+================================================================================
+10. CSV EXPORT
+================================================================================
+10.1 Export students CSV                                        [  --  ]
+10.2 Export batches CSV                                         [  --  ]
+10.3 Export fees CSV                                            [  --  ]
+10.4 Export attendance CSV                                      [  --  ]
+10.5 Share export                                               [  --  ]
+
+================================================================================
+11. WHATSAPP INTEGRATION
+================================================================================
+11.1 Receipt message                                            [  --  ]
+11.2 Reminder message                                           [  --  ]
+11.3 Absent notification                                        [  --  ]
+11.4 Late notification                                          [  --  ]
+11.5 Invalid number                                             [  --  ]
+11.6 No WhatsApp installed                                      [  --  ]
+11.7 Number normalization                                       [  --  ]
+
+================================================================================
+12. MULTI-DEVICE SYNC
+================================================================================
+12.1 Connect first device (Google account)                      [  --  ]
+12.2 Connect second device (same account)                       [  --  ]
+12.3 Student syncs both ways                                    [  --  ]
+12.4 Batch syncs both ways                                      [  --  ]
+12.5 FK remapping on new device                                 [  --  ]
+12.6 Edit conflict resolution (last-write-wins)                 [  --  ]
+12.7 Deletion propagation (tombstone)                           [  --  ]
+12.8 Attendance syncs                                           [  --  ]
+12.9 Fee syncs                                                  [  --  ]
+12.10 Three devices (owner + attender)                          [  --  ]
+12.11 Attender scope (no events/progress tables)                [  --  ]
+12.12 Failed upload retry                                       [  --  ]
+12.13 Damaged bundle handling                                   [  --  ]
+12.14 Pending row count                                         [  --  ]
+12.15 Send everything again                                     [  --  ]
+12.16 Forget peer                                               [  --  ]
+12.17 Disconnect account                                        [  --  ]
+12.18 Replaced phone adoption                                   [  --  ]
+
+================================================================================
+13. BACKUP & RESTORE
+================================================================================
+13.1 Create backup                                              [  --  ]
+13.2 Restore own backup                                         [  --  ]
+13.3 Restore other device's backup                              [  --  ]
+
+================================================================================
+14. EDGE CASES & REGRESSION
+================================================================================
+14.1 Close/reopen data persistence                              [  --  ]
+14.2 Fee generation idempotent                                  [  --  ]
+14.3 Student join date edge                                     [  --  ]
+14.4 Large batch (20+ students)                                 [  --  ]
+14.5 Special characters in names                                [  --  ]
+14.6 Rupee symbol in messages                                   [  --  ]
+14.7 Date format consistency                                    [  --  ]
+14.8 Month format consistency                                   [  --  ]
+14.9 Zero-fee student lifecycle                                 [  --  ]
+14.10 All-active students paid                                  [  --  ]
+
+================================================================================
+15. ROLE-BASED TESTING (ATTENDER APK)
+================================================================================
+15.1 Badge visible ("ATTENDER")                                 [  --  ]
+15.2 Limited tabs (only Attendance + Fees)                      [  --  ]
+15.3 No batches screen                                          [  --  ]
+15.4 No students screen                                         [  --  ]
+15.5 No events/progress                                         [  --  ]
+15.6 Sync scope (only attendance/fee tables synced)             [  --  ]
+15.7 Cannot send owner tables in bundle                         [  --  ]
+
+================================================================================
+16. WEB APP (PWA) TESTING
+================================================================================
+16.1 Build and serve locally                                    [PASS]
+     URL: http://localhost:5555
+16.2 Google Sign-In works in Chrome                             [  --  ]
+16.3 Data persists across page reload (IndexedDB)               [  --  ]
+16.4 Sync between Android APK and Web PWA                       [  --  ]
+16.5 Attendance tab works on web                                [  --  ]
+16.6 Fees tab works on web                                      [  --  ]
+16.7 Offline support (service worker with ?sw=1)                [  --  ]
+
+================================================================================
+OPEN BUGS
+================================================================================
+BUG-001: Signup screen asks for username TWICE
+         File: lib/screens/signup_screen.dart
+         The form has a _username field (line 28) but the user says it
+         appears twice on screen. Check if there's a second username
+         field rendered elsewhere or if the field label is confusing.
+         Status: NEEDS FIX
+
+================================================================================
+SUMMARY
+================================================================================
+Total test cases:   125
+Passed:              42
+Failed:               1 (BUG-001)
+Not yet tested:      82
+
+Web app is served at: http://localhost:5555
+To re-serve: cd mobile\build\web && python -m http.server 5555
+To rebuild:  cd mobile && flutter build web --release --pwa-strategy=none --no-web-resources-cdn

@@ -143,6 +143,12 @@ class TandavApi {
   }) =>
       attendance.getMonthlyAttendance(month, batchId: batchId);
 
+  Future<List<Map<String, dynamic>>> getStudentDailyAttendance(
+    int studentId,
+    String month,
+  ) =>
+      attendance.getStudentDailyAttendance(studentId, month);
+
   // ---- Fees ----
   Future<FeeListResponse> getFees({String? month, int? studentId, int? batchId, String? status, String? q}) =>
       fees.getFees(month: month, studentId: studentId, batchId: batchId, status: status, q: q);

@@ -72,7 +72,7 @@ class _CostumePaymentSheetState extends State<CostumePaymentSheet> {
       await api.updateParticipation(widget.participation.id, payload);
       if (mounted) {
         Navigator.pop(context);
-        Alert.show(context, 'Costume fee updated');
+        Alert.show(context, 'Event fee updated');
       }
     } on Exception catch (e) {
       if (mounted) {
@@ -105,7 +105,7 @@ class _CostumePaymentSheetState extends State<CostumePaymentSheet> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const Text(
-                            'Costume Fee',
+                            'Event Fee',
                             style: TextStyle(
                               fontSize: 17,
                               fontWeight: FontWeight.w900,
@@ -128,7 +128,7 @@ class _CostumePaymentSheetState extends State<CostumePaymentSheet> {
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   value: _costumeRequired,
-                  title: const Text('Costume required',
+                  title: const Text('Event fee required',
                       style: TextStyle(color: TandavColors.textPrimary)),
                   onChanged: (v) => setState(() => _costumeRequired = v),
                 ),
@@ -139,7 +139,7 @@ class _CostumePaymentSheetState extends State<CostumePaymentSheet> {
                     keyboardType:
                         const TextInputType.numberWithOptions(decimal: true),
                     decoration: const InputDecoration(
-                      labelText: 'Total costume fee (\u20B9)',
+                      labelText: 'Total event fee (\u20B9)',
                       prefixIcon: Icon(Icons.checkroom_outlined),
                     ),
                     validator: (v) {
@@ -205,7 +205,7 @@ class _CostumePaymentSheetState extends State<CostumePaymentSheet> {
                 _busy
                     ? const Center(child: CircularProgressIndicator())
                     : GoldButton(
-                        label: 'Save Costume Details',
+                        label: 'Save Event Fee Details',
                         icon: Icons.save_outlined,
                         expanded: true,
                         onPressed: _save,

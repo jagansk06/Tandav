@@ -116,6 +116,23 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
           selected['batch_id'] as int,
           costumeFee: selected['costume_fee'] ?? '0',
         );
+      } else if (selected['mode'] == 'outsider') {
+        final name = selected['outsider_name'] as String;
+        final parts = name.split(RegExp(r'\s+'));
+        final firstName = parts.first;
+        final lastName = parts.length > 1 ? parts.sublist(1).join(' ') : '';
+        final student = await api.createStudent({
+          'first_name': firstName,
+          'last_name': lastName,
+          'phone': selected['outsider_phone'] ?? '',
+          'is_active': 1,
+        });
+        await api.addParticipants(
+          widget.eventId,
+          [student.id],
+          isCostumeRequired: selected['costume_required'] as bool? ?? false,
+          costumeFee: selected['costume_fee'] ?? '0',
+        );
       } else {
         await api.addParticipants(
           widget.eventId,
@@ -185,7 +202,7 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
                   children: [
                     for (final (value, label) in [
                       (null, 'All'),
-                      ('due', 'Costume due'),
+                      ('due', 'Event fee due'),
                       ('partial', 'Partial'),
                       ('paid', 'Paid'),
                     ])
@@ -337,7 +354,7 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
                     color: TandavColors.gold, size: 20),
                 SizedBox(width: 8),
                 Text(
-                  'Costume Fees',
+                  'Event Fees',
                   style: TextStyle(
                     fontWeight: FontWeight.w800,
                     color: TandavColors.textPrimary,
@@ -457,13 +474,13 @@ class _EventDetailScreenState extends State<EventDetailScreen> {
                 ],
               )
             else
-              const StatusBadge(status: 'none', label: 'No costume'),
+              const StatusBadge(status: 'none', label: 'No event fee'),
             const SizedBox(width: 6),
             IconButton(
               onPressed: () => _costumeSheet(p),
               icon: const Icon(Icons.payments_outlined,
                   color: TandavColors.gold, size: 20),
-              tooltip: 'Manage costume fee',
+              tooltip: 'Manage event fee',
             ),
             IconButton(
               onPressed: () => _removeParticipant(p),
@@ -521,10 +538,14 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
   String _costumeFee = '';
   bool _costumeRequired = false;
   final _feeController = TextEditingController();
+  final _outsiderNameController = TextEditingController();
+  final _outsiderPhoneController = TextEditingController();
 
   @override
   void dispose() {
     _feeController.dispose();
+    _outsiderNameController.dispose();
+    _outsiderPhoneController.dispose();
     super.dispose();
   }
 
@@ -565,6 +586,11 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
                   label: Text('Select students'),
                   icon: Icon(Icons.person_add_alt_1_rounded),
                 ),
+                ButtonSegment(
+                  value: 'outsider',
+                  label: Text('Outsider'),
+                  icon: Icon(Icons.person_add_outlined),
+                ),
               ],
               selected: {_mode},
               onSelectionChanged: (s) => setState(() => _mode = s.first),
@@ -586,6 +612,27 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
                         ))
                     .toList(),
                 onChanged: (v) => setState(() => _batchId = v),
+              )
+            else if (_mode == 'outsider')
+              Column(
+                children: [
+                  TextField(
+                    controller: _outsiderNameController,
+                    decoration: const InputDecoration(
+                      labelText: 'Full name *',
+                      prefixIcon: Icon(Icons.person_outline),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _outsiderPhoneController,
+                    keyboardType: TextInputType.phone,
+                    decoration: const InputDecoration(
+                      labelText: 'Phone number',
+                      prefixIcon: Icon(Icons.phone_outlined),
+                    ),
+                  ),
+                ],
               )
             else
               Expanded(
@@ -628,7 +675,7 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
               contentPadding: EdgeInsets.zero,
               value: _costumeRequired,
               title: const Text(
-                'Costume required',
+                'Event fee required',
                 style: TextStyle(color: TandavColors.textPrimary),
               ),
               onChanged: (v) => setState(() => _costumeRequired = v),
@@ -640,7 +687,7 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
                 keyboardType:
                     const TextInputType.numberWithOptions(decimal: true),
                 decoration: const InputDecoration(
-                  labelText: 'Costume fee per student (\u20B9)',
+                  labelText: 'Event fee per student (\u20B9)',
                   prefixIcon: Icon(Icons.checkroom_outlined),
                 ),
                 onChanged: (v) => setState(() => _costumeFee = v.trim()),
@@ -655,7 +702,9 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
                               .firstOrNull
                               ?.studentCount ??
                           ''} students)'
-                  : 'Add $selectedCount student${selectedCount == 1 ? '' : 's'}',
+                  : _mode == 'outsider'
+                      ? 'Add outsider'
+                      : 'Add $selectedCount student${selectedCount == 1 ? '' : 's'}',
               icon: Icons.group_add_rounded,
               expanded: true,
               onPressed: () {
@@ -668,6 +717,21 @@ class _AddParticipantsSheetState extends State<_AddParticipantsSheet> {
                     'mode': 'batch',
                     'batch_id': _batchId,
                     'costume_fee': _costumeRequired ? _costumeFee : '0',
+                  });
+                } else if (_mode == 'outsider') {
+                  final name = _outsiderNameController.text.trim();
+                  if (name.isEmpty) {
+                    Alert.show(context, 'Enter the outsider\'s name',
+                        isError: true);
+                    return;
+                  }
+                  Navigator.pop(context, {
+                    'mode': 'outsider',
+                    'outsider_name': name,
+                    'outsider_phone': _outsiderPhoneController.text.trim(),
+                    'costume_required': _costumeRequired,
+                    'costume_fee':
+                        _costumeRequired ? _costumeFee : '0',
                   });
                 } else {
                   if (_selectedStudents.isEmpty) {

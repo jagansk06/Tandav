@@ -52,15 +52,6 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
       '${_date.year.toString().padLeft(4, '0')}-${_date.month.toString().padLeft(2, '0')}-${_date.day.toString().padLeft(2, '0')}';
 
   void _reloadDay() {
-    if (_selectedBatchId == null) {
-      setState(() {
-        _dayFuture = Future.value(
-            const AttendanceDay(date: '', batchId: 0, batchName: '', total: 0,
-                present: 0, absent: 0, late: 0, unmarked: 0, percentage: 0,
-                records: []));
-      });
-      return;
-    }
     setState(() {
       _dayFuture = context
           .read<TandavApi>()
@@ -123,14 +114,19 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                         contentPadding:
                             EdgeInsets.symmetric(horizontal: 12, vertical: 12),
                       ),
-                      items: batches
-                          .map((b) => DropdownMenuItem<int?>(
-                                value: b.id,
-                                child: Text(b.name,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis),
-                              ))
-                          .toList(),
+                      items: [
+                        const DropdownMenuItem<int?>(
+                          value: null,
+                          child: Text('All batches'),
+                        ),
+                        ...batches
+                            .map((b) => DropdownMenuItem<int?>(
+                                  value: b.id,
+                                  child: Text(b.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis),
+                                )),
+                      ],
                       onChanged: (v) {
                         setState(() {
                           _selectedBatchId = v;
@@ -155,7 +151,7 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
           child: FutureBuilder<AttendanceDay>(
             future: _dayFuture,
             builder: (context, snapshot) {
-              if (_selectedBatchId == null) {
+              if (_selectedBatchId == null && _batches.isEmpty) {
                 return const EmptyView(
                   icon: Icons.fact_check_outlined,
                   title: 'No batches yet',
@@ -266,14 +262,33 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   Future<void> _quickMarkAll(AttendanceDay day, String status) async {
     try {
       final api = context.read<TandavApi>();
-      final records = day.records
-          .map((r) => {'student_id': r.studentId, 'status': status})
-          .toList();
-      await api.saveAttendanceDay(
-        date: day.date,
-        batchId: _selectedBatchId!,
-        records: records,
-      );
+      if (_selectedBatchId != null) {
+        final records = day.records
+            .map((r) => {'student_id': r.studentId, 'status': status})
+            .toList();
+        await api.saveAttendanceDay(
+          date: day.date,
+          batchId: _selectedBatchId!,
+          records: records,
+        );
+      } else {
+        final byBatch = <int, List<Map<String, dynamic>>>{};
+        for (final r in day.records) {
+          final bid = r.batchId;
+          if (bid == null) continue;
+          byBatch.putIfAbsent(bid, () => []).add({
+            'student_id': r.studentId,
+            'status': status,
+          });
+        }
+        for (final entry in byBatch.entries) {
+          await api.saveAttendanceDay(
+            date: day.date,
+            batchId: entry.key,
+            records: entry.value,
+          );
+        }
+      }
       setState(() {
         _resetToken++;
         _liveStatuses = {};
@@ -355,11 +370,31 @@ class _AttendanceDayEditorState extends State<AttendanceDayEditor> {
           if (_notes[r.studentId] != null) 'notes': _notes[r.studentId],
         };
       }).whereType<Map<String, dynamic>>().toList();
-      await api.saveAttendanceDay(
-        date: widget.day.date,
-        batchId: widget.day.batchId,
-        records: records,
-      );
+      if (widget.day.batchId != 0) {
+        await api.saveAttendanceDay(
+          date: widget.day.date,
+          batchId: widget.day.batchId,
+          records: records,
+        );
+      } else {
+        final byBatch = <int, List<Map<String, dynamic>>>{};
+        for (final r in records) {
+          final studentId = r['student_id'] as int;
+          final row = widget.day.records
+              .where((rec) => rec.studentId == studentId)
+              .firstOrNull;
+          final bid = row?.batchId;
+          if (bid == null) continue;
+          byBatch.putIfAbsent(bid, () => []).add(r);
+        }
+        for (final entry in byBatch.entries) {
+          await api.saveAttendanceDay(
+            date: widget.day.date,
+            batchId: entry.key,
+            records: entry.value,
+          );
+        }
+      }
       widget.onSaved();
     } on Exception catch (e) {
       if (mounted) {

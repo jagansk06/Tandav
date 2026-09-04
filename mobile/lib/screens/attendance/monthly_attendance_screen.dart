@@ -7,7 +7,7 @@ import '../../core/theme.dart';
 import '../../models/attendance.dart';
 import '../../models/batch.dart';
 import '../../widgets/states.dart';
-import '../students/student_detail_screen.dart';
+import 'student_daily_attendance_screen.dart';
 
 class MonthlyAttendanceScreen extends StatefulWidget {
   const MonthlyAttendanceScreen({super.key});
@@ -164,7 +164,12 @@ class _MonthlyAttendanceScreenState extends State<MonthlyAttendanceScreen> {
         onTap: () => Navigator.push(
           context,
           MaterialPageRoute(
-              builder: (_) => StudentDetailScreen(studentId: r.studentId)),
+            builder: (_) => StudentDailyAttendanceScreen(
+              studentId: r.studentId,
+              studentName: r.studentName,
+              month: r.month,
+            ),
+          ),
         ),
         child: Padding(
           padding: const EdgeInsets.all(12),
