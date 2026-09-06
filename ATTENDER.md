@@ -85,10 +85,10 @@ folder is the only way changes travel. His **app login is his own** — password
 and recovery codes never sync between devices, so his password is not the
 owners' password and neither can see the other's.
 
-## Three devices, no more
+## Ten devices, no more
 
-Two owner phones plus the attender is exactly three, which is the cap. If a
-fourth ever writes to the account, Tandav refuses to guess which one to drop: it
+Ten devices is the cap (`maxDevices`). If an eleventh ever writes to the
+account, Tandav refuses to guess which one to drop: it
 names the files in the `Tandav Sync` folder and asks for one to be deleted.
 
 A device joining an account that already has history gets **all of it** on its

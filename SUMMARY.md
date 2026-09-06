@@ -6,7 +6,7 @@ reports. Dark black/gold theme.
 
 **Local-first.** Everything lives in an on-device SQLite database and the whole
 app works with no internet at all. There is **no Tandav server** and nothing to
-renew. Up to **three devices** — two owners plus the studio's attender — run the
+renew. Up to **ten devices** run the
 same data as **equal masters** and keep each other in sync through a shared
 Google Drive account.
 
@@ -162,8 +162,8 @@ device writes its own file and reads the others', so **nobody waits for anybody
 to be online** — one can sync at 9am and the next at 6pm and all end up correct.
 Merging is last-write-wins on `updated_at` with the higher device id breaking
 exact ties, soft-delete tombstones, and foreign keys remapped by UUID, all
-applied in one transaction per peer. **Up to three devices** share an account
-(two owners plus the attender); a fourth is refused by name rather than guessed
+applied in one transaction per peer. **Up to ten devices** share an account;
+an eleventh is refused by name rather than guessed
 at. What a device offers is filtered by what it has *delivered to each peer
 individually*, so a phone that joins late receives the studio's whole history on
 its first sync with nobody pressing anything. Sync runs on app open, on resume,
