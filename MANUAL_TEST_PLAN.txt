@@ -173,7 +173,7 @@ BUG: 1.1 - Signup screen asks for username TWICE. Remove the duplicate field.
 12.7 Deletion propagation (tombstone)                           [  --  ]
 12.8 Attendance syncs                                           [  --  ]
 12.9 Fee syncs                                                  [  --  ]
-12.10 Three devices (owner + attender)                          [  --  ]
+12.10 Ten devices (cap reached)                                  [  --  ]
 12.11 Attender scope (no events/progress tables)                [  --  ]
 12.12 Failed upload retry                                       [  --  ]
 12.13 Damaged bundle handling                                   [  --  ]

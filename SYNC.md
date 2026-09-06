@@ -1,7 +1,7 @@
 # Tandav — Multi-Master Device Sync
 
 Tandav is local-first: everything lives in the on-device SQLite database and
-the app works with no internet at all. Up to **three devices** run the same
+the app works with no internet at all. Up to **ten devices** run the same
 database as **equal masters** and keep each other in sync.
 
 There is exactly **one carrier**: a **Google Drive mailbox**. Every device signs
@@ -150,9 +150,9 @@ one and is still read, never written: `knownPeers()` folds it into the list so a
 phone that has been syncing since before three devices were supported keeps its
 pairing across the upgrade instead of silently re-adopting.
 
-**Three devices total** (`maxDevices`), so two peers each. A **fourth** is
+**Ten devices total** (`maxDevices`), so nine peers each. An **eleventh** is
 refused, not merged — the app stops and says so rather than guessing which of
-four phones to drop. The message **names the files** and how long ago each was
+eleven phones to drop. The message **names the files** and how long ago each was
 written, because "delete one of these in Drive" is the remedy and a bare
 `TANDAV-XXXX` is not something a customer can point at. The usual culprit is a
 leftover bundle from `tools/fake-peer.html`, which is always the oldest, so the
@@ -215,8 +215,8 @@ A device that came back with a **new** `TANDAV-XXXX` usually needs **nothing
 pressed at all** now. If a slot is free it is adopted on the next sync, and
 because a peer with no mark drops the outbound floor to "everything", it receives
 the studio's full history on that same run. Its old file should still be deleted
-from the Drive folder — otherwise a dead name holds a slot and the fourth real
-device is the one refused.
+from the Drive folder — otherwise a dead name holds a slot and the device that
+fills the cap past ten is the one refused.
 
 "Forget the other device" is for the case that cannot fix itself: **every** slot
 held by devices that will never write again. It clears the peers and their marks,
@@ -385,8 +385,8 @@ network and no Google account**.
   the snapshot-before-apply ordering; it fails if the order is ever reversed,
 - LWW when the same student is edited on both devices,
 - tombstones propagate through the mailbox,
-- **three devices share the account and a fourth is refused** — two owners plus
-  the attender fill the cap, and the extra one is named rather than merged,
+- **devices share the account until the cap is reached, then refuse** — the
+  slots fill up to `maxDevices`, and the extra one is named rather than merged,
 - **the attender build never puts owner-only rows in the mailbox** — `events`,
   `event_participations` and `monthly_progress` are filtered out even when they
   are somehow present in the local database (see `ATTENDER.md`),
@@ -426,9 +426,9 @@ flutter test
    recovers with no duplicates.
 6. Leave the app open on both owner phones for ~10 minutes with no taps, and
    confirm an edit on A reaches B on its own (the foreground timer).
-7. Check the Drive folder holds exactly **three** `tandav-*.json` files.
-8. Connect a **fourth** device and verify it is refused, not merged, and that
-   the message names the files it can see.
+7. Check the Drive folder holds one `tandav-*.json` file per device.
+8. Connect more than **ten** devices and verify the extra is refused, not
+   merged, and that the message names the files it can see.
 9. **The attender's phone.** Mark attendance and toggle a fee on it → sync →
    both changes reach the owners. Create an **event** on an owner phone, sync
    everything, then confirm the attender's phone still has no events (Settings →

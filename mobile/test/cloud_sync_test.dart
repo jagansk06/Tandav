@@ -405,7 +405,7 @@ void main() {
     expect(rows, hasLength(1), reason: 'tombstone row must be kept');
   });
 
-  test('three devices share the account and a fourth is refused', () async {
+  test('devices share the account until the cap is reached, then refuse', () async {
     await device('a');
     final aId = me();
     await seedBatch('Morning');
@@ -415,9 +415,9 @@ void main() {
     await cloud.syncNow();
     expect(await cloud.cloudPeerId, aId);
 
-    // The attender's phone signs in. Three devices is the shape the studio
-    // actually bought — two owners and the attender — so this must be adopted,
-    // not refused. The two-device build turned this file away.
+    // The attender's phone signs in. Up to maxDevices devices is the shape the
+    // studio actually bought, so this must be adopted, not refused. The
+    // two-device build turned this file away.
     mailbox.plant('TANDAV-9ZZZ', SyncBundle.encode(
       deviceId: 'TANDAV-9ZZZ',
       delta: SyncDelta(),
@@ -425,34 +425,47 @@ void main() {
     final three = await cloud.syncNow();
     expect(three.ok, isTrue, reason: three.message);
     expect(three.peerDeviceIds, containsAll(<String>[aId, 'TANDAV-9ZZZ']));
-    expect(await cloud.knownPeers(), hasLength(CloudSyncManager.maxPeers));
+    expect(await cloud.knownPeers(), hasLength(2));
     // One name is still exposed for the screens that show a single "other
     // device", and it stays the first device adopted rather than shuffling.
     expect(three.peerDeviceId, aId);
 
-    // A fourth signs into the same account. B's slots are full, so the newcomer
-    // is ignored rather than swapped in: the devices B already knows keep
-    // syncing normally while the extra one is sorted out.
-    mailbox.plant('TANDAV-7YYY', SyncBundle.encode(
-      deviceId: 'TANDAV-7YYY',
+    // Fill the remaining slots to the cap. Every newcomer fits until the cap is
+    // full, so earlier devices keep syncing normally while the last slot opens.
+    const extra = [
+      'TANDAV-4AAA', 'TANDAV-5BBB', 'TANDAV-6CCC', 'TANDAV-7YYY',
+      'TANDAV-2EEE', 'TANDAV-3FFF', 'TANDAV-8GGG',
+    ];
+    for (final id in extra) {
+      mailbox.plant(id, SyncBundle.encode(deviceId: id, delta: SyncDelta()));
+      final next = await cloud.syncNow();
+      expect(next.ok, isTrue, reason: next.message);
+    }
+    expect(await cloud.knownPeers(), hasLength(CloudSyncManager.maxPeers));
+
+    // One more appears after the cap is full. The newcomer is ignored rather
+    // than swapped in: the devices already known keep syncing normally while
+    // the extra one is sorted out.
+    mailbox.plant('TANDAV-8DDD', SyncBundle.encode(
+      deviceId: 'TANDAV-8DDD',
       delta: SyncDelta(),
     ));
     final ignored = await cloud.syncNow();
     expect(ignored.ok, isTrue, reason: ignored.message);
-    expect(ignored.peerDeviceIds, isNot(contains('TANDAV-7YYY')));
+    expect(ignored.peerDeviceIds, isNot(contains('TANDAV-8DDD')));
     expect(await cloud.knownPeers(), hasLength(CloudSyncManager.maxPeers));
 
-    // A brand-new device cannot tell which of the four are its partners, so it
+    // A brand-new device cannot tell which of the many are its partners, so it
     // refuses rather than guessing — and names the FILES, because "delete one
     // of these in Drive" is the remedy and a bare TANDAV-XXXX is not something
     // the customer can point at in a folder listing.
     await device('d');
     final fresh = await cloud.syncNow();
     expect(fresh.ok, isFalse);
-    expect(fresh.message, contains('4 other devices'));
+    expect(fresh.message, contains('11 other devices'));
     expect(fresh.message, contains('Tandav Sync'));
-    expect(fresh.message, contains(SyncMailbox.fileNameFor('TANDAV-9ZZZ')));
     expect(fresh.message, contains(SyncMailbox.fileNameFor('TANDAV-7YYY')));
+    expect(fresh.message, contains(SyncMailbox.fileNameFor('TANDAV-8DDD')));
     expect(fresh.message, contains(SyncMailbox.fileNameFor(aId)));
   });
 
@@ -709,18 +722,21 @@ void main() {
 
     await device('b');
     await cloud.syncNow();
-    mailbox.plant('TANDAV-9ZZZ', SyncBundle.encode(
-      deviceId: 'TANDAV-9ZZZ',
-      delta: SyncDelta(),
-    ));
-    await cloud.syncNow(); // fills B's second slot, delivering Morning to both
-    await cloud.syncNow(); // …and drains B's file
+    final dead = <String>[
+      'TANDAV-9ZZZ', 'TANDAV-4AAA', 'TANDAV-5BBB', 'TANDAV-6CCC',
+      'TANDAV-7YYY', 'TANDAV-2EEE', 'TANDAV-3FFF', 'TANDAV-8GGG',
+    ];
+    for (final id in dead) {
+      mailbox.plant(id, SyncBundle.encode(deviceId: id, delta: SyncDelta()));
+      await cloud.syncNow();
+    }
+    await cloud.syncNow(); // drains B's file
     expect(await cloud.knownPeers(), hasLength(CloudSyncManager.maxPeers));
     expect(await cloud.pendingRowCount(), 0);
 
-    // Both are gone: one phone replaced, and the other file was a leftover from
+    // Every peer is gone: one phone replaced, and the rest were leftovers from
     // tools/fake-peer.html that somebody finally deleted.
-    for (final id in [aId, 'TANDAV-9ZZZ']) {
+    for (final id in [aId, ...dead]) {
       mailbox.files.remove(SyncMailbox.fileNameFor(id));
       mailbox.times.remove(SyncMailbox.fileNameFor(id));
     }

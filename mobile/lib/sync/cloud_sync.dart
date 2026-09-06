@@ -187,12 +187,11 @@ class CloudSyncManager {
 
   /// How many Tandav devices one Google account may hold, this one included.
   ///
-  /// Three, because the studio has three people: the two owners and the
-  /// attender. The number is a real constraint rather than a preference — each
+  /// The number is a real constraint rather than a preference — each
   /// device leaves one file in the folder and reads everyone else's, so the
   /// exchange grows with every device added, and the cap is what keeps
   /// "something is wrong with sync" a question with a small, checkable answer.
-  static const maxDevices = 3;
+  static const maxDevices = 10;
 
   /// Peers this device may adopt: everyone else in [maxDevices].
   static const maxPeers = maxDevices - 1;

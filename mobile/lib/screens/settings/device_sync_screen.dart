@@ -350,7 +350,7 @@ class _DeviceSyncScreenState extends State<DeviceSyncScreen> {
                   'Every device must use the SAME Google account. Two different '
                   'accounts are two separate Drives, and nothing can travel '
                   'between them.\n\n'
-                  'Up to three devices can share one account. If a fourth ever '
+                  'Up to ten devices can share one account. If an eleventh ever '
                   'appears, Tandav says so and names the file to delete rather '
                   'than guessing which one to drop.\n\n'
                   'Everything keeps working with no internet at all. Changes '
