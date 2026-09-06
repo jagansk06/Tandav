@@ -34,7 +34,7 @@ import 'dart:typed_data';
 /// Exports that exist only in the `sqlite3` 3.x WebAssembly ABI. The 2.x
 /// builds expose a different surface (`dart_sqlite3_create_scalar_function`
 /// rather than `dart_sqlite3_create_function_v2`, no `sqlite3_initialize`), so
-/// the presence of these three separates a matching engine from a stale one.
+/// the presence of these three separates a 3.x engine from a 2.x one.
 const _abi3Sentinels = {
   'sqlite3_initialize',
   'sqlite3_error_offset',
@@ -43,7 +43,7 @@ const _abi3Sentinels = {
 
 /// Export that only 2.x provides, kept so a mismatch can be named precisely
 /// instead of merely reported.
-const _abi2Sentinel = 'dart_sqlite3_create_scalar_function';
+const _abi2Sentinels = {'dart_sqlite3_create_scalar_function'};
 
 void main() {
   final wasm = File('web/sqlite3.wasm');
@@ -71,18 +71,31 @@ void main() {
   stdout.writeln('web/sqlite3.wasm                : '
       '${wasm.lengthSync()} bytes, ${exports.length} exports');
 
-  final absent = _abi3Sentinels.difference(exports);
+  // The engine the worker is built to drive depends on the resolved `sqlite3`
+  // version: 2.x (the project pins 2.4.6) uses the 2.x WebAssembly ABI, 3.x
+  // uses the 3.x ABI. Demand the ABI that matches the resolved version instead
+  // of assuming one or the other, so a worker upgraded alongside `pub upgrade`
+  // cannot silently land on a stale engine.
+  final wantsAbi3 = _major(wanted) >= 3;
+  final expected = wantsAbi3 ? _abi3Sentinels : _abi2Sentinels;
+  final absent = expected.difference(exports);
   if (absent.isEmpty) {
-    stdout.writeln('\nOK — the engine exports the 3.x ABI the worker calls.');
+    stdout.writeln('\nOK — the engine exports the '
+        '${wantsAbi3 ? '3.x' : '2.x'} ABI the worker calls.');
     return;
   }
 
   stderr.writeln('\nMISMATCH — web/sqlite3.wasm is the wrong build.');
-  stderr.writeln('  the worker calls, and the engine does not export: '
+  stderr.writeln('  sqlite3 ${wanted ?? '?'} needs the '
+      '${wantsAbi3 ? '3.x' : '2.x'} ABI, and the engine does not export: '
       '${absent.join(', ')}');
-  if (exports.contains(_abi2Sentinel)) {
-    stderr.writeln('  the engine exports $_abi2Sentinel, so it is a '
-        'sqlite3 2.x build');
+  final other =
+      (wantsAbi3 ? _abi2Sentinels : _abi3Sentinels).firstWhere(
+          exports.contains,
+          orElse: () => '');
+  if (other.isNotEmpty) {
+    stderr.writeln('  the engine exports $other, so it is a '
+        'sqlite3 ${wantsAbi3 ? '2.x' : '3.x'} build');
   }
   final tag = wanted == null ? 'sqlite3-<version from pubspec.lock>'
       : 'sqlite3-$wanted';
@@ -91,6 +104,14 @@ void main() {
       'https://github.com/simolus3/sqlite3.dart/releases/download/'
       '$tag/sqlite3.wasm');
   exit(1);
+}
+
+/// Major version of the resolved `sqlite3` package, or 0 when unknown.
+int _major(String? version) {
+  if (version == null) return 0;
+  final dot = version.indexOf('.');
+  if (dot <= 0) return 0;
+  return int.tryParse(version.substring(0, dot)) ?? 0;
 }
 
 /// The `sqlite3` version pub actually resolved. Read with a regex rather than a
