@@ -12,7 +12,7 @@ class SyncDelta {
 
   /// Our own clock at the moment this delta was snapshotted.
   ///
-  /// This is the ceiling for [SyncEngine.markDeltaSent]. Rows merged from a
+  /// This is the ceiling for [SyncEngine.recordAcks]. Rows merged from a
   /// peer carry the PEER's `updated_at`, which may sit in the future if its
   /// clock is fast; letting such a value become our "delivered" mark would
   /// strand every local edit until real time caught up. Clamping to the
@@ -31,6 +31,17 @@ class SyncApplyResult {
   final Map<String, int> conflictsSkipped = {}; // table -> older rows skipped
   final Map<String, int> orphansSkipped = {}; // table -> rows with missing parent
 
+  /// table -> the newest `updated_at` among the peer's rows we can honestly say
+  /// we have handled, per layer.
+  ///
+  /// This is what the caller turns into an acknowledgement for that peer. A row
+  /// is only acknowledgable when we made a decision about it (applied it, or
+  /// skipped it because ours is newer, or skipped the whole table as out of
+  /// scope). Orphaned rows are **excluded**, and a table with any orphan is not
+  /// acknowledged at all, so the peer keeps re-offering it until every parent
+  /// has arrived. See [SyncEngine.ackKey] for where this is stored.
+  final Map<String, String> ackWatermarks = {};
+
   int get totalApplied => applied.values.fold(0, (a, b) => a + b);
 }
 
@@ -39,10 +50,11 @@ class SyncApplyResult {
 /// Strategy:
 /// - **Incremental** – every table keeps TWO independent marks, and conflating
 ///   them was a data-loss bug, so keep them apart:
-///     * `sent.<peerId>.<table>` – the newest `updated_at` we have actually
-///       **delivered** to *that specific peer*. This, and only this, decides
-///       what [computeOutbound] sends. It is advanced by [markDeltaSent] after a
-///       *confirmed* send.
+///     * `sent.<peerId>.<table>` – the newest `updated_at` of OUR rows that
+///       *that specific peer* has **confirmed reading**. This, and only this,
+///       decides what [computeOutbound] sends. It is advanced by [recordAcks]
+///       from the acknowledgements the peer carries back in its bundle — never
+///       from our own upload.
 ///     * `watermark.<table>` – the newest `updated_at` we have **received**.
 ///       Bookkeeping/diagnostics only.
 ///   Filtering our own outbound rows by the *received* mark is wrong: the
@@ -58,6 +70,15 @@ class SyncApplyResult {
 ///   receive the studio's history — a silent hole, reported as a clean sync on
 ///   both sides. Per-peer marks make the newcomer's absent mark mean what it
 ///   should: "this device holds nothing, send it everything."
+/// - **Acknowledged delivery** – a sent mark advances only once the peer has
+///   **read** our rows and said so. When we apply a peer's bundle we record,
+///   per table, how far through *their* rows we got (`ack.<peer>.<table>`) and
+///   carry those watermarks back in our own bundle; the peer feeds them through
+///   [recordAcks] and advances *its* sent marks for us. Until that round trip,
+///   our marks do not move, so rows a peer has not yet read stay in our file
+///   no matter how many times we upload while it is offline. Overwriting our
+///   one file used to destroy any batch a peer was away for; this is what makes
+///   the overwrite safe.
 /// - **Conflict resolution** – last-write-wins by `updated_at` (UTC ISO-8601).
 ///   On equal timestamps the lexicographically higher `device_id` wins
 ///   (deterministic and stable across all devices).
@@ -99,15 +120,35 @@ class SyncEngine {
     'monthly_progress': {'student_id': 'students'},
   };
 
-  /// Key holding the newest `updated_at` we have successfully delivered to
-  /// [peerId] for [table]. Absent (== '') means "that peer has never had
-  /// anything from us", which correctly forces a full send.
+  /// Key holding the newest `updated_at` of our rows that [peerId] has
+  /// **confirmed reading** for [table]. Absent (== '') means "that peer has
+  /// never had anything from us", which correctly forces a full send.
+  ///
+  /// This is an *acknowledgement*, not an upload marker. It is written only by
+  /// [recordAcks], fed from the `acks` section of the peer's own bundle; a
+  /// successful upload writes nothing. Advancing it on upload was the bug that
+  /// lost a batch any time a peer was offline across two of our uploads.
   static String sentKey(String peerId, String table) =>
       'sent.$peerId.$table';
 
   /// Prefix of every sent mark, used to clear them all without enumerating
   /// peers we may no longer know about.
   static const sentKeyPrefix = 'sent.';
+
+  /// Key holding the newest `updated_at` of [peerId]'s rows that **we** have
+  /// seen and handled for [table]. This is the acknowledgement we carry back to
+  /// [peerId] in our bundle, which it feeds into [recordAcks] to advance its
+  /// sent mark for us.
+  ///
+  /// Written during [applyIncoming] (same transaction, so the watermark is
+  /// atomic with the rows it describes) and read by [outboundAcks] when we are
+  /// about to upload. Monotonic: values only ever move forward.
+  static String ackKey(String peerId, String table) =>
+      'ack.$peerId.$table';
+
+  /// Prefix of every acknowledgement key, cleared alongside `sent.` so a
+  /// forgotten or reset peer can never be told "we have your data" again.
+  static const ackKeyPrefix = 'ack.';
 
   /// The pre-per-peer key shape, still present in databases written by older
   /// builds.
@@ -143,19 +184,19 @@ class SyncEngine {
   /// ## Why an empty [peers] means "send everything"
   ///
   /// With nobody adopted yet we cannot know who will read the file, so the only
-  /// safe content is the whole database. [markDeltaSent] refuses to advance any
-  /// mark in that state, which together fix a real hole in the two-device
-  /// version: a first phone used for a week before the second one existed used
-  /// to mark its rows delivered to nobody, and then overwrite its own file with
-  /// an empty delta. The second phone arrived to find an empty mailbox and the
-  /// first one insisting it had already sent everything.
+  /// safe content is the whole database. [recordAcks] cannot advance a mark in
+  /// that state, which together fix a real hole in the two-device version: a
+  /// first phone used for a week before the second one existed used to mark its
+  /// rows delivered to nobody, and then overwrite its own file with an empty
+  /// delta. The second phone arrived to find an empty mailbox and the first
+  /// one insisting it had already sent everything.
   Future<SyncDelta> computeOutbound(
     Transaction txn, {
     Set<String> peers = const {},
   }) async {
     final delta = SyncDelta();
     // Read our clock BEFORE querying, so every row written after this point is
-    // strictly above the mark markDeltaSent will set.
+    // strictly above any mark [recordAcks] will set from a peer's clock.
     delta.snapshotAt = DateTime.now().toUtc().toIso8601String();
     for (final table in tables) {
       final floor = await _outboundFloor(txn, table, peers);
@@ -192,62 +233,81 @@ class SyncEngine {
     return floor;
   }
 
-  /// Record that every row in [delta] has reached each of [peers], so the next
-  /// [computeOutbound] does not send it again.
+  /// Advance our sent marks for [peerId] from the acknowledgements it carried
+  /// back to us, so the next [computeOutbound] stops offering rows it has
+  /// confirmed reading.
   ///
-  /// **Only call this once delivery is confirmed.** Over the Drive mailbox that
-  /// is a successful file write — the bundle now sits in the account and each
-  /// peer will read it whenever it next syncs. Calling it merely because we
-  /// *attempted* a send would drop rows whenever the upload failed; calling it
-  /// late only costs a harmless re-send, so when in doubt, call it late.
+  /// **This is the only thing that may advance a sent mark.** The marks mean
+  /// "that peer already holds everything up to this timestamp", which is only
+  /// true once the peer has *read* the rows and said so. Advancing them from our
+  /// own upload treated reachability as reading and lost any batch a peer was
+  /// offline across two of our uploads — the file was overwritten before the
+  /// peer ever saw it, and the mark then claimed it had.
   ///
-  /// With no [peers] this does **nothing**, deliberately. A sent mark is a claim
-  /// about a specific device's contents, so with no device to name there is no
-  /// claim to record — and recording one anyway is how the first phone of a pair
-  /// used to declare its data delivered before the second phone existed.
+  /// [watermarks] is the `acks` section of the peer's bundle addressed to us:
+  /// table -> the newest `updated_at` of OUR rows the peer received.
   ///
-  /// ## Known limitation: a peer that stays offline across two uploads
-  ///
-  /// Each upload **overwrites** our single file, so rows from upload N are gone
-  /// once upload N+1 lands. We mark them delivered at upload N because the file
-  /// was readable then, which is a claim about reachability rather than about
-  /// reading. A peer that is offline across both uploads therefore never sees
-  /// the first batch, and nothing here can tell. The remedy is the one the app
-  /// already has — **Send everything again** on a device that holds the data —
-  /// and the honest fix is an acknowledgement in the bundle so marks advance on
-  /// *confirmed read* instead. Until that exists, treat onboarding a device that
-  /// has been away a long time as "resend, then sync".
-  Future<void> markDeltaSent(
+  /// Three clamps, each closing a way a foreign value could rescue us into
+  /// pretending data was delivered:
+  /// - a watermark from a *fast* peer clock (its rows carry future stamps we
+  ///   forwarded) is capped at our own `now`, so it cannot strand local edits
+  ///   made before real time catches up — those rows are re-offered as echoes
+  ///   until then, which the peer discards;
+  /// - a watermark is never advanced past the newest `updated_at` we actually
+  ///   hold for that table, so a peer cannot ack rows we never had;
+  /// - a mark never moves backwards, so a clock that jumped back cannot trigger
+  ///   pointless re-sends.
+  Future<void> recordAcks(
     Transaction txn,
-    SyncDelta delta, {
-    Set<String> peers = const {},
-  }) async {
-    if (peers.isEmpty) return;
-    final ceiling = delta.snapshotAt;
-    for (final entry in delta.tables.entries) {
-      var max = '';
-      for (final row in entry.value) {
-        final at = (row['updated_at'] as String?) ?? '';
-        if (at.compareTo(max) > 0) max = at;
+    String peerId,
+    Map<String, String> watermarks,
+  ) async {
+    if (peerId.isEmpty) return;
+    final now = DateTime.now().toUtc().toIso8601String();
+    for (final table in tables) {
+      final w = watermarks[table];
+      if (w == null || w.isEmpty) continue;
+      var mark = w.compareTo(now) > 0 ? now : w;
+      final tableMax = await _maxUpdatedAt(txn, table);
+      if (tableMax.isNotEmpty && mark.compareTo(tableMax) > 0) {
+        mark = tableMax;
       }
-      // Never let a peer's clock set our mark. A row we merged from a fast
-      // phone can be stamped in the future; if that became our mark, every
-      // local edit until then would sort below it and never be sent again.
-      // Such a row is simply re-offered each sync until our own clock passes
-      // it, and the peer discards it as an unchanged echo — wasted bytes, in
-      // exchange for never losing an edit.
-      if (ceiling.isNotEmpty && max.compareTo(ceiling) > 0) max = ceiling;
-      if (max.isEmpty) continue;
-      for (final peer in peers) {
-        final key = sentKey(peer, entry.key);
-        final current = await state.readWithin(txn, key) ?? '';
-        // Never move a mark backwards: a clock that jumped back would otherwise
-        // re-send, and worse, a later correct value would be lost.
-        if (max.compareTo(current) > 0) {
-          await state.writeWithin(txn, key, max);
-        }
+      if (mark.isEmpty) continue;
+      final key = sentKey(peerId, table);
+      final current = await state.readWithin(txn, key) ?? '';
+      if (mark.compareTo(current) > 0) {
+        await state.writeWithin(txn, key, mark);
       }
     }
+  }
+
+  /// The acknowledgements to include in our next upload: peer -> table ->
+  /// newest `updated_at` of that peer's rows we have handled.
+  ///
+  /// These are the rows stored by [applyIncoming] under [ackKey]; a peer only
+  /// appears once we have something to tell it. Contained, idempotent and small
+  /// enough to ride every bundle — losing one in an overwrite is harmless, the
+  /// next upload repeats it.
+  Future<Map<String, Map<String, String>>> outboundAcks(
+    Transaction txn, {
+    required Set<String> peers,
+  }) async {
+    final out = <String, Map<String, String>>{};
+    for (final peer in peers) {
+      if (peer.isEmpty) continue;
+      final tables = <String, String>{};
+      for (final table in this.tables) {
+        final w = await state.readWithin(txn, ackKey(peer, table));
+        if (w != null && w.isEmpty == false) tables[table] = w;
+      }
+      if (tables.isNotEmpty) out[peer] = tables;
+    }
+    return out;
+  }
+
+  Future<String> _maxUpdatedAt(Transaction txn, String table) async {
+    final rows = await txn.rawQuery('SELECT MAX(updated_at) AS m FROM $table');
+    return (rows.isEmpty ? null : rows.first['m']) as String? ?? '';
   }
 
   /// Forget which of our rows a peer has already received, so the next sync
@@ -287,11 +347,20 @@ class SyncEngine {
   /// Deliberately does **not** touch `watermark.<table>`. Those record what we
   /// have *received*, and lowering them would make us re-apply the peers' rows
   /// against our own — pointless work with real conflict-resolution risk.
+  ///
+  /// Also clears the `ack.<peer>.<table>` keys. Those are our claims that "we
+  /// have already handled this peer's rows", and they die with the peer just
+  /// like the sent marks do — a forgotten relationship has nothing to
+  /// acknowledge. Over-clearing both directions is safe: it only costs the same
+  /// larger upload the doc above describes.
   Future<int> clearSentMarks(SyncExecutor ex, {Set<String>? peers}) async {
     if (peers == null) {
       // Everything under the prefix, so an unknown or already-forgotten peer
-      // cannot leave a mark behind claiming it holds our data.
-      return state.deleteWithPrefix(ex, sentKeyPrefix);
+      // cannot leave a mark behind claiming it holds our data — or that we hold
+      // its.
+      final sent = await state.deleteWithPrefix(ex, sentKeyPrefix);
+      final ack = await state.deleteWithPrefix(ex, ackKeyPrefix);
+      return sent + ack;
     }
     var cleared = 0;
     for (final table in tables) {
@@ -303,10 +372,11 @@ class SyncEngine {
         cleared++;
       }
       for (final peer in peers) {
-        final key = sentKey(peer, table);
-        if (await state.readWithin(ex, key) == null) continue;
-        await state.writeWithin(ex, key, null); // null deletes the row
-        cleared++;
+        for (final key in [sentKey(peer, table), ackKey(peer, table)]) {
+          if (await state.readWithin(ex, key) == null) continue;
+          await state.writeWithin(ex, key, null); // null deletes the row
+          cleared++;
+        }
       }
     }
     return cleared;
@@ -447,10 +517,54 @@ class SyncEngine {
         if (maxSeen.compareTo(current) > 0) {
           await state.writeWithin(txn, receivedKey(table), maxSeen);
         }
+        // Same gate, and the same reason, for the acknowledgement. Skipping the
+        // ack when orphans were present is what makes the peer keep re-offering
+        // this table until every parent has arrived — otherwise the child rows
+        // would be declared handled and quietly vanish.
+        await _recordAck(txn, peerDeviceId, table, maxSeen);
+        result.ackWatermarks[table] = maxSeen;
       }
     }
+
+    // Tables this build deliberately does not hold (the attender's phone and
+    // the owner's events): we read the rows, chose to store none of them, and
+    // there is no parent dependency to wait for. Acknowledging them keeps the
+    // owner from re-offering the whole table to a scope that will never store
+    // it — we have handled as much as this build ever will.
+    for (final table in incoming.keys) {
+      if (tables.contains(table)) continue;
+      var max = '';
+      for (final raw in incoming[table]!) {
+        final at = (raw['updated_at'] as String?) ?? '';
+        if (at.compareTo(max) > 0) max = at;
+      }
+      if (max.isNotEmpty) {
+        await _recordAck(txn, peerDeviceId, table, max);
+        result.ackWatermarks[table] = max;
+      }
+    }
+
     await state.writeWithin(txn, 'last_sync_at', DateTime.now().toUtc().toIso8601String());
     return result;
+  }
+
+  /// Persist an acknowledgement for [peerId]'s table rows up to [watermark],
+  /// monotonically — it only ever moves forward.
+  ///
+  /// Runs inside the same transaction as the rows it acknowledges, so a failed
+  /// apply cannot leave an ack on top of rows that were never stored.
+  Future<void> _recordAck(
+    SyncExecutor ex,
+    String peerId,
+    String table,
+    String watermark,
+  ) async {
+    if (peerId.isEmpty || watermark.isEmpty) return;
+    final key = ackKey(peerId, table);
+    final current = await state.readWithin(ex, key) ?? '';
+    if (watermark.compareTo(current) > 0) {
+      await state.writeWithin(ex, key, watermark);
+    }
   }
 
   void _maxOf(List<String> list, String value) {

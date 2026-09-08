@@ -41,6 +41,7 @@ class SyncBundle {
     required this.createdAt,
     required this.tables,
     required this.protocol,
+    this.acks = const {},
   });
 
   /// `TANDAV-XXXX` of the device that produced this bundle.
@@ -55,6 +56,19 @@ class SyncBundle {
   /// table -> rows, ready to hand straight to [SyncEngine.applyIncoming].
   final Map<String, List<Map<String, Object?>>> tables;
 
+  /// Acknowledgements the writer carries back to its peers: peer id -> table ->
+  /// the newest `updated_at` of that peer's rows the writer has handled.
+  ///
+  /// This is how a `sent.<peer>.<table>` mark advances — only after the peer
+  /// has actually *read* our rows and, on one of its own syncs, told us it did.
+  /// See [SyncEngine.recordAcks]. Additive and optional, so old bundles decode
+  /// to an empty map and old builds silently ignore the field — the round trip
+  /// is what makes overwriting our single file safe instead of lossy.
+  final Map<String, Map<String, String>> acks;
+
+  /// Number of tables the writer acknowledges handling, for diagnostics.
+  int get ackCount => acks.values.fold(0, (sum, t) => sum + t.length);
+
   int get rowCount => tables.values.fold(0, (sum, rows) => sum + rows.length);
 
   bool get isEmpty => rowCount == 0;
@@ -65,10 +79,15 @@ class SyncBundle {
   static const int formatVersion = 1;
 
   /// Serialise [delta] into the text written to the mailbox.
+  ///
+  /// [acks] is the writer's accumulated acknowledgements from [SyncEngine]
+  /// (`peer -> table -> watermark`). It is optional and defaults to empty, so
+  /// old callers and test helpers keep working unchanged.
   static String encode({
     required String deviceId,
     required SyncDelta delta,
     DateTime? createdAt,
+    Map<String, Map<String, String>> acks = const {},
   }) {
     final tables = <String, List<Map<String, Object?>>>{};
     for (final table in SyncCodec.applyOrder) {
@@ -83,6 +102,7 @@ class SyncBundle {
       'createdAt': (createdAt ?? DateTime.now().toUtc()).toIso8601String(),
       'rows': tables.values.fold<int>(0, (sum, rows) => sum + rows.length),
       'tables': tables,
+      'acks': acks,
     });
   }
 
@@ -152,11 +172,31 @@ class SyncBundle {
       if (parsed.isNotEmpty) tables[table] = parsed;
     }
 
+    // Acknowledgements are optional (old bundles do not carry them), and a
+    // malformed value is ignored rather than fatal — an ack that fails to parse
+    // must not block the rows next to it, it only delays one delivery mark.
+    final acks = <String, Map<String, String>>{};
+    final acksRaw = raw['acks'];
+    if (acksRaw is Map<String, Object?>) {
+      for (final peerEntry in acksRaw.entries) {
+        final perTable = peerEntry.value;
+        if (perTable is! Map) continue;
+        final peerAcks = <String, String>{};
+        for (final entry in perTable.entries) {
+          final v = entry.value;
+          if (v is! String || v.isEmpty) continue;
+          peerAcks[entry.key] = v;
+        }
+        if (peerAcks.isNotEmpty) acks[peerEntry.key] = peerAcks;
+      }
+    }
+
     return SyncBundle(
       deviceId: deviceId,
       createdAt: (created ?? DateTime.now()).toUtc(),
       protocol: protocol,
       tables: tables,
+      acks: acks,
     );
   }
 }

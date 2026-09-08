@@ -569,13 +569,16 @@ class TandavDatabase {
       {'key': 'device_id', 'value': fresh},
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
-    // The 'sent.' and 'watermark.' prefixes mirror SyncEngine.sentKey and
-    // SyncEngine.receivedKey. They are spelled out as literals here because
-    // SyncEngine imports this file, so importing it back would be circular.
-    await db.delete(
-      'sync_state',
-      where: "key IN (?, ?, ?, ?, ?) "
-          "OR key LIKE 'sent.%' OR key LIKE 'watermark.%'",
+// The 'sent.', 'ack.' and 'watermark.' prefixes mirror SyncEngine.sentKey,
+// SyncEngine.ackKey and SyncEngine.receivedKey. They are spelled out as
+// literals here because SyncEngine imports this file, so importing it back
+// would be circular. 'sent.' is what we believed a peer held of ours; 'ack.'
+// is what we claimed to have handled of theirs; neither belongs to a fresh
+// device id.
+await db.delete(
+  'sync_state',
+  where: "key IN (?, ?, ?, ?, ?) "
+      "OR key LIKE 'sent.%' OR key LIKE 'ack.%' OR key LIKE 'watermark.%'",
       whereArgs: [
         'paired_device_id',
         'pairing_secret',

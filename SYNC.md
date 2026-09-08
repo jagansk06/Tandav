@@ -86,16 +86,29 @@ sync at 9am, device B at 6pm, and both end up correct.
 The order below is deliberate and is enforced by a regression test.
 
 1. **Snapshot** the outbound delta (`computeOutbound`) in a read-only
-   transaction.
-2. **Upload** it as one JSON bundle, overwriting our own file.
+   transaction, together with the acknowledgements we owe each peer
+   (`outboundAcks`).
+2. **Upload** it as one JSON bundle, overwriting our own file. The bundle also
+   carries an `acks` section — the newest `updated_at` of each peer's rows we
+   have handled.
 3. **Download** the peer's file and validate it.
-4. **Apply** every table in **one** write transaction (`applyIncoming`).
+4. **Process its acks** (`recordAcks`): this, and only this, advances our
+   `sent.<peer>.<table>` marks.
+5. **Apply** every table in **one** write transaction (`applyIncoming`), which
+   at the same time records the acks we owe that peer next time.
 
 Why snapshot before applying: applying **advances the watermarks**, and the
 outbound delta is defined as *rows newer than the watermark*. Merge first and
 our own older-but-unsent rows fall behind the new watermark and **would never
 reach the peer**. Why upload before applying: a failed upload leaves the local
 database completely untouched, so the retry recomputes an identical delta.
+
+**Nothing marks a row "delivered" at upload time.** The file sits in the
+account, but *delivered* is a claim about what another device **read**, and only
+that device's acknowledgement can confirm it. This is the entire safety
+guarantee against the single-file-overwrite hole — if the upload succeeded but
+the peer never read it, the row is still on offer, which is exactly the honest
+state. A bundle that fails to decode therefore changes nothing locally.
 
 ### Bundle format
 
@@ -163,10 +176,10 @@ are free slots, *none* are adopted. Taking the newest two would be worse than
 failing — it silently picks the studio's sync partners by upload time, and the
 customer would never be told a choice had been made.
 
-The order inside `_run()` is what makes three work: **list → snapshot → upload →
-record delivery → apply**. Listing first means a peer adopted on this run is
-already in the peer set when the outbound delta is computed, so a newcomer gets a
-full bundle on the *same* sync it is discovered, not the next one.
+The order inside `_run()` is what makes three work: **list → snapshot (+ acks) →
+upload → process peer acks → apply**. Listing first means a peer adopted on this
+run is already in the peer set when the outbound delta is computed, so a newcomer
+gets a full bundle on the *same* sync it is discovered, not the next one.
 
 ### Rebuilding a device that lost its data
 
@@ -197,9 +210,9 @@ Details that are easy to get wrong if this is ever rewritten:
   `attendance`, `fee_payments` and `event_participations`, which gained the
   column through `ALTER TABLE … NOT NULL DEFAULT ''`.
 - **`_running` is held while the marks are cleared.** Otherwise a resume or the
-  five-minute timer could start a sync in the gap, and its `markDeltaSent` —
-  computed from a delta snapshotted *before* the clear — would write the marks
-  straight back. The button would report success and have done nothing.
+  five-minute timer could start a sync in the gap, and its `recordAcks` —
+  computing marks from a peer bundle it read *before* the clear — would write
+  them straight back. The button would report success and have done nothing.
 - **Clearing survives a failed sync, on purpose.** The customer taps this when
   something is already wrong, which is when their internet is least reliable.
   The request lives in the database, so whichever sync succeeds next carries the
@@ -228,11 +241,11 @@ This is the single easiest thing to get wrong in this file, and getting it wrong
 loses data silently.
 
 A sent mark does **not** mean "we uploaded this". It means **"that specific
-device already holds everything up to this timestamp"** — which is why
-`markDeltaSent` may only run after a *confirmed* write, and why the peer id is
-part of the key. **So anything that forgets a peer must clear that peer's marks
-in the same transaction**, because the next device adopted is a different device
-and it holds nothing.
+device already holds everything up to this timestamp"** — which is why it only
+advances from the peer's own **acknowledgement** (`recordAcks`), never from our
+upload, and why the peer id is part of the key. **So anything that forgets a
+peer must clear that peer's marks in the same transaction**, because the next
+device adopted is a different device and it holds nothing.
 
 Both places that forget a peer do this: `forgetCloudPeer()` and `disconnect()`.
 When only the first half was done, the failure looked like this:
@@ -260,7 +273,7 @@ current peers, and:
 
 - **a peer with no mark drops the floor to "send everything"** — which is exactly
   what makes a device joining an established studio receive its whole history;
-- **an empty peer set also means "send everything"**, and `markDeltaSent` with no
+- **an empty peer set also means "send everything"**, and `recordAcks` with no
   peers is a **no-op**. Nothing has been delivered to nobody. The single-mark
   version got this wrong in a way that cost data: a first phone used for a week
   alone marked its rows delivered, then overwrote its own file with an empty
@@ -272,12 +285,45 @@ reports its **whole database** as pending rather than zero. That is not a bug to
 tidy away: nothing has been delivered, and the count is the answer to "what would
 the next sync send".
 
-One limitation stands, documented rather than fixed: marks advance on a
-**confirmed upload**, not a confirmed *read*. If a peer is offline across two of
-our uploads, the second overwrites the first and the peer never sees the rows
-that were only in the first — unless a later edit or **Send everything again**
-re-offers them. Closing it properly needs an `ack` field in the bundle plus
-per-peer received marks.
+### How a row is delivered (and the overwrite hole)
+
+One file per device, **overwritten in place** on every sync, makes a bundle a
+**delta, not a snapshot**: a batch of rows that a peer was offline across two of
+our uploads only ever lived in the first upload, and the second overwrote it. If
+the `sent` mark advanced on upload, that batch would be gone forever. So delivery
+is now **confirmed by the reader**:
+
+- When we apply a peer's rows we remember, per peer and table, the newest
+  `updated_at` we handled (`ack.<peerId>.<table>`), written in the **same
+  transaction** as the apply.
+- That watermark travels as an **`acks` section** in our next bundle, e.g.
+  `"acks": { "TANDAV-91EF": { "students": "2026-09-01T08:00:00.000Z" } }` —
+  peer id → table → newest `updated_at` of that peer's rows we saw. The field is
+  **additive and optional**, so version-1 bundles still decode and an old build
+  simply ignores it. That is safe: an old build never acks, so the new build
+  keeps re-offering rows until the old build upgrades — re-offering everything
+  to a device that never acks is the price of *not* losing data, and peers skip
+  the echoes as unchanged.
+- The peer reads our acks and feeds them into `recordAcks`, which advances its
+  `sent.<peer>.<table>` marks — the **only** thing that may. Consequences:
+
+  - Rows a peer never read are re-offered **every** sync until it acks, however
+    often our upload overwrites its file — an offline peer's rows can no longer be
+    lost to a second upload.
+  - A table we applied but left **orphaned** is not acked, so the owner keeps
+    re-offering it until the parents arrive too.
+  - A table this build does **not** hold (the attender receiving `events`) is acked
+    wholesale, so the owner does not re-offer the entire table to a device that
+    will never store it.
+  - Watermarks are **clamped**: never past our own `now`, never past the newest
+    `updated_at` we actually hold, never backwards — so a fast or lying peer clock
+    cannot rescue a `sent` mark into covering rows the peer never saw.
+
+There is now no "delivery on upload" path at all: rows stop being offered **only**
+on a confirmed read. That is the fix for the old limitation. The residual cost is
+one **one-sync lag** — a row A uploads is not marked delivered to B until B has
+run its own sync and carried the ack back — which is a re-offer of a handful of
+rows, never a loss.
 
 ### One-time developer setup (do this once, ever)
 
@@ -329,7 +375,9 @@ backups as secrets.)
   newest `updated_at` received from the peer (`watermark.<table>` in
   `sync_state`). Nothing is ever dumped in full. Note there are **two** marks
   per table and they are not interchangeable: only `sent.<table>` may gate what
-  we transmit. Using the inbound mark for that was a real data-loss bug.
+  we transmit, and `sent.<table>` itself advances only from the peer's
+  acknowledgement, never from our upload. Using the inbound mark (or the upload)
+  for that was a real data-loss bug.
 - **Conflict resolution (LWW):** newer `updated_at` wins. On an exact
   timestamp tie the lexicographically **higher device id** wins, so both
   devices reach the same answer. The losing side keeps its watermark behind
@@ -347,8 +395,8 @@ backups as secrets.)
   attendance/fees/progress, `event_id`+`student_id` for participation) merge
   into that row instead of duplicating.
 - **Atomicity:** all tables of one inbound payload apply inside a **single
-  transaction** together with the watermark advances; a failure rolls back
-  and the local database is never half-updated.
+  transaction** together with the received-mark and acknowledgement advances; a
+  failure rolls back and the local database is never half-updated.
 
 ## Permissions / platform notes
 
@@ -375,6 +423,8 @@ network and no Google account**.
 - LWW by `updated_at`, and the device-id tie-break (both sides converge),
 - tombstone propagation for deletions,
 - natural-key merge of independently created batches,
+- acknowledgement clamping — a future or backwards watermark can neither
+  strand our edits nor force re-sends,
 - `SyncCodec` round trip including `_fk` metadata.
 
 `test/cloud_sync_test.dart` (Drive path, against an in-memory `FakeMailbox`):
@@ -400,6 +450,14 @@ network and no Google account**.
   whole reason the action exists), that re-offering rows cannot duplicate them
   or overwrite a newer edit on the peer, and that a resend requested with no
   internet is still honoured by the next successful sync.
+- **rows a peer misses while offline are re-offered, not lost** — the core
+  ack guarantee: a peer offline across two of our uploads still receives the
+  row that only lived in the first,
+- **first sync merges a large existing dataset with local data, no dupes** —
+  A holding 300 students and B holding 3 converge to 303 on both, each row
+  exactly once,
+- the acks round trip with empty bundles: a peer that has nothing to send still
+  acknowledges and un-sticks the other device's file.
 
 Run everything with:
 

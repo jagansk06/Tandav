@@ -27,9 +27,10 @@
 ///
 /// 1. **List** the other devices' files and settle who we sync with.
 /// 2. **Snapshot** our outbound delta in a read-only transaction.
-/// 3. **Upload** it.
-/// 4. **Record** delivery against each peer.
-/// 5. **Apply** each peer's bundle, one write transaction per peer.
+/// 3. **Upload** it (carrying our accumulated acknowledgements).
+/// 4. **Apply** each peer's bundle, one write transaction per peer. Rows
+///    become "delivered" to a peer only when that peer confirms it read them —
+///    an `acks` section it carries back is what finally advances our sent marks.
 ///
 /// Listing first is what makes three devices work: the delta in step 2 is
 /// computed against the *set* of peers, so a device adopted in step 1 is
@@ -37,16 +38,21 @@
 /// nothing, so moving it ahead of the snapshot costs the invariant below
 /// nothing.
 ///
-/// Snapshotting before applying matters: applying advances the watermarks, and
-/// the outbound delta is defined as "rows newer than the marks". If we merged
-/// first, our own older-but-unsent rows would fall behind the freshly advanced
-/// marks and would never reach the peers. Uploading before applying matters
-/// too: if the upload fails we have changed nothing locally, so the next attempt
-/// recomputes exactly the same delta and nothing is lost.
+/// Snapshotting before applying matters: applying changes the local database,
+/// and the outbound delta is a snapshot of "what the peers have not confirmed".
+/// If we merged first, a peer's bundle that carried an acknowledgement could
+/// advance our sent marks *and* overwrite our own unsent rows with the peer's
+/// versions, and either could make our own older-but-unconfirmed edits fall
+/// behind the freshly advanced marks — never reaching the peers. Uploading
+/// before applying matters too: if the upload fails we have changed nothing
+/// locally, so the next attempt recomputes exactly the same delta and nothing
+/// is lost.
 ///
-/// Recording delivery (step 4) before applying (step 5) is also deliberate — a
-/// bundle that fails to decode must not leave us believing our own rows are
-/// still pending, because the file we wrote is sitting in the folder either way.
+/// Nothing here records delivery at upload time. The file sits in the account,
+/// but "delivered" is a claim about what another device *read*, which only its
+/// acknowledgement can confirm — see [SyncEngine.recordAcks]. A bundle that
+/// fails to decode therefore changes nothing: our rows are simply still on
+/// offer, which is the honest state.
 library;
 
 import 'dart:async';
@@ -159,9 +165,10 @@ class CloudSyncManager {
   ///
   /// Note that [Future.timeout] does not cancel the underlying HTTP request; it
   /// only stops us waiting on it. An abandoned run may still finish quietly,
-  /// which is safe: the upload overwrites one file in place, and the per-table
-  /// `sent` marks only advance after a confirmed write, so the next attempt
-  /// recomputes exactly the same delta.
+  /// which is safe: the upload overwrites one file in place, and rows only stop
+  /// being offered once the peer *reads* them and acknowledges — nothing here
+  /// advances a mark on a guessed outcome, so the next attempt recomputes
+  /// exactly the same delta.
   ///
   /// Injectable so tests can use a few milliseconds instead of a minute and a
   /// half.
@@ -259,10 +266,10 @@ class CloudSyncManager {
   /// ## Why it clears the sent marks as well
   ///
   /// `sent.<peerId>.<table>` does not mean "uploaded". It means **"that peer
-  /// already holds everything up to this timestamp"** — that is the whole reason
-  /// [SyncEngine.markDeltaSent] may only run after a confirmed delivery. The
-  /// moment a peer is forgotten that sentence stops being true: the next device
-  /// adopted is a *different* device, and it holds nothing.
+  /// already holds everything up to this timestamp"** — the whole reason the
+  /// mark is only advanced from the peer's own acknowledgement, never from our
+  /// upload. The moment a peer is forgotten that sentence stops being true: the
+  /// next device adopted is a *different* device, and it holds nothing.
   ///
   /// Leaving the marks behind was a silent data hole rather than an error. The
   /// replacement device would be adopted normally, both devices would report a
@@ -288,8 +295,8 @@ class CloudSyncManager {
   /// peer is forgotten but the marks still claim delivery. And `_running` is
   /// held while it happens, for the same reason [resendEverything] holds it: a
   /// resume or the five-minute timer could otherwise slip a sync into the gap
-  /// and its `markDeltaSent` — computed from a delta snapshotted before the
-  /// clear — would put the marks straight back.
+  /// and its `recordAcks` — computing marks from a bundle it read before the
+  /// clear — would put them straight back.
   ///
   /// Returns null on success, or a message to show the user when nothing was
   /// done.
@@ -475,8 +482,13 @@ class CloudSyncManager {
     //    another device's rows cannot interleave with the snapshot it is based
     //    on. The floor is the *least* caught-up peer's mark: one file serves
     //    every reader, so it has to satisfy whoever is furthest behind.
-    final delta =
-        await d.transaction((txn) => engine.computeOutbound(txn, peers: peerIds));
+    //    Alongside it, read the acknowledgements we have accumulated for these
+    //    peers — they ride this very upload.
+    final (delta, acks) = await d.transaction((txn) async {
+      final delta = await engine.computeOutbound(txn, peers: peerIds);
+      final acks = await engine.outboundAcks(txn, peers: peerIds);
+      return (delta, acks);
+    });
     final sent = delta.rowCount;
 
     // 3. Upload. Done before the merge so a network failure leaves the local
@@ -486,19 +498,15 @@ class CloudSyncManager {
       sent == 0 ? 'No local changes to send.' : 'Sending $sent changes…',
       sent: sent,
     );
-    final bundle = SyncBundle.encode(deviceId: deviceId, delta: delta);
+    final bundle = SyncBundle.encode(deviceId: deviceId, delta: delta, acks: acks);
     await mailbox.writeOwn(deviceId, bundle);
 
-    // 3b. The write succeeded, so these rows ARE delivered to every peer: the
-    //     bundle now sits in the shared account and each of them will read it
-    //     whenever it next syncs. Record that before touching the download half,
-    //     because whatever happens below cannot un-send a file that is already
-    //     there. With no peers there is nobody to record it against, and
-    //     markDeltaSent refuses — see its doc; claiming delivery to nobody used
-    //     to lose the first device's entire history.
-    if (sent > 0 && peerIds.isNotEmpty) {
-      await d.transaction((txn) => engine.markDeltaSent(txn, delta, peers: peerIds));
-    }
+    //    No delivery marks advance here. The upload overwrites our one file in
+    //    place, and a peer that was offline all along would never see a batch
+    //    that only lived in that single upload — so rows are only "delivered"
+    //    when the peer reads them and says so, in the acks we process below.
+    //    Until then the next upload re-offers them; that is the entire safety
+    //    guarantee of this design.
 
     // 4. Read and merge each device's bundle, one transaction per device.
     if (toRead.isEmpty) {
@@ -537,6 +545,18 @@ class CloudSyncManager {
       final at = incoming.createdAt;
       if (newestBundleAt == null || at.isAfter(newestBundleAt)) {
         newestBundleAt = at;
+      }
+
+      // Process the peer's acknowledgements of OUR rows before deciding whether
+      // the bundle has rows to apply — an empty bundle still carries acks, and
+      // a bundle with rows must not be read twice. Only the entries addressed
+      // to this device count; the file is read by every peer, so it may praise
+      // any of them.
+      final myAcks = incoming.acks[deviceId];
+      if (myAcks != null && myAcks.isNotEmpty) {
+        await d.transaction(
+          (txn) => engine.recordAcks(txn, peerId, myAcks),
+        );
       }
       if (incoming.isEmpty) continue;
 
@@ -677,10 +697,10 @@ class CloudSyncManager {
   ///
   /// - The marks are cleared **before** [syncNow], not merged into it, and the
   ///   `_running` flag is held while clearing. Otherwise a resume or the
-  ///   five-minute timer could start a sync in the gap, and its `markDeltaSent`
-  ///   — which writes marks computed from the delta it snapshotted *before* the
-  ///   clear — would put them straight back, leaving a button that reports
-  ///   success and did nothing.
+  ///   five-minute timer could start a sync in the gap, and its `recordAcks`
+  ///   — computing marks from a peer bundle it read *before* the clear — would
+  ///   put them straight back, leaving a button that reports success and did
+  ///   nothing.
   /// - Clearing persists even if the sync then fails (no internet, timeout).
   ///   That is intentional: the customer's request is recorded in the database,
   ///   so whichever sync succeeds next carries the full copy. They do not have

@@ -14,7 +14,7 @@ import 'package:tandav_mobile/sync/sync_state.dart';
 
 /// The peer these tests claim delivery to.
 ///
-/// A sent mark is a claim about one named device, so `markSent` needs somebody
+/// A sent mark is a claim about one named device, so `confirmed` needs somebody
 /// to name. The engine never validates the id against anything — it is only a
 /// key segment — so a fixed constant stands in for "the other phone" and keeps
 /// the marks comparable across a `device()` switch, which a real device id
@@ -77,13 +77,29 @@ void main() {
           t, delta.tables,
           peerDeviceId: peerDeviceId)));
 
-  /// Stand-in for a transport confirming delivery. The real carriers call this
-  /// after a successful Drive write / the peer's `syncDone`, and suppression of
-  /// repeat sends depends entirely on it.
-  Future<void> markSent(SyncDelta delta,
+  /// Stand-in for the peer confirming it read our rows. In the real flow the
+  /// peer computes the newest `updated_at` it saw per table and carries that
+  /// back as an acknowledgement, which [SyncEngine.recordAcks] turns into our
+  /// sent mark. Suppression of repeat sends depends entirely on this: marks
+  /// advance on a *confirmed read*, never on our own upload.
+  Future<void> confirmed(SyncDelta delta,
           {Set<String> peers = const {testPeer}}) =>
-      open().then((d) =>
-          d.transaction((t) => currentEngine.markDeltaSent(t, delta, peers: peers)));
+      open().then((d) => d.transaction((t) async {
+        final watermarks = <String, String>{};
+        for (final entry in delta.tables.entries) {
+          var max = '';
+          for (final row in entry.value) {
+            final at = (row['updated_at'] as String?) ?? '';
+            if (at.compareTo(max) > 0) max = at;
+          }
+          if (max.isNotEmpty) watermarks[entry.key] = max;
+        }
+        for (final peer in peers) {
+          if (watermarks.isNotEmpty) {
+            await currentEngine.recordAcks(t, peer, watermarks);
+          }
+        }
+      }));
 
   Future<int> seedStudent(String name, {int? batchId}) async {
     final d = await open();
@@ -183,7 +199,7 @@ void main() {
     final aDelta = await outbound();
     expect(aDelta.tables['batches']!.length, 1);
     expect(aDelta.tables['students']!.length, 1);
-    await markSent(aDelta);
+    await confirmed(aDelta);
 
     await device('b');
     final bId = me();
@@ -205,7 +221,7 @@ void main() {
     // B creates a second student, syncs back to A.
     await seedStudent('Meera');
     final bDelta = await outbound();
-    await markSent(bDelta);
+    await confirmed(bDelta);
     await device('a');
     final appliedA = await applyTo(bDelta, bId);
     expect(appliedA.totalApplied, greaterThan(0));
@@ -230,7 +246,7 @@ void main() {
     // a re-send that never stopped would be an infinite loop between the two
     // phones.
     await device('a');
-    await markSent(aDelta2);
+    await confirmed(aDelta2);
     expect((await outbound()).rowCount, 0);
   });
 
@@ -249,7 +265,7 @@ void main() {
 
     final first = await outbound(peers: const {owner});
     expect(first.rowCount, 2);
-    await markSent(first, peers: const {owner});
+    await confirmed(first, peers: const {owner});
 
     // Caught up with the one peer we knew about.
     expect((await outbound(peers: const {owner})).rowCount, 0);
@@ -261,7 +277,7 @@ void main() {
     expect(rejoin.tables['students']!.length, 1);
 
     // Delivery is recorded for both, so the next sync is quiet again.
-    await markSent(rejoin, peers: const {owner, newcomer});
+    await confirmed(rejoin, peers: const {owner, newcomer});
     expect((await outbound(peers: const {owner, newcomer})).rowCount, 0);
   });
 
@@ -276,7 +292,7 @@ void main() {
 
     final alone = await outbound(peers: const {});
     expect(alone.rowCount, 2, reason: 'no peers means send everything');
-    await markSent(alone, peers: const {});
+    await confirmed(alone, peers: const {});
 
     // No mark was written at all — not for a peer, not for the legacy
     // peer-less key — so the data is still on offer the moment somebody does
@@ -433,6 +449,46 @@ void main() {
 
     expect((await allStudents()).length, 2);
     expect(await countWhere('batches', 'deleted_at IS NULL'), 1);
+  });
+
+  test('acknowledgements are clamped so a peer cannot claim more than it read',
+      () async {
+    // The sent mark is only as trustworthy as the watermark a peer carries back.
+    // Three ways that watermark could be wrong:
+    //  - a fast peer clock stamps its rows in the future, and a watermark built
+    //    from those would strand our own edits made before real time caught up;
+    //  - a peer can only ack rows it actually received, never ones we never had;
+    //  - a mark must never move backwards, or a clock that jumped back forces
+    //    pointless re-sends of everything.
+    await device('a');
+    final batchId = await seedBatch('Morning');
+    await seedStudent('Ravi', batchId: batchId);
+    final d = await open();
+    final raviAt = (await d.query('students',
+        where: 'first_name = ?', whereArgs: ['Ravi']))
+        .first['updated_at'] as String;
+
+// A future watermark (peer clock jumped forward) cannot strand our own
+    // edits: it is capped at the newest `updated_at` we actually hold, which
+    // the seeded rows set.
+    final later = DateTime.now().toUtc().add(const Duration(days: 1)).toIso8601String();
+    await open().then((d) => d.transaction((t) => currentEngine.recordAcks(
+        t, testPeer, {'batches': later, 'students': later})));
+    final futureFloor = await currentState.read('sent.$testPeer.students');
+    expect(futureFloor, raviAt,
+        reason: 'the future watermark was clamped to the newest row we hold, '
+            'not believed wholesale');
+
+    // A watermark that moved backwards (or is empty/ignored) never clears a
+    // mark — monotonicity means a clock that jumped back forces no re-sends.
+    await open().then((d) => d.transaction((t) => currentEngine.recordAcks(
+        t, testPeer, {'students': '2000-01-01T00:00:00.000Z'})));
+    expect(await currentState.read('sent.$testPeer.students'), raviAt);
+    await open().then((d) => d.transaction((t) => currentEngine.recordAcks(
+        t, testPeer, {'students': ''})));
+    expect(await currentState.read('sent.$testPeer.students'), raviAt);
+    expect((await outbound(peers: const {testPeer})).rowCount, 0,
+        reason: 'the clamped mark still covers the rows we hold');
   });
 
   // A test covering FrameCodec / FrameAccumulator / envelope / pairingCode /

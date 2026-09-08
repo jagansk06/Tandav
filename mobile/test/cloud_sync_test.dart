@@ -558,10 +558,13 @@ void main() {
     expect(await cloud.lastCloudSyncAt, isNull);
 
     // Our upload happened before the damaged file was read, and a bad file on
-    // the peer's side cannot un-send it — so those rows are genuinely delivered
-    // and must NOT be queued again.
+    // the peer's side cannot un-send it. But the damaged peer never READ our
+    // rows either, and only a peer that reads and acknowledges them closes the
+    // delivery — so they stay on offer until that peer syncs successfully. The
+    // invariant upload-before-apply protects still holds: the upload happened;
+    // neither side pretends the peer has the rows.
     expect(mailbox.files, contains(SyncMailbox.fileNameFor(me())));
-    expect(await cloud.pendingRowCount(), 0);
+    expect(await cloud.pendingRowCount(), greaterThan(0));
   });
 
   test('bundle encoding rejects incompatible and malformed input', () {
@@ -658,9 +661,24 @@ void main() {
     expect(await cloud.cloudPeerId, aId);
     await tick();
     await seedStudent('Ravi');
-    await cloud.syncNow(); // B delivers Morning + Ravi to A
-    await cloud.syncNow(); // …and B's own file drains to empty
-    final bFile = SyncMailbox.fileNameFor(me());
+    await cloud.syncNow(); // B delivers Morning + Ravi to A …
+    expect(await cloud.pendingRowCount(), 2,
+        reason: 'delivery is only claimed once A READS the rows and '
+            'acknowledges — B keeps offering both until then');
+    var bFile = SyncMailbox.fileNameFor(me());
+    expect(SyncBundle.decode(mailbox.files[bFile]!).rowCount, 2);
+
+    // A reads B's bundle (and its own acks are recorded in that same apply
+    // step). They ride A's NEXT upload — so one more A sync and two more B
+    // syncs (first reads A's acks, second uploads the now-drained file)
+    // settle B to empty.
+    await device('a');
+    await cloud.syncNow();
+    await cloud.syncNow();
+
+    await device('b');
+    await cloud.syncNow();
+    await cloud.syncNow();
     expect(await cloud.pendingRowCount(), 0);
     expect(SyncBundle.decode(mailbox.files[bFile]!).rowCount, 0);
 
@@ -730,9 +748,12 @@ void main() {
       mailbox.plant(id, SyncBundle.encode(deviceId: id, delta: SyncDelta()));
       await cloud.syncNow();
     }
-    await cloud.syncNow(); // drains B's file
+    await cloud.syncNow(); // Morning is STILL on offer — none of the planted
+    // bundles has ever acknowledged a single row
     expect(await cloud.knownPeers(), hasLength(CloudSyncManager.maxPeers));
-    expect(await cloud.pendingRowCount(), 0);
+    expect(await cloud.pendingRowCount(), 1,
+        reason: 'Morning reached the account but no planted peer ever read it, '
+            'so nothing advances its mark without an ack');
 
     // Every peer is gone: one phone replaced, and the rest were leftovers from
     // tools/fake-peer.html that somebody finally deleted.
@@ -803,10 +824,13 @@ void main() {
     expect(await cloud.cloudPeerId, aId);
     expect(await cloud.cloudAccount, isNotNull);
 
-    // B has now delivered everything it holds, so nothing is pending.
+    // B therefore delivers Evening to A, and both rows sit on offer — its own
+    // copy of Morning plus the new Evening. Delivery is only claimed when A
+    // reads them and acknowledges, which never happens before the disconnect.
     await seedBatch('Evening');
     await cloud.syncNow();
-    expect(await cloud.pendingRowCount(), 0);
+    expect(await cloud.pendingRowCount(), 2,
+        reason: 'B uploaded but nothing has acknowledged a single row yet');
 
     await cloud.disconnect();
     expect(await cloud.cloudPeerId, isNull);
@@ -831,15 +855,17 @@ void main() {
     await cloud.syncNow();
 
     await device('b');
-    await cloud.syncNow();
+    await cloud.syncNow(); // adopts A, applies Morning + Ravi
     expect(await cloud.pendingRowCount(), 2,
-        reason: 'B holds these rows and re-offers them until A confirms — the '
-            'echo is expected, and A discards it as unchanged');
+        reason: 'B\'s own copies of the two rows are on offer until A confirms '
+            'it read them — the echo is expected, and A discards it as '
+            'unchanged');
 
-    // A syncs again, now that B has left a file behind: that is the run where A
-    // adopts B and its marks start meaning something. Before a peer exists there
-    // is nobody to have delivered anything to, and pending correctly reports the
-    // whole database.
+    // The ack for what B applied is written in the same transaction as the
+    // apply, but B's file was already on its way up by then. One more B sync
+    // carries it, and A's pending drops from "both offered, none confirmed"
+    // to "none".
+    await cloud.syncNow();
     await device('a');
     await cloud.syncNow();
     expect(await cloud.pendingRowCount(), 0,
@@ -927,9 +953,16 @@ void main() {
     final bId = me();
     expect((await cloud.syncNow()).applied, 3);
 
-    // A syncs twice more: the first run adopts B and hands the three rows over,
-    // the second finds nothing left to say. That second, empty upload is what
-    // leaves the account holding no copy of anything.
+    // A syncs to hand the three rows over, then B syncs once: B's first run
+    // uploaded its file BEFORE it applied anything, so that bundle carries no
+    // acknowledgements yet — this one does. Two more A syncs follow: the first
+    // reads B's acks (its own snapshot had already gone up, so its file still
+    // holds the three), the second finds nothing left to say. That empty upload
+    // is what leaves the account holding no copy of anything.
+    await device('a');
+    await cloud.syncNow();
+    await device('b');
+    await cloud.syncNow();
     await device('a');
     await cloud.syncNow();
     await cloud.syncNow();
@@ -1032,7 +1065,9 @@ void main() {
       delta: SyncDelta(),
     ));
     expect((await cloud.syncNow()).sent, 2);
-    expect(await cloud.pendingRowCount(), 0);
+    expect(await cloud.pendingRowCount(), 2,
+        reason: 'the planted peer never reads the file, so nothing can ack it — '
+            'a mark only advances on a confirmed read');
 
     mailbox.connected = false;
     final offline = await cloud.resendEverything();
@@ -1046,5 +1081,82 @@ void main() {
     final later = await cloud.syncNow();
     expect(later.ok, isTrue, reason: later.message);
     expect(later.sent, 2);
+  });
+
+  test('rows a peer misses while offline are re-offered, not lost', () async {
+    // Regression for the bug this design exists to kill. Each upload OVERWRITES
+    // the sender's single mailbox file, so a peer that is offline across two of
+    // our uploads never sees the first batch at all. If the sent mark advanced
+    // on upload, that batch would be gone forever — X is only safe because the
+    // mark waits for the peer's acknowledgement, keeping everything on offer
+    // until B reads it.
+    await device('a');
+    await seedStudent('Existing');
+    await cloud.syncNow();
+
+    await device('b'); // B now holds Existing
+    await cloud.syncNow();
+    expect(await findStudent('Existing'), isNotNull);
+
+    // B goes offline. A adopts it, then writes X and Y while B is away — the
+    // second upload overwrites the file that still held X.
+    await device('a');
+    await cloud.syncNow();
+    await seedStudent('Loss-X');
+    await cloud.syncNow();
+    await seedStudent('Loss-Y');
+    await cloud.syncNow();
+
+    // B comes back. It must find X even though X's upload was overwritten
+    // twice before B ever read it.
+    await device('b');
+    final back = await cloud.syncNow();
+    expect(back.ok, isTrue, reason: back.message);
+    expect(await findStudent('Loss-X'), isNotNull,
+        reason: 'X was sent before Y, but the file was overwritten before B '
+            'read it — delivery must be acknowledged, not assumed');
+    expect(await findStudent('Loss-Y'), isNotNull);
+    expect(await findStudent('Existing'), isNotNull);
+  });
+
+  test('first sync merges a large existing dataset with local data, no dupes',
+      () async {
+    // The customer's setup this project keeps coming back to: one phone has
+    // held the studio's history for months, a second new phone has its own
+    // small set of records. The very first sync must merge them both ways —
+    // no wipe, no duplicate, no row lost from either side — because every later
+    // sync leans on exactly that guarantee.
+    await device('a');
+    for (var i = 0; i < 300; i++) {
+      await seedStudent('History-$i');
+    }
+    final aRun = await cloud.syncNow();
+    expect(aRun.ok, isTrue, reason: aRun.message);
+    expect(aRun.sent, 300);
+
+    await device('b');
+    await seedStudent('FollowUp-1');
+    await seedStudent('FollowUp-2');
+    await seedStudent('FollowUp-3');
+    final bRun = await cloud.syncNow();
+    expect(bRun.ok, isTrue, reason: bRun.message);
+    // B must end up with all 303 students, each exactly once.
+    final db = await open();
+    final onB = await db
+        .rawQuery('SELECT COUNT(*) AS n FROM students WHERE deleted_at IS NULL');
+    expect((onB.first['n'] as int), 303);
+    expect(await findStudent('FollowUp-1'), isNotNull);
+    expect(await findStudent('History-0'), isNotNull);
+    expect(await findStudent('History-299'), isNotNull);
+
+    await device('a');
+    final a2 = await cloud.syncNow();
+    expect(a2.ok, isTrue, reason: a2.message);
+    final dbA = await open();
+    final onA = await dbA
+        .rawQuery('SELECT COUNT(*) AS n FROM students WHERE deleted_at IS NULL');
+    expect((onA.first['n'] as int), 303);
+    expect(await findStudent('FollowUp-2'), isNotNull,
+        reason: "B's local rows never made it back to A");
   });
 }
