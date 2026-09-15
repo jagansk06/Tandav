@@ -147,7 +147,7 @@ class _FeesScreenState extends State<FeesScreen> {
           upiLink = WhatsAppService.upiPayLink(
             vpa: vpa,
             payee: await api.getUpiPayee(),
-            amount: f.outstanding,
+            amount: f.pendingValue,
             note: '${student.fullName} · fee ${Fmt.monthLabel(f.month)}',
           );
         }
@@ -161,7 +161,7 @@ class _FeesScreenState extends State<FeesScreen> {
           : WhatsAppService.reminderMessage(
               studentName: student.fullName,
               monthLabel: Fmt.monthLabel(f.month),
-              amountDue: f.outstanding,
+              amountDue: f.pendingValue,
               upiLink: upiLink,
             );
       final result =
@@ -485,9 +485,9 @@ class _FeesScreenState extends State<FeesScreen> {
         mainAxisSize: MainAxisSize.min,
         children: [
           ListTile(
-            onTap: isPaid
-                ? null
-                : () => _openPayment(f),
+            onTap: f.pendingValue > 0
+                ? () => _openPayment(f)
+                : null,
             leading: Container(
               width: 40,
               height: 40,
@@ -508,12 +508,13 @@ class _FeesScreenState extends State<FeesScreen> {
                 color: TandavColors.textPrimary,
               ),
             ),
-            subtitle: Text(
-              '${Fmt.money(f.dueValue)} monthly'
-              '${isPaid && f.paymentDate != null ? ' · Paid on ${Fmt.date(f.paymentDate)}' : ''}',
-              style: const TextStyle(
-                  fontSize: 12.5, color: TandavColors.textSecondary),
-            ),
+subtitle: Text(
+            '${Fmt.money(f.dueValue)}/month'
+            '${f.pendingValue > 0 ? ' · Pending ${Fmt.money(f.pendingValue)}' : ''}'
+            '${isPaid && f.paymentDate != null ? ' · Paid on ${Fmt.date(f.paymentDate)}' : ''}',
+            style: const TextStyle(
+                fontSize: 12.5, color: TandavColors.textSecondary),
+          ),
             trailing: _busyFeeId == f.id
                 ? const SizedBox(
                     width: 22,
@@ -650,7 +651,7 @@ class _UpiFlowSheet extends StatelessWidget {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        '${Fmt.money(fee.outstanding)} due · '
+                        '${Fmt.money(fee.pendingValue)} due · '
                         '${Fmt.monthLabel(fee.month)}',
                         style: const TextStyle(
                           fontSize: 13,

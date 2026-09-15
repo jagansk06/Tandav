@@ -87,6 +87,10 @@ const CORE = [
   'icons/Icon-512.png',
   'icons/Icon-maskable-192.png',
   'icons/Icon-maskable-512.png',
+  'icons/apple-touch-icon.png',
+  'icons/apple-touch-icon-167x167.png',
+  'icons/apple-touch-icon-152x152.png',
+  'icons/apple-touch-icon-120x120.png',
   // The SQLite engine. Without this the app opens and then has no database at
   // all, which is the worst possible way for it to fail. There is deliberately
   // no `sqflite_sw.js` here — see lib/platform/app_files_web.dart for why the

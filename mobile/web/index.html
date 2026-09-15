@@ -44,11 +44,23 @@
   <meta name="theme-color" content="#0B0B0E">
 
   <!--
-    iOS ignores the icons declared in manifest.json and uses this link instead,
-    so it has to be here as well as there or the home-screen icon becomes a
+    iOS ignores the icons declared in manifest.json and uses these links instead,
+    so they have to be here as well as there or the home-screen icon becomes a
     grey screenshot of the page.
+
+    These must be truecolor (non-palette) PNGs with NO alpha channel — iOS
+    refuses palette PNGs and renders transparent/8-bit icons as a black or grey
+    blob. Every size is generated exactly that way from the same master artwork
+    (see tools/make-web-icons.py). The order is deliberate: iOS picks the
+    largest size that fits its springboard, so 180 (modern iPhone), 167 (iPad
+    Pro), 152 (iPad) and 120 (older iPhone) are all offered, and the bare
+    fallback link keeps the icon working even if a future iOS ignores `sizes`.
   -->
-  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="icons/apple-touch-icon-167x167.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="icons/apple-touch-icon-152x152.png">
+  <link rel="apple-touch-icon" sizes="120x120" href="icons/apple-touch-icon-120x120.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 
   <link rel="icon" type="image/png" href="favicon.png"/>
 

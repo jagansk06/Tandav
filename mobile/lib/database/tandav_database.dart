@@ -21,7 +21,7 @@ class TandavDatabase {
   static final TandavDatabase instance = TandavDatabase._();
 
   static const dbName = 'tandav.db';
-  static const dbVersion = 2;
+  static const dbVersion = 3;
 
   /// Business tables that participate in two-device synchronization.
   /// `users`, `app_settings` and `sync_state` are deliberately excluded.
@@ -121,7 +121,7 @@ class TandavDatabase {
         password_hash TEXT NOT NULL,
         is_active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
       )
     ''');
     batch.execute('''
@@ -141,7 +141,7 @@ class TandavDatabase {
         is_active INTEGER NOT NULL DEFAULT 1,
         notes TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
       )
     ''');
     batch.execute('''
@@ -163,7 +163,7 @@ class TandavDatabase {
         photo_url TEXT,
         notes TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE SET NULL
       )
     ''');
@@ -195,7 +195,7 @@ class TandavDatabase {
         absents INTEGER NOT NULL DEFAULT 0,
         lates INTEGER NOT NULL DEFAULT 0,
         percentage REAL NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         UNIQUE (student_id, month),
         FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
       )
@@ -213,7 +213,7 @@ class TandavDatabase {
         payment_method TEXT,
         notes TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         UNIQUE (student_id, month),
         FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
       )
@@ -246,7 +246,7 @@ class TandavDatabase {
         batch_id INTEGER,
         is_active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE SET NULL
       )
     ''');
@@ -284,7 +284,7 @@ class TandavDatabase {
         discipline_rating INTEGER NOT NULL DEFAULT 0,
         attendance_percentage REAL,
         remarks TEXT,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         UNIQUE (student_id, month),
         FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
       )
@@ -425,6 +425,64 @@ class TandavDatabase {
         )
       ''');
     }
+    if (oldVersion < 3) {
+      // v2 -> v3: every synced row's `updated_at`/`deleted_at` is re-expressed
+      // as UTC ISO-8601 (`2026-09-15T14:30:05.123Z`). Early builds mixed
+      // SQLite's `datetime('now')` "YYYY-MM-DD HH:MM:SS" stamps in with the ISO
+      // values the app writes, and because sync compares timestamps as raw
+      // strings a space (0x20) sorts below 'T' (0x54): a mixed-format row could
+      // sit permanently under the delivered-mark floor and never upload to
+      // Drive — silently, while every sync still reported clean.
+      //
+      // Values are re-expressed, never changed: the instant each one describes
+      // stays identical, so last-write-wins verdicts are unchanged. Then the
+      // per-peer delivered/acknowledged marks are dropped so the next sync
+      // offers the whole database again — rows the format bug stranded finally
+      // reach the mailbox, and the peer matches each row by `sync_uuid` and
+      // skips it as an unchanged echo (see SyncEngine.clearSentMarks).
+      await _normalizeSyncTimestamps(db);
+      await db.execute(
+          "DELETE FROM sync_state WHERE key LIKE 'sent.%' OR key LIKE 'ack.%'");
+    }
+  }
+
+  /// Rewrite every synced table's `updated_at` and `deleted_at` values into
+  /// canonical UTC ISO-8601 without changing the instant they describe. See the
+  /// v3 migration note in [_onUpgrade] for why.
+  static Future<void> _normalizeSyncTimestamps(Database db) async {
+    for (final table in syncTables) {
+      final rows =
+          await db.query(table, columns: ['id', 'updated_at', 'deleted_at']);
+      for (final r in rows) {
+        final id = r['id'];
+        final oldAt = (r['updated_at'] as String?) ?? '';
+        final oldDel = (r['deleted_at'] as String?) ?? '';
+        final newAt = _normalizeTimestamp(oldAt);
+        final newDel = _normalizeTimestamp(oldDel);
+        if (newAt != oldAt || newDel != oldDel) {
+          await db.update(table, {
+            'updated_at': newAt,
+            if (newDel != '') 'deleted_at': newDel,
+          }, where: 'id = ?', whereArgs: [id]);
+        }
+      }
+    }
+  }
+
+  /// Reform a timestamp into UTC ISO-8601. Values without a zone designator
+  /// come from SQLite's `datetime('now')`, which is UTC, so they are re-parsed
+  /// as UTC rather than as local time (which would shift them by the device's
+  /// UTC offset). Unrecognisable values are left untouched.
+  static String _normalizeTimestamp(String value) {
+    if (value.isEmpty) return value;
+    final t = DateTime.tryParse(value);
+    if (t == null) return value;
+    if (value.contains('Z') || value.contains('+')) {
+      return t.toUtc().toIso8601String();
+    }
+    return DateTime.utc(t.year, t.month, t.day, t.hour, t.minute, t.second,
+            t.millisecond, t.microsecond)
+        .toIso8601String();
   }
 
   bool get isAdminSeeded => _seeded;

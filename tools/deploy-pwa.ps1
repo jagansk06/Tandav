@@ -43,7 +43,7 @@ $BuildDir  = Join-Path $MobileDir 'build\web'
 # blank white page with a 404 for every asset, which reads like a broken build
 # rather than a wrong string.
 $GitHubUser  = 'jagansk06'
-$SiteName    = 'tandav-app'      # the PUBLIC, build-output-only repository
+$SiteName    = 'Tandav'          # the PUBLIC, build-output-only repository
 # ===============================================================================
 
 $SiteRepoUrl = "https://github.com/$GitHubUser/$SiteName.git"

@@ -1,169 +1,100 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 
-import '../../core/format.dart';
-import '../../core/services.dart';
 import '../../core/theme.dart';
 import '../../widgets/states.dart';
 
 /// Owner-only settings for how monthly fees behave.
 ///
-/// Today it holds one rule: the fixed rupee amount added to a month's fee when
-/// the student did not pay the previous month's fee. The rule is applied
-/// automatically at generation time and is never compounded onto itself — see
-/// [FeeRepository].
-class FeeSettingsScreen extends StatefulWidget {
+/// Fees now run on automatic monthly carry-forward: every month's fee record
+/// is the student's *fixed* monthly fee, unpaid months accumulate into an
+/// outstanding balance, and payments clear the oldest unpaid month first. The
+/// old "late-fee increment" (an extra amount added to the next month's fee) is
+/// gone — this screen is now a plain explanation of the current behaviour,
+/// because there is nothing left to configure.
+class FeeSettingsScreen extends StatelessWidget {
   const FeeSettingsScreen({super.key});
-
-  @override
-  State<FeeSettingsScreen> createState() => _FeeSettingsScreenState();
-}
-
-class _FeeSettingsScreenState extends State<FeeSettingsScreen> {
-  final _penalty = TextEditingController();
-  final _formKey = GlobalKey<FormState>();
-  bool _loadFailed = false;
-  bool _busy = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  @override
-  void dispose() {
-    _penalty.dispose();
-    super.dispose();
-  }
-
-  Future<void> _load() async {
-    try {
-      final p = await context.read<TandavApi>().getLateFeePenalty();
-      if (!mounted) return;
-      _penalty.text = p.toStringAsFixed(0);
-    } on Exception {
-      if (mounted) setState(() => _loadFailed = true);
-    }
-  }
-
-  Future<void> _save() async {
-    if (!_formKey.currentState!.validate()) return;
-    setState(() => _busy = true);
-    try {
-      final amount = double.parse(_penalty.text.trim());
-      await context.read<TandavApi>().setLateFeePenalty(amount);
-      if (!mounted) return;
-      Alert.show(
-        context,
-        amount > 0
-            ? 'Saved — ₹${amount.toStringAsFixed(0)} added to unpaid months'
-            : 'Late-fee increment turned off',
-      );
-    } on Exception catch (e) {
-      if (mounted) {
-        Alert.show(context, e.toString().replaceFirst('Exception: ', ''),
-            isError: true);
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Fee Settings')),
-      body: _loadFailed
-          ? ErrorView(
-              message: 'Could not load settings',
-              onRetry: () {
-                setState(() => _loadFailed = false);
-                _load();
-              },
-            )
-          : ListView(
-              padding: const EdgeInsets.fromLTRB(18, 18, 18, 36),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(18, 18, 18, 36),
+        children: [
+          _card(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _card(
-                  child: Form(
-                    key: _formKey,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const SectionHeader(title: 'Late-fee increment'),
-                        const SizedBox(height: 8),
-                        const Text(
-                          'If a student has not paid one month\'s fee, this '
-                          'fixed amount is added to the next month\'s fee as an '
-                          'increment.',
-                          style: TextStyle(
-                            color: TandavColors.textSecondary,
-                            fontSize: 13,
-                            height: 1.5,
-                          ),
-                        ),
-                        const SizedBox(height: 14),
-                        TextFormField(
-                          controller: _penalty,
-                          keyboardType: const TextInputType.numberWithOptions(
-                              decimal: true),
-                          decoration: const InputDecoration(
-                            labelText: 'Increment amount (\u20B9)',
-                            prefixIcon: Icon(Icons.currency_rupee_rounded),
-                            helperText:
-                                'Set 0 to turn the increment off',
-                          ),
-                          validator: (v) {
-                            final amt = double.tryParse(v ?? '');
-                            if (amt == null || amt < 0) {
-                              return 'Enter a positive amount or 0';
-                            }
-                            return null;
-                          },
-                        ),
-                        const SizedBox(height: 18),
-                        _busy
-                            ? const Center(child: CircularProgressIndicator())
-                            : GoldButton(
-                                label: 'Save',
-                                icon: Icons.check_rounded,
-                                expanded: true,
-                                onPressed: _save,
-                              ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                _card(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const SectionHeader(title: 'How it works'),
-                      const SizedBox(height: 8),
-                      const _Bullet(
-                          'Applied automatically when next month\'s fee record '
-                          'is generated.'),
-                      const _Bullet(
-                          'Checked against the previous month: if that month '
-                          'was not marked paid (due or partial), the increment '
-                          'is added.'),
-                      const _Bullet(
-                          'Applied once per unpaid month — it never stacks onto '
-                          'its own previous increment.'),
-                      const _Bullet(
-                          'Once the owner marks the unpaid month as paid, the '
-                          'following month reverts to the normal monthly fee.'),
-                      const _Bullet(
-                          'A student only ever receives fee records from the '
-                          'month they joined — the increment never applies to a '
-                          'month before they were a student.'),
-                    ],
+                const SectionHeader(title: 'Automatic monthly carry-forward'),
+                const SizedBox(height: 8),
+                const Text(
+                  'Every month\'s fee record is the student\'s fixed monthly '
+                  'fee — nothing is ever added on top of it. When a month is '
+                  'not paid, that amount carries forward: the total the student '
+                  'owes grows month to month, automatically, until it is paid.',
+                  style: TextStyle(
+                    color: TandavColors.textSecondary,
+                    fontSize: 13,
+                    height: 1.5,
                   ),
                 ),
               ],
             ),
+          ),
+          const SizedBox(height: 14),
+          _card(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SectionHeader(title: 'How it works'),
+                const SizedBox(height: 8),
+                const _Bullet(
+                    'The monthly fee you set on a student is the fee for every '
+                    'month — it never changes and never gets an increment.'),
+                const _Bullet(
+                    'An unpaid month rolls forward into the next month\'s '
+                    'total automatically. A student who skipped September and '
+                    'October shows a pending balance of ₹2,000 plus November\'s '
+                    'fee in the November register.'),
+                const _Bullet(
+                    'Payments settle the oldest unpaid month first. A ₹2,000 '
+                    'payment in November clears September and October; '
+                    'November\'s own fee remains to collect.'),
+                const _Bullet(
+                    'Once everything up to a month is settled, that month shows '
+                    '"paid" and the pending balance for the next month starts '
+                    'fresh at the monthly fee.'),
+                const _Bullet(
+                    'Fees are only ever generated from the month a student '
+                    'joined — nothing is owed for months before they were a '
+                    'student.'),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          _card(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SectionHeader(title: 'Example'),
+                const SizedBox(height: 8),
+                const Text(
+                  'A student\'s monthly fee is ₹1,000. They do not pay for '
+                  'September or October. In November the register shows '
+                  '₹3,000 pending (Sep ₹1,000 + Oct ₹1,000 + Nov ₹1,000). '
+                  'Mark them paid with ₹3,000 and all three months are cleared; '
+                  'December starts again at ₹1,000.',
+                  style: TextStyle(
+                    color: TandavColors.textSecondary,
+                    fontSize: 13,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 

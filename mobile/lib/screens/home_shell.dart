@@ -347,14 +347,14 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                     );
                   },
                 ),
-              // Withheld from the attender build: this configures how revenue is
-              // calculated (late-fee increments), which is an owner decision.
+              // Withheld from the attender build: this explains how monthly
+              // fees carry forward, which is an owner decision.
               if (!isAttenderBuild)
                 ListTile(
                   leading: const Icon(Icons.tune_rounded,
                       color: TandavColors.gold),
                   title: const Text('Fee Settings'),
-                  subtitle: const Text('Late-fee increment for unpaid months',
+                  subtitle: const Text('How monthly fee carry-forward works',
                       style: TextStyle(fontSize: 11.5)),
                   onTap: () {
                     Navigator.pop(ctx);

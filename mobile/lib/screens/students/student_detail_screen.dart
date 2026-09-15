@@ -716,7 +716,7 @@ class _StudentDetailScreenState extends State<StudentDetailScreen> {
   }
 
   Future<void> _markPaid(Fee f) async {
-    final remaining = f.outstanding;
+    final remaining = f.pendingValue;
     if (remaining <= 0) return;
     setState(() => _busyFeeId = f.id);
     try {

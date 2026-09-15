@@ -60,7 +60,7 @@ class _FeePaymentSheetState extends State<FeePaymentSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final remaining = widget.fee.outstanding;
+    final remaining = widget.fee.pendingValue;
     return Padding(
       padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
       child: Padding(

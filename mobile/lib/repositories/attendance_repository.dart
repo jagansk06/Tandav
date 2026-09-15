@@ -285,10 +285,10 @@ class AttendanceRepository {
       await txn.rawUpdate('''
         UPDATE monthly_progress
         SET attendance_percentage = ?,
-            updated_at = datetime('now'),
+            updated_at = ?,
             device_id = ?
         WHERE student_id = ? AND month = ?
-      ''', [pct, db.deviceId, studentId, start]);
+      ''', [pct, SyncStamp.now(db).updatedAt, db.deviceId, studentId, start]);
     }
   }
 

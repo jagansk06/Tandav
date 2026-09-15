@@ -7,14 +7,20 @@ import '../sync/sync_meta.dart';
 
 /// Monthly fee system backed by SQLite.
 ///
-/// - One row per student per month (`UNIQUE (student_id, month)`).
+/// - One row per student per month (`UNIQUE (student_id, month)`); each row's
+///   `amount_due` is the student's **fixed monthly fee** — unpaid months carry
+///   forward as an outstanding balance instead of inflating the next month.
 /// - [ensureMonthlyFees] guarantees a fee record for the current month for
 ///   EVERY eligible active student — regardless of the generation watermark —
 ///   plus backfills any months missed while the app was closed. Idempotent,
 ///   runs locally on app start/resume and whenever the Fees screen opens
 ///   (no server, no cron).
-/// - Payments are recorded additively on the month row *and* appended to the
-///   `fee_payments` ledger so history and paid dates are never lost.
+/// - Payments settle the **oldest unpaid month first** (FIFO). [markFeePaid]
+///   clears a student's whole outstanding up to the tapped month in one step;
+///   [recordFeePayment] applies a specific amount oldest-first across months.
+///   Every payment updates the per-month `amount_paid` columns and appends one
+///   `fee_payments` ledger entry (the audit trail), so history and paid dates
+///   are never lost.
 class FeeRepository {
   final TandavDatabase db;
   FeeRepository(this.db);
@@ -22,8 +28,11 @@ class FeeRepository {
   static const _watermarkKey = 'fee_watermark_month';
 
   /// `app_settings` key holding the fixed rupee amount added to the following
-  /// month's fee when a student has not paid the previous month's fee. The
-  /// studio can change it; it is stored as a decimal string.
+  /// month's fee when a student has not paid the previous month's fee.
+  ///
+  /// Retained read/write for backwards compatibility (an existing value stays
+  /// in `app_settings` untouched), but **no longer applied**: unpaid months
+  /// now carry forward as an outstanding balance and a month's fee stays fixed.
   static const lateFeePenaltyKey = 'late_fee_penalty';
 
   /// Default late-fee penalty when none has been configured (₹ 100).
@@ -31,7 +40,8 @@ class FeeRepository {
 
   Future<Database> get _d => db.open();
 
-  /// Read the configured late-fee penalty for unpaid previous months.
+  /// Read the configured late-fee penalty. Legacy: kept for compatibility but
+  /// never applied to generated fees — unpaid months carry forward instead.
   Future<double> getLateFeePenalty() async {
     final d = await _d;
     final rows = await d.query('app_settings',
@@ -41,8 +51,8 @@ class FeeRepository {
     return v == null || v < 0 ? defaultLateFeePenalty : v;
   }
 
-  /// Set the late-fee penalty (rounded to 2 decimals). Passing 0 disables the
-  /// increment entirely. The value is negative-clamped to 0.
+  /// Set the late-fee penalty. Legacy: the value is stored for backwards
+  /// compatibility but never applied to generated fees.
   Future<void> setLateFeePenalty(double amount) async {
     final d = await _d;
     await d.insert('app_settings', {
@@ -156,14 +166,13 @@ class FeeRepository {
   /// non-zero fee who joined on or before that month. Returns the number of
   /// newly inserted rows (existing records are never duplicated).
   ///
-  /// A [lateFeePenalty] is added onto the base monthly fee when the student
-  /// left the *previous* month's fee unpaid (status other than `paid`). The
-  /// increment only ever sits on a freshly generated record, so it is applied
-  /// once and never compounds on its own; if the owner has already booked the
-  /// previous month as paid, the next record reverts to the plain monthly fee.
+  /// `amount_due` is always the student's fixed monthly fee (the value on the
+  /// student record at generation time). Unpaid earlier months are NOT added
+  /// on top: the outstanding balance carries forward separately, so the total
+  /// the register shows grows month to month while each row's own fee stays
+  /// legible.
   Future<int> _insertMonthFees(Transaction txn, DateTime month) async {
     final nextMonth = DbFmt.addMonths(month, 1);
-    final penalty = await _lateFeePenaltyIn(txn);
     final students = await txn.query('students',
         where: 'is_active = 1 AND monthly_fee > 0 AND join_date < ?',
         whereArgs: [DbFmt.date(nextMonth)]);
@@ -172,7 +181,7 @@ class FeeRepository {
       final inserted = await txn.insert('fees', {
         'student_id': s['id'],
         'month': DbFmt.month(month),
-        'amount_due': await _amountDue(txn, s, month, penalty),
+        'amount_due': _fee(s['monthly_fee']),
         'amount_paid': 0,
         'status': 'due',
         ...SyncStamp.now(db).columns(),
@@ -180,35 +189,6 @@ class FeeRepository {
       if (inserted != 0) created++;
     }
     return created;
-  }
-
-  /// The late-fee penalty resolved inside a transaction (single QUERY against
-  /// `app_settings`, shared by every student in [month]).
-  Future<double> _lateFeePenaltyIn(Transaction txn) async {
-    final rows = await txn.query('app_settings',
-        where: 'key = ?', whereArgs: [lateFeePenaltyKey], limit: 1);
-    if (rows.isEmpty) return defaultLateFeePenalty;
-    final v = double.tryParse(rows.first['value']?.toString() ?? '');
-    return v == null || v < 0 ? defaultLateFeePenalty : v;
-  }
-
-  /// The amount due for a single (student, month) fee record: the student's
-  /// base monthly fee, plus [penalty] when the immediately-preceding month's
-  /// record exists and was not fully paid.
-  Future<double> _amountDue(
-      Transaction txn, Map<String, Object?> s, DateTime month, double penalty) async {
-    var due = _fee(s['monthly_fee']);
-    if (penalty > 0) {
-      final previous = DbFmt.addMonths(month, -1);
-      final prevRows = await txn.query('fees',
-          where: 'student_id = ? AND month = ?',
-          whereArgs: [s['id'], DbFmt.month(previous)],
-          limit: 1);
-      if (prevRows.isNotEmpty && (prevRows.first['status'] as String?) != 'paid') {
-        due = DbFmt.round2(due + penalty);
-      }
-    }
-    return due;
   }
 
   Future<FeeListResponse> getFees({
@@ -253,8 +233,16 @@ class FeeRepository {
       ${where.isEmpty ? '' : 'AND ${where.join(' AND ')}'}
       ORDER BY f.month DESC, s.first_name COLLATE NOCASE
     ''', args);
+    // Each row carries the student's carry-forward balance through the month —
+    // the figure the register actually chases — alongside its own due/paid.
+    final items = <Fee>[];
+    for (final r in rows) {
+      final running = await _runningOutstanding(
+          d, r['student_id'] as int, (r['month'] as String?) ?? '');
+      items.add(_feeFromRow(r, s: _names(r), runningOutstanding: running));
+    }
     return FeeListResponse(
-      items: rows.map((r) => _feeFromRow(r, s: _names(r))).toList(),
+      items: items,
       total: rows.length,
     );
   }
@@ -272,13 +260,19 @@ class FeeRepository {
     final rows = await d.rawQuery('''
       SELECT f.* FROM fees f $join WHERE f.month = ? AND f.deleted_at IS NULL
     ''', args);
-    var totalDue = 0.0, totalPaid = 0.0;
+    var totalDue = 0.0, totalPaid = 0.0, pending = 0.0;
     var paid = 0, partial = 0, due = 0;
     for (final r in rows) {
       final dueV = _fee(r['amount_due']);
       final paidV = _fee(r['amount_paid']);
       totalDue += dueV;
       totalPaid += paidV;
+      // Carry-forward: what this batch/studio is really owed through this
+      // month is every student's running unpaid balance, not just this
+      // month's shortfall.
+      pending = DbFmt.round2(pending +
+          await _runningOutstanding(
+              d, r['student_id'] as int, (r['month'] as String?) ?? ''));
       final st = feeStatus(dueV, paidV);
       if (st == 'paid') paid++;
       if (st == 'partial') partial++;
@@ -288,7 +282,7 @@ class FeeRepository {
       month: _monthIso(month),
       totalDue: totalDue.toStringAsFixed(2),
       totalPaid: totalPaid.toStringAsFixed(2),
-      outstanding: (totalDue - totalPaid).toStringAsFixed(2),
+      outstanding: pending.toStringAsFixed(2),
       paidCount: paid,
       partialCount: partial,
       dueCount: due,
@@ -331,7 +325,52 @@ class FeeRepository {
     final s = await d.query('students',
         where: 'id = ?', whereArgs: [studentId], limit: 1);
     final studentName = s.isEmpty ? '' : _names(s.first);
-    return _feeFromRow(row, s: studentName);
+    final running =
+        await _runningOutstanding(d, studentId, row['month'] as String? ?? '');
+    return _feeFromRow(row, s: studentName, runningOutstanding: running);
+  }
+
+  /// The student's unpaid balance carried forward through [monthStart]
+  /// (inclusive): the sum of `amount_due − amount_paid` over every non-deleted
+  /// record up to and including that month.
+  Future<double> _runningOutstanding(
+      DatabaseExecutor d, int studentId, String monthStart) async {
+    if (monthStart.isEmpty) return 0;
+    final rows = await d.rawQuery('''
+      SELECT COALESCE(SUM(amount_due - amount_paid), 0) AS total
+      FROM fees
+      WHERE student_id = ? AND month <= ? AND deleted_at IS NULL
+    ''', [studentId, monthStart]);
+    return _fee(rows.isEmpty ? null : rows.first['total']);
+  }
+
+  /// The student's non-deleted fee rows through [monthStart], oldest month
+  /// first, for FIFO payment allocation.
+  Future<List<Map<String, Object?>>> _unpaidUpTo(
+      Transaction txn, int studentId, String monthStart) async {
+    final unpaid = await txn.rawQuery('''
+      SELECT f.* FROM fees f
+      WHERE f.student_id = ? AND f.month <= ? AND f.deleted_at IS NULL
+      ORDER BY f.month ASC
+    ''', [studentId, monthStart]);
+    return unpaid
+        .where((r) => _fee(r['amount_due']) - _fee(r['amount_paid']) > 0.001)
+        .toList();
+  }
+
+  /// Build the [Fee] for [row] from inside a transaction, attaching the
+  /// student's carry-forward balance through that row's month.
+  Future<Fee> _feeWithStudent(
+      Transaction txn, Map<String, Object?> row) async {
+    final studentId = row['student_id'] as int;
+    final monthStart = (row['month'] as String?) ?? '';
+    final s = await txn.query('students',
+        where: 'id = ?', whereArgs: [studentId], limit: 1);
+    return _feeFromRow(row,
+        s: s.isEmpty ? '' : _names(s.first),
+        runningOutstanding: monthStart.isEmpty
+            ? null
+            : await _runningOutstanding(txn, studentId, monthStart));
   }
 
   Future<Fee> createFee(int studentId, String month, String amountDue) async {
@@ -364,9 +403,11 @@ class FeeRepository {
     return _feeFromRow(row, s: s.isEmpty ? '' : _names(s.first));
   }
 
-  /// One-tap "Mark Paid": settle the full outstanding amount for the month,
-  /// stamp the phone's current date and append a ledger entry. Idempotent —
-  /// an already-paid record is returned untouched.
+  /// One-tap "Mark Paid": settle a student's **entire outstanding balance**
+  /// through the tapped row's month — every unpaid month up to and including
+  /// it, oldest first (FIFO) — stamp the phone's current date and append a
+  /// single ledger entry on the tapped row. Idempotent: a student with nothing
+  /// outstanding is returned untouched.
   Future<Fee> markFeePaid(int feeId) async {
     final d = await _d;
     return d.transaction((txn) async {
@@ -374,54 +415,51 @@ class FeeRepository {
       if (rows.isEmpty) throw RepoException('Fee record not found');
       final row = rows.first;
       final studentId = row['student_id'] as int;
-      final due = _fee(row['amount_due']);
-      final paid = _fee(row['amount_paid']);
-      if (due <= 0) {
-        throw RepoException('Amount due must be greater than zero');
-      }
-      final remaining = DbFmt.round2(due - paid);
-      if (remaining <= 0.001) {
-        final s = await txn.query('students',
-            where: 'id = ?', whereArgs: [studentId], limit: 1);
-        final out = Map<String, Object?>.from(row);
-        out['student_name'] = s.isEmpty ? '' : _names(s.first);
-        return _feeFromRow(out);
-      }
+      final monthStart = (row['month'] as String?) ?? '';
+
+      final outstanding = await _runningOutstanding(txn, studentId, monthStart);
+      if (outstanding <= 0.001) return _feeWithStudent(txn, row);
+
+      final unpaid = await _unpaidUpTo(txn, studentId, monthStart);
       final today = DbFmt.date(DateTime.now());
-      await txn.update('fees', {
-        'amount_paid': due,
-        'status': 'paid',
-        'payment_date': today,
-        'payment_method': 'cash',
-        ...SyncStamp.now(db).touchColumns(),
-      }, where: 'id = ?', whereArgs: [feeId]);
+      var collected = 0.0;
+      for (final r in unpaid) {
+        final due = _fee(r['amount_due']);
+        collected = DbFmt.round2(collected + _fee(r['amount_due']) - _fee(r['amount_paid']));
+        await txn.update('fees', {
+          'amount_paid': due,
+          'status': 'paid',
+          'payment_date': today,
+          'payment_method': 'cash',
+          ...SyncStamp.now(db).touchColumns(),
+        }, where: 'id = ?', whereArgs: [r['id']]);
+      }
       await txn.insert('fee_payments', {
         'fee_id': feeId,
         'student_id': studentId,
-        'amount': remaining,
+        'amount': collected,
         'payment_date': today,
         'payment_method': 'cash',
         ...SyncStamp.now(db).columns(),
       });
-      final updated = await txn.query('fees', where: 'id = ?', whereArgs: [feeId]);
-      final s = await txn.query('students',
-          where: 'id = ?', whereArgs: [studentId], limit: 1);
-      final out = Map<String, Object?>.from(updated.first);
-      out['student_name'] = s.isEmpty ? '' : _names(s.first);
-      return _feeFromRow(out);
+      final updated = await txn.query('fees',
+          where: 'id = ?', whereArgs: [feeId]);
+      return _feeWithStudent(txn, updated.first);
     });
   }
 
-  /// One-tap "Mark Due": fully reverse a payment — amount is removed from the
-  /// monthly collected total, the status returns to due, the payment date is
-  /// cleared and the ledger entry is removed (no transaction remains).
+  /// One-tap "Mark Due": fully reverse this one row's payment — its amount is
+  /// removed from the monthly collected totals, its status returns to due, its
+  /// payment date is cleared, and the ledger entries attached to it are
+  /// tombstoned. Under FIFO a bulk payment may have settled several months in
+  /// one tap; marking each of those months due in turn undoes it. Older months
+  /// are never disturbed.
   Future<Fee> markFeeDue(int feeId) async {
     final d = await _d;
     return d.transaction((txn) async {
       final rows = await txn.query('fees', where: 'id = ?', whereArgs: [feeId]);
       if (rows.isEmpty) throw RepoException('Fee record not found');
       final row = rows.first;
-      final studentId = row['student_id'] as int;
       final stamp = SyncStamp.now(db);
       await txn.update('fee_payments', {
         ...stamp.tombstoneColumns(),
@@ -433,17 +471,16 @@ class FeeRepository {
         'payment_method': null,
         ...stamp.touchColumns(),
       }, where: 'id = ?', whereArgs: [feeId]);
-      final updated = await txn.query('fees', where: 'id = ?', whereArgs: [feeId]);
-      final s = await txn.query('students',
-          where: 'id = ?', whereArgs: [studentId], limit: 1);
-      final out = Map<String, Object?>.from(updated.first);
-      out['student_name'] = s.isEmpty ? '' : _names(s.first);
-      return _feeFromRow(out);
+      final updated = await txn.query('fees',
+          where: 'id = ?', whereArgs: [feeId]);
+      return _feeWithStudent(txn, updated.first);
     });
   }
 
-  /// Record a payment: adds to the month's amount_paid, updates status and
-  /// payment date/method, and appends a ledger entry for the history.
+  /// Record a payment of [amount] for the tapped row's month, applied across
+  /// the student's unpaid months oldest-first (FIFO). Each touched month's
+  /// `amount_paid` absorbs as much of the remaining payment as it still owns;
+  /// statuses recompute per month, and one ledger entry rides the tapped row.
   Future<Fee> recordFeePayment(
     int feeId,
     double amount,
@@ -456,21 +493,32 @@ class FeeRepository {
       if (rows.isEmpty) throw RepoException('Fee record not found');
       final row = rows.first;
       final studentId = row['student_id'] as int;
-      final due = _fee(row['amount_due']);
-      final paid = _fee(row['amount_paid']);
+      final monthStart = (row['month'] as String?) ?? '';
       if (amount <= 0) throw RepoException('Payment amount must be positive');
-      if (paid + amount > due + 0.001) {
+      final outstanding = await _runningOutstanding(txn, studentId, monthStart);
+      if (amount > outstanding + 0.001) {
         throw RepoException(
-            'Payment exceeds remaining due of ${(due - paid).toStringAsFixed(2)}');
+            'Payment exceeds remaining dues of ${outstanding.toStringAsFixed(2)}');
       }
-      final newPaid = DbFmt.round2(paid + amount);
-      await txn.update('fees', {
-        'amount_paid': newPaid,
-        'status': feeStatus(due, newPaid),
-        'payment_date': paymentDate,
-        'payment_method': method,
-        ...SyncStamp.now(db).touchColumns(),
-      }, where: 'id = ?', whereArgs: [feeId]);
+      var left = amount;
+      final unpaid = await _unpaidUpTo(txn, studentId, monthStart);
+      for (final r in unpaid) {
+        if (left <= 0.001) break;
+        final due = _fee(r['amount_due']);
+        final paid = _fee(r['amount_paid']);
+        final remaining = DbFmt.round2(due - paid);
+        if (remaining <= 0.001) continue;
+        final chunk = DbFmt.round2(left < remaining ? left : remaining);
+        final newPaid = DbFmt.round2(paid + chunk);
+        await txn.update('fees', {
+          'amount_paid': newPaid,
+          'status': feeStatus(due, newPaid),
+          'payment_date': paymentDate,
+          'payment_method': method,
+          ...SyncStamp.now(db).touchColumns(),
+        }, where: 'id = ?', whereArgs: [r['id']]);
+        left = DbFmt.round2(left - chunk);
+      }
       await txn.insert('fee_payments', {
         'fee_id': feeId,
         'student_id': studentId,
@@ -479,12 +527,9 @@ class FeeRepository {
         'payment_method': method,
         ...SyncStamp.now(db).columns(),
       });
-      final updated = await txn.query('fees', where: 'id = ?', whereArgs: [feeId]);
-      final out = Map<String, Object?>.from(updated.first);
-      final s = await txn.query('students',
-          where: 'id = ?', whereArgs: [studentId], limit: 1);
-      out['student_name'] = s.isEmpty ? '' : _names(s.first);
-      return _feeFromRow(out);
+      final updated = await txn.query('fees',
+          where: 'id = ?', whereArgs: [feeId]);
+      return _feeWithStudent(txn, updated.first);
     });
   }
 
@@ -573,7 +618,8 @@ class FeeRepository {
     return n == null ? 0 : DbFmt.round2(n);
   }
 
-  Fee _feeFromRow(Map<String, Object?> row, {String? s}) => Fee(
+  Fee _feeFromRow(Map<String, Object?> row,
+      {String? s, double? runningOutstanding}) => Fee(
         id: row['id'] as int,
         studentId: row['student_id'] as int,
         studentName: s ?? '',
@@ -584,6 +630,8 @@ class FeeRepository {
         paymentDate: row['payment_date'] as String?,
         paymentMethod: row['payment_method'] as String?,
         notes: row['notes'] as String?,
+        runningOutstanding:
+            runningOutstanding?.toStringAsFixed(2) ?? '',
       );
 
   String _names(Map<String, Object?> row) {

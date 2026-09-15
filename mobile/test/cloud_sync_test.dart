@@ -1159,4 +1159,84 @@ void main() {
     expect(await findStudent('FollowUp-2'), isNotNull,
         reason: "B's local rows never made it back to A");
   });
+
+  test('v3 upgrade re-expresses legacy space stamps and re-offers stranded '
+      'rows', () async {
+    // Pre-fix reality: SQLite's `datetime('now')` wrote "2026-09-01 10:00:00"
+    // (a space separator) through the recompute helpers and the v1->v2 backfill,
+    // while the app's own writes use ISO "…T…Z". Sync compares timestamps as
+    // raw strings, and ' ' sorts below 'T', so a space-stamped row can sit
+    // permanently under a peer's ISO delivered-mark floor and never upload —
+    // while every sync still reports clean. This is the exact state a phone
+    // upgrading to v3 sits in, and the migration must dig it out.
+    await device('a');
+    final d = await open();
+    final instance = TandavDatabase.instance;
+    final peerId = 'TANDAV-9ZZZ';
+    mailbox.plant(peerId, SyncBundle.encode(
+      deviceId: peerId,
+      delta: SyncDelta(),
+    ));
+    final uuid = TandavDatabase.generateSyncUuid();
+    final studentId = await d.insert('students', {
+      'first_name': 'Legacy',
+      'last_name': '',
+      'gender': '',
+      'dob': null,
+      'phone': '',
+      'email': null,
+      'address': null,
+      'emergency_contact_name': null,
+      'emergency_contact_phone': null,
+      'batch_id': null,
+      'monthly_fee': 500.0,
+      'join_date': '2026-08-01',
+      'is_active': 1,
+      'photo_url': null,
+      'notes': null,
+      'sync_uuid': uuid,
+      'device_id': me(),
+      'updated_at': '2026-09-01 10:00:00',
+    });
+    // The peer already acknowledged everything up to a HIGHER ISO watermark —
+    // the delivered-mark floor that swallows the space-stamped row.
+    await SyncState(instance)
+        .write('sent.$peerId.students', '2026-09-30T00:00:00Z');
+    await SyncState(instance)
+        .write('ack.$peerId.students', '2026-09-28T00:00:00Z');
+
+    final beforeUpgrade = await cloud.syncNow();
+    expect(beforeUpgrade.ok, isTrue, reason: beforeUpgrade.message);
+    expect(beforeUpgrade.sent, 0,
+        reason: 'the space-stamped row sorts below the ISO floor and never '
+            'leaves the phone');
+
+    // The same v2 file reopens under the new build, exactly like an App Store
+    // update landing on an installed copy.
+    await d.execute('PRAGMA user_version = 2');
+    await TandavDatabase.instance.close();
+
+    await device('a'); // reopen -> v2 -> v3 migration runs
+    final reopened = await open();
+    final rows = await reopened.query('students',
+        where: 'id = ?', whereArgs: [studentId]);
+    expect(rows.single['updated_at'], '2026-09-01T10:00:00.000Z',
+        reason: 'the instant is re-expressed in UTC ISO, never altered');
+    expect(await SyncState(instance).read('sent.$peerId.students'), isNull,
+        reason: 'sent marks are dropped so the whole database re-offers');
+    expect(await SyncState(instance).read('ack.$peerId.students'), isNull);
+
+    final afterUpgrade = await cloud.syncNow();
+    expect(afterUpgrade.ok, isTrue, reason: afterUpgrade.message);
+    expect(afterUpgrade.sent, greaterThan(0),
+        reason: 'the row the format bug stranded finally reaches the mailbox');
+
+    // The uploaded row carries the canonical stamp — a peer comparing it
+    // against anything it holds keeps working in both directions.
+    final file =
+        SyncBundle.decode(mailbox.files[SyncMailbox.fileNameFor(me())]!);
+    final sent = file.tables['students']!
+        .singleWhere((r) => r['sync_uuid'] == uuid);
+    expect(sent['updated_at'], '2026-09-01T10:00:00.000Z');
+  });
 }

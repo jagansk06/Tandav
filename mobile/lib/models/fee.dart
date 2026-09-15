@@ -10,6 +10,15 @@ class Fee {
   final String? paymentMethod;
   final String? notes;
 
+  /// The student's total unpaid balance carried forward through [month]
+  /// (inclusive) — the sum of `amount_due − amount_paid` over every record up
+  /// to and including this month. On the register this is what the owner
+  /// actually chases; the row's own `amountDue − amountPaid` is only that
+  /// month's share. Blank for rows built outside the register by callers that
+  /// did not ask for it ([pendingValue] then falls back to the month's own
+  /// amount).
+  final String runningOutstanding;
+
   const Fee({
     required this.id,
     required this.studentId,
@@ -21,11 +30,17 @@ class Fee {
     this.paymentDate,
     this.paymentMethod,
     this.notes,
+    this.runningOutstanding = '',
   });
 
   double get dueValue => double.tryParse(amountDue) ?? 0;
   double get paidValue => double.tryParse(amountPaid) ?? 0;
   double get outstanding => (dueValue - paidValue).clamp(0, double.infinity);
+
+  /// The carry-forward balance this student owes as of this row's month, or —
+  /// when the row was not annotated with one — this month's own outstanding.
+  double get pendingValue =>
+      double.tryParse(runningOutstanding) ?? outstanding;
 
   factory Fee.fromJson(Map<String, dynamic> json) => Fee(
         id: json['id'] as int,
@@ -38,6 +53,7 @@ class Fee {
         paymentDate: json['payment_date'] as String?,
         paymentMethod: json['payment_method'] as String?,
         notes: json['notes'] as String?,
+        runningOutstanding: (json['running_outstanding'] ?? '').toString(),
       );
 }
 

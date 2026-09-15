@@ -64,70 +64,107 @@ void main() {
     return s.id;
   }
 
-  group('fee increment for unpaid months', () {
-    test('default penalty is 100 and lives in app_settings', () async {
+  group('monthly fee carry-forward', () {
+    test('legacy late-fee penalty value still stores but is never applied',
+        () async {
       final api = await freshApi();
+      // The key still exists for backward compatibility...
       expect(await api.getLateFeePenalty(), 100);
       await api.setLateFeePenalty(250);
       expect(await api.getLateFeePenalty(), 250);
-      await api.setLateFeePenalty(0);
-      expect(await api.getLateFeePenalty(), 0);
+      // ...but generation must ignore it: a month after an unpaid month is the
+      // plain fixed fee.
+      await createStudent(api, name: 'Aarav', fee: '1500');
+      await api.fees.ensureMonthlyFees(prev);
+      await api.fees.ensureMonthlyFees(base);
+      expect((await api.getFees(month: baseIso)).items.single.amountDue,
+          '1500.00');
     });
 
-    test('unpaid previous month adds the penalty to the next month', () async {
+    test('unpaid months carry forward: the register total grows, fees stay fixed',
+        () async {
       final api = await freshApi();
       await createStudent(api, name: 'Aarav', fee: '1500');
 
-      // Generate the previous month, leave it unpaid (due), then generate the
-      // current month — the increment is added on top of the base fee.
       await api.fees.ensureMonthlyFees(prev);
       expect((await api.getFees(month: prevIso)).items.single.status, 'due');
       await api.fees.ensureMonthlyFees(base);
-      final thisMonth = (await api.getFees(month: baseIso)).items.single;
-      expect(thisMonth.amountDue, '1600.00'); // 1500 + 100 default penalty
+      // The base month's own fee is still the fixed monthly fee (no penalty)…
+      final baseFee = (await api.getFees(month: baseIso)).items.single;
+      expect(baseFee.amountDue, '1500.00');
+      // …while the row honestly reports the carry-forward balance.
+      expect(baseFee.runningOutstanding, '3000.00');
+
+      // One more unpaid month → three months of arrears on the register.
+      await api.fees.ensureMonthlyFees(next);
+      final nextFee = (await api.getFees(month: nextIso)).items.single;
+      expect(nextFee.amountDue, '1500.00');
+      expect(nextFee.runningOutstanding, '4500.00');
+      expect(nextFee.status, 'due');
     });
 
-    test('paid previous month earns no increment; reverts the month after',
+    test('marking the latest month paid clears the whole carry-forward',
         () async {
       final api = await freshApi();
       await createStudent(api, name: 'Payal', fee: '2000');
-
-      // Previous month unpaid -> current month incremented.
       await api.fees.ensureMonthlyFees(prev);
       await api.fees.ensureMonthlyFees(base);
-      expect((await api.getFees(month: baseIso)).items.single.amountDue, '2100.00');
 
-      // Mark the month that immediately precedes "next" (base) paid; the
-      // following month reverts to the plain monthly fee.
+      // Two unpaid months = ₹4,000. One tap on the current month settles both,
+      // oldest first (FIFO), and leaves the student fully clear.
       final baseFee = (await api.getFees(month: baseIso)).items.single;
+      expect(baseFee.runningOutstanding, '4000.00');
       await api.markFeePaid(baseFee.id);
+
+      final prevFee = (await api.getFees(month: prevIso)).items.single;
+      final basePaid = (await api.getFees(month: baseIso)).items.single;
+      expect(prevFee.status, 'paid');
+      expect(basePaid.status, 'paid');
+      expect(basePaid.runningOutstanding, '0.00');
+
+      // The following month is a fresh, fixed fee — no increment creeps back.
       await api.fees.ensureMonthlyFees(next);
-      expect((await api.getFees(month: nextIso)).items.single.amountDue, '2000.00');
+      expect((await api.getFees(month: nextIso)).items.single.amountDue,
+          '2000.00');
+      expect((await api.getFees(month: nextIso)).items.single.runningOutstanding,
+          '2000.00');
     });
 
-    test('partial payment still counts as unpaid for the increment', () async {
+    test('partial payments allocate oldest month first', () async {
       final api = await freshApi();
       await createStudent(api, name: 'Parth', fee: '1200');
       await api.fees.ensureMonthlyFees(prev);
-      final prevFee = (await api.getFees(month: prevIso)).items.single;
-      await api.recordFeePayment(prevFee.id, 300, DbFmt.date(prev), 'cash');
       await api.fees.ensureMonthlyFees(base);
-      expect((await api.getFees(month: baseIso)).items.single.amountDue, '1300.00');
+
+      final baseFee = (await api.getFees(month: baseIso)).items.single;
+      // ₹1,500 covers the full previous month and 300 of the current one.
+      await api.recordFeePayment(baseFee.id, 1500, DbFmt.date(base), 'cash');
+
+      final prevFee = (await api.getFees(month: prevIso)).items.single;
+      final basePaid = (await api.getFees(month: baseIso)).items.single;
+      expect(prevFee.amountPaid, '1200.00');
+      expect(prevFee.status, 'paid');
+      expect(basePaid.amountPaid, '300.00');
+      expect(basePaid.status, 'partial');
+      expect(basePaid.runningOutstanding, '900.00');
     });
 
-    test('disabled penalty (0) produces no increment', () async {
+    test('a payment cannot exceed the carry-forward balance', () async {
       final api = await freshApi();
-      await api.setLateFeePenalty(0);
-      await createStudent(api, name: 'Zero', fee: '1500');
+      await createStudent(api, name: 'Sara', fee: '1000');
       await api.fees.ensureMonthlyFees(prev);
-      await api.fees.ensureMonthlyFees(base);
-      expect((await api.getFees(month: baseIso)).items.single.amountDue, '1500.00');
+      final prevFee = (await api.getFees(month: prevIso)).items.single;
+      // Only ₹1,000 is owed through the previous month.
+      await expectLater(
+        api.recordFeePayment(prevFee.id, 1500, DbFmt.date(base), 'cash'),
+        throwsA(isA<dynamic>()),
+      );
     });
 
     test('fees are only ever generated from the student\'s join month', () async {
       final api = await freshApi();
       // Joins THIS month -> no record for the previous month, and the current
-      // month's fee is the base fee (no previous month to be unpaid).
+      // month's fee is the base fee.
       final id = await createStudent(api,
           name: 'Joiner', fee: '1500', joinDate: DbFmt.date(base));
       await api.fees.ensureMonthlyFees(prev);
@@ -136,21 +173,22 @@ void main() {
       expect(fees.length, 1); // only this month, not the month before joining
       expect(fees.single.month, baseIso);
       expect(fees.single.amountDue, '1500.00');
+      expect(fees.single.runningOutstanding, '1500.00');
     });
 
-    test('backfill after a closed-app gap increments the freshly generated '
-        'month when the preceding month is unpaid', () async {
+    test('backfill after a closed-app gap keeps the fixed fee and carries the '
+        'outstanding', () async {
       final api = await freshApi();
       await createStudent(api, name: 'Ranveer', fee: '1000');
       // App was last open in the previous month (unpaid). Reopening this month
-      // backfills the current month and, because the previous month is due,
-      // applies the increment to it.
+      // backfills the current month: the fee is still ₹1,000 and the pending
+      // total reflects both unpaid months.
       await api.fees.ensureMonthlyFees(prev);
       expect((await api.getFees(month: prevIso)).items.single.status, 'due');
       await api.fees.ensureMonthlyFees(base);
-      expect((await api.getFees(month: baseIso)).items.single.amountDue, '1100.00');
-      // The gap month itself is never incremented: it has no predecessor.
-      expect((await api.getFees(month: prevIso)).items.single.amountDue, '1000.00');
+      final baseFee = (await api.getFees(month: baseIso)).items.single;
+      expect(baseFee.amountDue, '1000.00');
+      expect(baseFee.runningOutstanding, '2000.00');
     });
   });
 

@@ -1,4 +1,5 @@
 {
+    "id": "./",
     "name": "Tandav Dance Studio",
     "short_name": "Tandav",
     "description": "Students, attendance, fees and batches for a dance studio. Works with no internet; syncs with the other device on its own.",
